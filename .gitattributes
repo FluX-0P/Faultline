@@ -1,0 +1,11 @@
+# Store text with LF so scripts like mvnw run on Linux CI
+* text=auto eol=lf
+
+# Windows scripts keep CRLF
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Binaries
+*.jar binary
+*.png binary
+*.gif binary
