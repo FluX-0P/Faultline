@@ -1,0 +1,16 @@
+spring:
+  application:
+    name: demo-app
+  datasource:
+    url: jdbc:postgresql://localhost:5432/demo
+    username: demo
+    password: demo
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: payment-worker
+      enable-auto-commit: false
+      auto-offset-reset: earliest
+    listener:
+      # the offset is committed exactly when the code calls acknowledge()
+      ack-mode: manual_immediate
