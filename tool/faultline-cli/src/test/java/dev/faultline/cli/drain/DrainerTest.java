@@ -13,10 +13,10 @@ class DrainerTest {
     private static final Duration POLL = Duration.ofMillis(20);
 
     @Test
-    void settlesOnceTheCountStopsChanging() throws Exception {
-        var calls = new AtomicLong();
-        // grows for the first 10 polls, then stays at 10
-        var result = Drainer.waitUntilStable(() -> Math.min(calls.incrementAndGet(), 10), QUIET, MAX, POLL);
+    void settlesOnceTheCountStopsChangingAndNothingIsLeft() throws Exception {
+        var polls = new AtomicLong();
+        // grows for the first 10 polls, then stays at 10; nothing left to process throughout
+        var result = Drainer.waitUntilDone(() -> Math.min(polls.incrementAndGet(), 10), () -> 0, QUIET, MAX, POLL);
 
         assertThat(result.settled()).isTrue();
         assertThat(result.count()).isEqualTo(10);
@@ -24,11 +24,21 @@ class DrainerTest {
     }
 
     @Test
-    void givesUpWhenTheCountNeverSettles() throws Exception {
-        var calls = new AtomicLong();
-        var result = Drainer.waitUntilStable(calls::incrementAndGet, QUIET, Duration.ofMillis(500), POLL);
+    void keepsWaitingWhileMessagesAreLeftEvenIfTheCountIsStill() throws Exception {
+        // like a restart: nothing new lands for a while, but one message is still unacknowledged
+        var polls = new AtomicLong();
+        var result = Drainer.waitUntilDone(() -> 5, () -> polls.incrementAndGet() < 30 ? 1 : 0, QUIET, MAX, POLL);
+
+        assertThat(result.settled()).isTrue();
+        assertThat(polls.get()).isGreaterThanOrEqualTo(30);
+    }
+
+    @Test
+    void givesUpWhenItNeverSettles() throws Exception {
+        var result = Drainer.waitUntilDone(() -> 5, () -> 1, QUIET, Duration.ofMillis(500), POLL);
 
         assertThat(result.settled()).isFalse();
+        assertThat(result.backlog()).isEqualTo(1);
         assertThat(result.waited()).isGreaterThanOrEqualTo(Duration.ofMillis(500));
     }
 }

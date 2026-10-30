@@ -14,6 +14,8 @@ import java.util.Random;
  */
 public final class PaymentWorkload {
     public static final String PATH = "/payments";
+    public static final String TOPIC = "payments.requested";
+    public static final String GROUP = "payment-worker";
     public static final int ACCOUNTS = 100;
     public static final long INITIAL_BALANCE = 1_000_000;
     static final int MIN_AMOUNT = 100;
@@ -39,18 +41,35 @@ public final class PaymentWorkload {
             .formatted(p.paymentId(), p.accountId(), p.amountMinor());
     }
 
-    /** Empties the payments table and puts every account back to its starting balance, in one transaction. */
-    public void reset(Connection db) throws SQLException {
+    /**
+     * Empties the payments and processed_events tables and puts every account back to its starting balance,
+     * in one transaction. Returns false on a fresh database, where the app has not created its tables yet
+     * (it does on startup, with fresh balances).
+     */
+    public boolean reset(Connection db) throws SQLException {
+        if (!exists(db, "accounts")) return false;
         db.setAutoCommit(false);
         try (var st = db.createStatement()) {
             st.execute("truncate payments");
+            // the B1 fix's table: left full, every payment of a rerun would be skipped as already processed
+            if (exists(db, "processed_events")) st.execute("truncate processed_events");
             st.execute("update accounts set balance_minor = " + INITIAL_BALANCE);
             db.commit();
+            return true;
         } catch (SQLException e) {
             db.rollback();
             throw e;
         } finally {
             db.setAutoCommit(true);
+        }
+    }
+
+    private static boolean exists(Connection db, String table) throws SQLException {
+        try (var st = db.prepareStatement("select to_regclass(?)")) {
+            st.setString(1, table);
+            try (var rs = st.executeQuery()) {
+                return rs.next() && rs.getString(1) != null;
+            }
         }
     }
 

@@ -92,6 +92,11 @@ public final class Checker {
         return CheckResult.of("balances", wrong);
     }
 
+    /** Every planned fault really fired. Without this, a PASS could just mean the fault never happened. */
+    public static CheckResult faultsFired(int planned, int fired) {
+        return CheckResult.of("faults-fired", fired == planned ? List.of() : List.of("fired " + fired + " of " + planned));
+    }
+
     private static int times(Map<String, Integer> applied, String paymentId) {
         return applied.getOrDefault(paymentId, 0);
     }
