@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Runs the Faultline CLI. Build it first: (cd tool && ./mvnw -q package -DskipTests)
+set -euo pipefail
+
+jar="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tool/faultline-cli/target/faultline.jar"
+if [[ ! -f "$jar" ]]; then
+  echo "faultline.jar not found. Build it first: (cd tool && ./mvnw -q package -DskipTests)" >&2
+  exit 2
+fi
+
+# Git Bash on Windows: hand java a Windows path (/e/... would not resolve)
+if command -v cygpath >/dev/null 2>&1; then
+  jar="$(cygpath -w "$jar")"
+fi
+
+exec java -jar "$jar" "$@"
