@@ -9,7 +9,7 @@ import org.testcontainers.utility.DockerImageName;
 
 // Same images as deploy/docker-compose.yml, so tests and manual runs use identical versions
 @TestConfiguration(proxyBeanMethods = false)
-class TestcontainersConfiguration {
+public class TestcontainersConfiguration {
 
 	@Bean
 	@ServiceConnection

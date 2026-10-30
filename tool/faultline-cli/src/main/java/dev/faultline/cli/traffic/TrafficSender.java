@@ -40,14 +40,20 @@ public final class TrafficSender implements AutoCloseable {
         this.target = target;
     }
 
-    /** Fails fast if nothing is listening at the target. Any HTTP response, even a 404, counts as reachable. */
-    public void checkReachable() throws IOException, InterruptedException {
+    /** Whether anything answers at the target. Any HTTP response, even a 404, counts. */
+    public boolean isReachable() throws InterruptedException {
         try {
             http.send(HttpRequest.newBuilder(target).timeout(REQUEST_TIMEOUT).GET().build(),
                 HttpResponse.BodyHandlers.discarding());
-        } catch (ConnectException | HttpConnectTimeoutException e) {
-            throw new IllegalStateException("nothing is answering at " + target + " (is the app running?)", e);
+            return true;
+        } catch (IOException e) {
+            return false;
         }
+    }
+
+    /** Fails fast if nothing is listening at the target. */
+    public void checkReachable() throws InterruptedException {
+        if (!isReachable()) throw new IllegalStateException("nothing is answering at " + target + " (is the app running?)");
     }
 
     /** Sends every payment at {@code ratePerSecond}, records each outcome, and returns once all have finished. */

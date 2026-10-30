@@ -11,6 +11,15 @@ spring:
       group-id: payment-worker
       enable-auto-commit: false
       auto-offset-reset: earliest
+      properties:
+        # a crashed worker is noticed after 6s instead of the default 45s, so a restarted one resumes quickly
+        "[session.timeout.ms]": 6000
+        "[heartbeat.interval.ms]": 2000
     listener:
       # the offset is committed exactly when the code calls acknowledge()
       ack-mode: manual_immediate
+
+demo:
+  fixes:
+    # B1 fix: skip a payment already recorded in processed_events, checked in the same transaction as the debit
+    dedupe: false

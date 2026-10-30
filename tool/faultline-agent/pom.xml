@@ -11,8 +11,77 @@
 
 	<artifactId>faultline-agent</artifactId>
 	<name>faultline-agent</name>
-	<description>Java agent that fires faults inside named methods (Phase 3)</description>
+	<description>Java agent that fires faults inside named methods, with no change to the app's code</description>
 
-	<!-- empty until Phase 3 -->
-	<packaging>pom</packaging>
+	<properties>
+		<!-- runs inside the target app, so it must load on the oldest Java a Spring Boot 3+ app can use -->
+		<maven.compiler.release>17</maven.compiler.release>
+	</properties>
+
+	<dependencies>
+		<!-- the only dependency: it runs inside the target app, so it must not drag in anything that could clash -->
+		<dependency>
+			<groupId>net.bytebuddy</groupId>
+			<artifactId>byte-buddy</artifactId>
+		</dependency>
+
+		<dependency>
+			<groupId>org.junit.jupiter</groupId>
+			<artifactId>junit-jupiter</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.assertj</groupId>
+			<artifactId>assertj-core</artifactId>
+			<scope>test</scope>
+		</dependency>
+	</dependencies>
+
+	<build>
+		<plugins>
+			<!-- target/faultline-agent.jar, loaded with -javaagent: -->
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-shade-plugin</artifactId>
+				<executions>
+					<execution>
+						<phase>package</phase>
+						<goals>
+							<goal>shade</goal>
+						</goals>
+						<configuration>
+							<finalName>faultline-agent</finalName>
+							<createDependencyReducedPom>false</createDependencyReducedPom>
+							<!-- the app may ship its own ByteBuddy (Hibernate, Mockito do); ours moves out of its way -->
+							<relocations>
+								<relocation>
+									<pattern>net.bytebuddy</pattern>
+									<shadedPattern>dev.faultline.agent.shaded.net.bytebuddy</shadedPattern>
+								</relocation>
+							</relocations>
+							<transformers>
+								<transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+									<manifestEntries>
+										<Premain-Class>dev.faultline.agent.FaultAgent</Premain-Class>
+									</manifestEntries>
+								</transformer>
+								<transformer implementation="org.apache.maven.plugins.shade.resource.ApacheLicenseResourceTransformer"/>
+								<transformer implementation="org.apache.maven.plugins.shade.resource.ApacheNoticeResourceTransformer"/>
+							</transformers>
+							<filters>
+								<filter>
+									<artifact>*:*</artifact>
+									<excludes>
+										<exclude>module-info.class</exclude>
+										<exclude>META-INF/versions/*/module-info.class</exclude>
+										<exclude>META-INF/MANIFEST.MF</exclude>
+									</excludes>
+								</filter>
+							</filters>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+		</plugins>
+	</build>
 </project>

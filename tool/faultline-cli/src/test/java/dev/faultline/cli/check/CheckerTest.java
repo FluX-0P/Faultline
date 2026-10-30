@@ -93,6 +93,13 @@ class CheckerTest {
             .containsExactly("acct-1", "acct-2", "acct-10", "acct-100");
     }
 
+    @Test
+    void faultsFiredPassesOnlyWhenEveryPlannedFaultFired() {
+        assertThat(Checker.faultsFired(3, 3).passed()).isTrue();
+        assertThat(Checker.faultsFired(3, 2).offenders()).containsExactly("fired 2 of 3");
+        assertThat(Checker.faultsFired(3, 4).offenders()).containsExactly("fired 4 of 3");
+    }
+
     private static List<CheckResult> check(List<HistoryEntry> history, Map<String, Integer> applied, Map<String, Long> balances) {
         return Checker.check(history, applied, balances, START);
     }

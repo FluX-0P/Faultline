@@ -3,12 +3,13 @@ package dev.faultline.cli.drain;
 import java.time.Duration;
 
 /**
- * Waits for the app to finish processing: done once the result count has stopped changing for a quiet period.
- * Simple and app-agnostic; a Kafka consumer-lag check replaces it later.
+ * Waits for the app to finish processing: done once nothing is left to process (Kafka lag is zero) and the
+ * result count has stopped changing for a quiet period. Lag alone survives a restart that takes a while;
+ * the quiet period catches results that land just after the last acknowledgment.
  */
 public final class Drainer {
-    public static final Duration QUIET = Duration.ofSeconds(10);
-    public static final Duration MAX_WAIT = Duration.ofMinutes(2);
+    public static final Duration QUIET = Duration.ofSeconds(3);
+    public static final Duration MAX_WAIT = Duration.ofMinutes(3);
     static final Duration POLL = Duration.ofSeconds(1);
 
     @FunctionalInterface
@@ -16,32 +17,34 @@ public final class Drainer {
         long count() throws Exception;
     }
 
-    /** {@code settled} is false when MAX_WAIT ran out while the count was still changing. */
-    public record Result(long count, boolean settled, Duration waited) {}
+    /** {@code settled} is false when MAX_WAIT ran out first; {@code backlog} is what was still left then. */
+    public record Result(long count, long backlog, boolean settled, Duration waited) {}
 
     private Drainer() {}
 
-    public static Result waitUntilStable(Counter counter) throws Exception {
-        return waitUntilStable(counter, QUIET, MAX_WAIT, POLL);
+    public static Result waitUntilDone(Counter results, Counter backlog) throws Exception {
+        return waitUntilDone(results, backlog, QUIET, MAX_WAIT, POLL);
     }
 
-    static Result waitUntilStable(Counter counter, Duration quiet, Duration maxWait, Duration poll) throws Exception {
+    static Result waitUntilDone(Counter results, Counter backlog, Duration quiet, Duration maxWait, Duration poll) throws Exception {
         long start = System.nanoTime();
-        long last = counter.count();
-        long lastChange = start;
+        long last = results.count();
+        long left = backlog.count();
+        long quietSince = start;
         while (true) {
             long now = System.nanoTime();
-            if (now - lastChange >= quiet.toNanos()) {
-                return new Result(last, true, Duration.ofNanos(now - start));
+            if (left == 0 && now - quietSince >= quiet.toNanos()) {
+                return new Result(last, 0, true, Duration.ofNanos(now - start));
             }
             if (now - start >= maxWait.toNanos()) {
-                return new Result(last, false, Duration.ofNanos(now - start));
+                return new Result(last, left, false, Duration.ofNanos(now - start));
             }
             Thread.sleep(poll);
-            long current = counter.count();
-            if (current != last) {
+            long current = results.count();
+            left = backlog.count();
+            if (current != last || left > 0) {
                 last = current;
-                lastChange = System.nanoTime();
+                quietSince = System.nanoTime();
             }
         }
     }

@@ -30,3 +30,22 @@ Kafka listens on `localhost:9092` (from your machine) and `kafka:19092` (from co
 ```
 
 Each run writes `runs/<timestamp>/` with `run.json` (settings), `history.jsonl` (every request and its outcome) and `result.json` (each check's verdict). Exit code 0 means every check passed, 1 means a check failed, 2 means Faultline could not run.
+
+## Crash the app on purpose
+
+With `--app-jar`, Faultline starts the app itself and attaches its fault agent. `--fault before-ack` crashes the app just before Spring Kafka commits the offset (after the app's own database commit), and Faultline restarts it each time:
+
+```bash
+(cd demo-app && ./mvnw -q package -DskipTests)   # build the demo app jar
+(cd tool && ./mvnw -q package -DskipTests)       # build the CLI and the agent
+
+# bug B1 on: 3 crashes -> 3 payments applied twice, FAIL
+./faultline run --count 3000 --seed 42 --app-jar demo-app/target/demo-app-0.0.1-SNAPSHOT.jar \
+  --fault before-ack --nth-hit 300 --times 3
+
+# with the fix on: the same 3 crashes, PASS
+./faultline run --count 3000 --seed 42 --app-jar demo-app/target/demo-app-0.0.1-SNAPSHOT.jar \
+  --app-arg=--demo.fixes.dedupe=true --fault before-ack --nth-hit 300 --times 3
+```
+
+The run folder then also holds `app.log` (the app's output across every restart) and `faults.jsonl` (one line per crash the agent fired).
