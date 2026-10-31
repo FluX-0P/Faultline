@@ -1,0 +1,61 @@
+# Planted bug B7: a message that can never be processed is retried forever, so it blocks every message behind it on
+# its partition. The API publishes to payments.raw; Faultline's relay forwards to payments.requested and corrupts the
+# 300th message. With dead-letter handling only that one message is missing, which the checks excuse.
+# faultline benchmark adds the settings that switch the bug on or off.
+app: demo-app
+journey: make-payment
+risk:
+  id: B7
+  pattern: P7
+  title: No dead-letter handling for bad messages
+  location: PaymentListener#onMessage
+  file: src/main/java/dev/faultline/demo/payment/PaymentListener.java
+  line: 29
+  why: Hand-written benchmark plan for planted bug B7.
+target:
+  url: http://localhost:8080
+  compose:
+    file: deploy/docker-compose.yml
+    profile: demo
+    services: [api, worker-1, worker-2, worker-3]
+    consumers: 3
+  args: [--payments.inbound-topic=payments.raw]
+database:
+  url: jdbc:postgresql://localhost:5432/demo
+  user: demo
+  password: demo
+  reset:
+  - TRUNCATE payments
+  - TRUNCATE processed_events
+  - UPDATE accounts SET balance_minor = 1000000
+kafka:
+  bootstrap: localhost:9092
+  topic: payments.requested
+  group: payment-worker
+relay:
+  from: payments.raw
+  to: payments.requested
+traffic:
+  count: 2000
+  rate: 100
+  # a blocked partition never drains; 30s is plenty for a healthy app
+  drain_timeout: 30s
+  request:
+    method: POST
+    path: /payments
+    body: |
+      {"paymentId": "pay-${seed}-${seq}", "accountId": "acct-${int:1:100}", "amountMinor": ${int:100:5000}}
+correlate_by:
+  request_field: paymentId
+  table: payments
+  column: payment_id
+fault:
+  layer: messaging
+  action: corrupt
+  nth_hit: 300
+  times: 1
+checks: [no-lost, no-duplicates, no-unexpected, faults-fired]
+confirm:
+  runs: 2
+  baselines: 1
+  min_failing: 2

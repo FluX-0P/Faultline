@@ -10,7 +10,7 @@ import java.time.Duration;
 public final class Drainer {
     public static final Duration QUIET = Duration.ofSeconds(3);
     public static final Duration MAX_WAIT = Duration.ofMinutes(3);
-    static final Duration POLL = Duration.ofSeconds(1);
+    public static final Duration POLL = Duration.ofSeconds(1);
 
     @FunctionalInterface
     public interface Counter {
@@ -26,7 +26,7 @@ public final class Drainer {
         return waitUntilDone(results, backlog, QUIET, MAX_WAIT, POLL);
     }
 
-    static Result waitUntilDone(Counter results, Counter backlog, Duration quiet, Duration maxWait, Duration poll) throws Exception {
+    public static Result waitUntilDone(Counter results, Counter backlog, Duration quiet, Duration maxWait, Duration poll) throws Exception {
         long start = System.nanoTime();
         long last = results.count();
         long left = backlog.count();

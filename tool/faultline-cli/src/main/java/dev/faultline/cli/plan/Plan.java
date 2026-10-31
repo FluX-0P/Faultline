@@ -6,6 +6,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -31,11 +32,16 @@ import tools.jackson.dataformat.yaml.YAMLWriteFeature;
  * hand-written plan can be a plain fault-free run.
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
-public record Plan(String app, String journey, Risk risk, Target target, Database database, Kafka kafka,
-                   Traffic traffic, CorrelateBy correlateBy, Fault fault, List<String> checks, Confirm confirm) {
+public record Plan(String app, String journey, Risk risk, Target target, Database database, Kafka kafka, Relay relay,
+                   Traffic traffic, CorrelateBy correlateBy, Order order, Fault fault, List<String> checks, List<Rule> rules,
+                   Confirm confirm) {
 
     public static final List<String> DATA_CHECKS = List.of("no-lost", "no-duplicates", "no-unexpected");
     public static final String FAULTS_FIRED = "faults-fired";
+    public static final String PER_KEY_ORDER = "per-key-order";
+    private static final List<String> TRAFFIC_ACTIONS = List.of("duplicate");
+    private static final List<String> MESSAGING_ACTIONS = List.of("duplicate", "reorder", "corrupt");
+    private static final Pattern RULE_SQL = Pattern.compile("(?is)\\s*(select|with)\\s[^;]+;?\\s*");
     private static final Set<String> BODY_METHODS = Set.of("POST", "PUT", "PATCH");
     private static final List<String> CODE_ACTIONS = List.of("crash", "delay", "throw");
     private static final List<String> PROCESS_ACTIONS = List.of("kill", "pause", "restart");
@@ -73,7 +79,23 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
     public record Kafka(String bootstrap, String topic, String group) {}
 
     /** Without a {@code seed}, each run picks one and prints it. */
-    public record Traffic(Integer count, Integer rate, Long seed, Request request) {}
+    /** Without a {@code seed}, each run picks one. {@code drainTimeout} caps the wait for the app to finish (default 3m). */
+    public record Traffic(Integer count, Integer rate, Long seed, Request request, String drainTimeout) {}
+
+    /**
+     * A chaos relay Faultline runs between two topics: the app publishes to {@code from}, the relay forwards to {@code to}
+     * and fires messaging faults on the way. The app must be set to publish to {@code from}.
+     */
+    public record Relay(String from, String to) {}
+
+    /**
+     * For per-key-order: requests with the same {@code key} field must be applied in the order they happened, read from
+     * the effects table's {@code by} column (one that grows as rows are added, such as an id).
+     */
+    public record Order(String key, String by) {}
+
+    /** An app rule: SQL that must return no rows once the run is over. Each row it returns is an offender. */
+    public record Rule(String id, String sql) {}
 
     public record Request(String method, String path, String body) {}
 
@@ -134,19 +156,19 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
      */
     public Plan forRun(long seed, Integer count, Integer rate, List<String> extraArgs, Integer runs, Integer baselines) {
         var t = new Target(target.url(), target.jar(), target.compose(), withArgs(extraArgs));
-        var tr = new Traffic(count != null ? count : traffic.count(), rate != null ? rate : traffic.rate(), seed, traffic.request());
+        var tr = new Traffic(count != null ? count : traffic.count(), rate != null ? rate : traffic.rate(), seed, traffic.request(), traffic.drainTimeout());
         Confirm c = confirm();
         if (runs != null || baselines != null) {
             int r = runs != null ? runs : c.runs();
             c = new Confirm(r, baselines != null ? baselines : c.baselines(), Math.min(c.minFailing(), r));
         }
-        return new Plan(app, journey, risk, t, database, kafka, tr, correlateBy, fault, checks, c);
+        return new Plan(app, journey, risk, t, database, kafka, relay, tr, correlateBy, order, fault, checks, rules, c);
     }
 
     /** The same plan without its fault: a baseline run, to show the checks pass when nothing is broken. */
     public Plan withoutFault() {
         var c = checks.stream().filter(check -> !check.equals(FAULTS_FIRED)).toList();
-        return new Plan(app, journey, risk, target, database, kafka, traffic, correlateBy, null, c, confirm);
+        return new Plan(app, journey, risk, target, database, kafka, relay, traffic, correlateBy, order, null, c, rules, confirm);
     }
 
     /** The plan's own confirm settings, or a single run without a baseline for plans that have none. */
@@ -247,6 +269,23 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
 
         if (fault != null) problems.addAll(faultProblems());
 
+        if (relay != null && (blank(relay.from()) || blank(relay.to()) || relay.from().equals(relay.to()))) {
+            problems.add("relay needs two different topics, from and to");
+        }
+        if (order != null && (blank(order.key()) || !EffectsTable.isIdentifier(order.by()))) {
+            problems.add("order needs key (a request field) and by (a column of " + (correlateBy == null ? "the effects table" : correlateBy.table()) + ")");
+        }
+        if (traffic != null && traffic.drainTimeout() != null && !Durations.valid(traffic.drainTimeout())) {
+            problems.add("traffic.drain_timeout must be a duration, such as 60s");
+        }
+        var ruleIds = new HashSet<String>();
+        for (Rule rule : rules == null ? List.<Rule>of() : rules) {
+            if (blank(rule.id()) || !ruleIds.add(rule.id())) problems.add("every rule needs its own id");
+            if (rule.sql() == null || !RULE_SQL.matcher(rule.sql()).matches()) {
+                problems.add("rule " + rule.id() + ": sql must be one SELECT (or WITH) statement that returns the offending rows");
+            }
+        }
+
         var c = confirm();
         if (c.runs() == null || c.runs() < 1) problems.add("confirm.runs must be at least 1");
         if (c.baselines() == null || c.baselines() < 0) problems.add("confirm.baselines cannot be negative");
@@ -258,11 +297,12 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
             problems.add("checks is empty");
         } else {
             for (String check : checks) {
-                if (!DATA_CHECKS.contains(check) && !check.equals(FAULTS_FIRED)) {
-                    problems.add("unknown check '" + check + "': use " + String.join(", ", DATA_CHECKS) + " or " + FAULTS_FIRED);
+                if (!DATA_CHECKS.contains(check) && !check.equals(FAULTS_FIRED) && !check.equals(PER_KEY_ORDER)) {
+                    problems.add("unknown check '" + check + "': use " + String.join(", ", DATA_CHECKS) + ", " + PER_KEY_ORDER + " or " + FAULTS_FIRED);
                 }
             }
             if (checks.contains(FAULTS_FIRED) && fault == null) problems.add("check faults-fired needs a fault");
+            if (checks.contains(PER_KEY_ORDER) && order == null) problems.add("check per-key-order needs order: key and by");
         }
         return problems;
     }
@@ -293,8 +333,15 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
             if (!"restart".equals(fault.action()) && !Durations.valid(fault.duration())) {
                 problems.add("fault.duration must say how long the service stays down, such as 15s");
             }
+        } else if (fault.layer().equals("traffic")) {
+            if (!TRAFFIC_ACTIONS.contains(fault.action())) problems.add("fault.action must be one of " + TRAFFIC_ACTIONS + " for a traffic fault");
+            if (fault.nthHit() == null || fault.nthHit() < 1) problems.add("fault.nth_hit must be at least 1");
+        } else if (fault.layer().equals("messaging")) {
+            if (!MESSAGING_ACTIONS.contains(fault.action())) problems.add("fault.action must be one of " + MESSAGING_ACTIONS + " for a messaging fault");
+            if (fault.nthHit() == null || fault.nthHit() < 1) problems.add("fault.nth_hit must be at least 1");
+            if (relay == null) problems.add("a messaging fault needs a relay: from and to topics");
         } else {
-            problems.add("fault.layer must be code or process");
+            problems.add("fault.layer must be code, process, traffic or messaging");
         }
         return problems;
     }

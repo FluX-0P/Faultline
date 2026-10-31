@@ -10,7 +10,7 @@ risk:
   title: "Save, then acknowledge the message"
   location: PaymentListener#onMessage
   file: src/main/java/dev/faultline/demo/payment/PaymentListener.java
-  line: 18
+  line: 29
   confidence: high
   why: Hand-written benchmark plan for planted bug B1.
 target:

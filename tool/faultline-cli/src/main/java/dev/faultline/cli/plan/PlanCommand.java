@@ -198,11 +198,14 @@ public final class PlanCommand implements Callable<Integer> {
             new Plan.Target(f.url(), f.jar(), null, List.of()),
             new Plan.Database(f.dbUrl(), f.dbUser(), f.dbPassword(), reset),
             new Plan.Kafka(f.bootstrap(), f.topic(), f.group()),
+            null,
             // the closing newline makes plan.yaml show the body as a | block, so its quotes need no escaping
-            new Plan.Traffic(COUNT, RATE, null, new Plan.Request(d.request().method(), d.request().path(), d.request().body().strip() + "\n")),
+            new Plan.Traffic(COUNT, RATE, null, new Plan.Request(d.request().method(), d.request().path(), d.request().body().strip() + "\n"), null),
             new Plan.CorrelateBy(d.correlateBy(), d.effect().table(), d.effect().column()),
+            null,
             new Plan.Fault(null, "before-ack", null, "crash", NTH_HIT, TIMES, null, null, null),
             List.of("no-lost", "no-duplicates", "no-unexpected", Plan.FAULTS_FIRED),
+            null,
             CONFIRM);
     }
 

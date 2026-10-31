@@ -15,7 +15,7 @@ class BenchmarkFileTest {
     @Test
     void everyShippedPlanIsValidWithItsBugOnAndOff() throws Exception {
         var bench = BenchmarkFile.read(BENCHMARK);
-        assertThat(bench.bugs()).extracting(BenchmarkFile.Bug::id).contains("B1", "B10");
+        assertThat(bench.bugs()).extracting(BenchmarkFile.Bug::id).contains("B1", "B3", "B7", "B9", "B10");
 
         for (var bug : bench.bugs()) {
             Plan plan = Plan.read(BENCHMARK.resolveSibling(bug.plan()));
@@ -29,8 +29,9 @@ class BenchmarkFileTest {
         var bench = BenchmarkFile.read(BENCHMARK);
         var b1 = bench.bugs().stream().filter(b -> b.id().equals("B1")).findFirst().orElseThrow();
 
-        assertThat(bench.args(b1)).containsExactly("--payments.dedupe=none");
-        assertThat(bench.args(null)).containsExactly("--payments.dedupe=claim-first");
+        assertThat(bench.args(b1)).containsExactly("--payments.dedupe=none", "--payments.dedupe-key=payment-id",
+            "--payments.bad-messages=dead-letter", "--payments.retries=in-place");
+        assertThat(bench.args(null)).first().isEqualTo("--payments.dedupe=claim-first");
     }
 
     @Test

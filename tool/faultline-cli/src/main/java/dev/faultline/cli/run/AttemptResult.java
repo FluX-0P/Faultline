@@ -22,8 +22,12 @@ public record AttemptResult(String name, String kind, Sent sent, Drain drain, In
         return checks.stream().allMatch(CheckResult::passed);
     }
 
-    /** Whether a data check (no-lost, no-duplicates, no-unexpected) failed: the data came out wrong. */
+    /** Whether a data check failed: every check but faults-fired, which is about the fault, not the data. */
     public boolean dataFailed() {
-        return checks.stream().anyMatch(c -> !c.passed() && Plan.DATA_CHECKS.contains(c.name()));
+        return checks.stream().anyMatch(AttemptResult::dataCheckFailed);
+    }
+
+    public static boolean dataCheckFailed(CheckResult c) {
+        return !c.passed() && !c.name().equals(Plan.FAULTS_FIRED);
     }
 }

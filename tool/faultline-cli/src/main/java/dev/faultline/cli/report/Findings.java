@@ -10,7 +10,7 @@ import dev.faultline.cli.run.AttemptResult;
 
 /**
  * Labels the plan's risk from all its runs. Confirmed needs three things: the fault fired as planned, a data check
- * (no-lost, no-duplicates, no-unexpected) failed in at least confirm.min_failing of those runs, and every baseline run
+ * (every check but faults-fired) failed in at least confirm.min_failing of those runs, and every baseline run
  * without the fault passed. A flagged risk the runs could not break stays suspected.
  */
 public final class Findings {
@@ -44,7 +44,7 @@ public final class Findings {
                 label = Label.CONFIRMED;
                 reason = "%s failed in %d of %d runs with the fault%s.".formatted(failedChecks(failing.getFirst()), failing.size(), faultRuns.size(),
                     baselines.isEmpty() ? "" : ", and passed in the %d baseline run%s without it".formatted(baselines.size(), baselines.size() == 1 ? "" : "s"));
-                evidence = failing.getFirst().checks().stream().filter(c -> !c.passed() && Plan.DATA_CHECKS.contains(c.name()))
+                evidence = failing.getFirst().checks().stream().filter(AttemptResult::dataCheckFailed)
                     .flatMap(c -> c.offenders().stream()).limit(MAX_EVIDENCE).toList();
             } else if (failing.size() >= needed) {
                 label = Label.NOT_TESTED;
@@ -65,7 +65,7 @@ public final class Findings {
     }
 
     private static String failedChecks(AttemptResult attempt) {
-        return attempt.checks().stream().filter(c -> !c.passed() && Plan.DATA_CHECKS.contains(c.name()))
+        return attempt.checks().stream().filter(AttemptResult::dataCheckFailed)
             .map(CheckResult::name).collect(Collectors.joining(", "));
     }
 }

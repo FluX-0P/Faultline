@@ -43,10 +43,10 @@ class PlanTest {
         Plan broken = new Plan(p.app(), p.journey(), p.risk(),
             new Plan.Target("localhost:8080", null, null, List.of()),
             new Plan.Database("jdbc:mysql://x/y", "demo", "demo", List.of("DROP TABLE payments")),
-            p.kafka(),
-            new Plan.Traffic(0, 100, null, new Plan.Request("GET", "/payments", "{\"paymentId\": \"pay-${seq}\"}")),
-            new Plan.CorrelateBy("paymentId", "payments; drop table x", "payment_id"),
-            p.fault(), List.of("no-lost", "no-lies"), new Plan.Confirm(2, 1, 3));
+            p.kafka(), null,
+            new Plan.Traffic(0, 100, null, new Plan.Request("GET", "/payments", "{\"paymentId\": \"pay-${seq}\"}"), null),
+            new Plan.CorrelateBy("paymentId", "payments; drop table x", "payment_id"), null,
+            p.fault(), List.of("no-lost", "no-lies"), null, new Plan.Confirm(2, 1, 3));
 
         assertThat(broken.problems()).contains(
             "target.url must start with http:// or https://",
@@ -58,14 +58,15 @@ class PlanTest {
             "correlate_by.table is not a table name: payments; drop table x",
             "a code fault needs target.jar or target.compose: Faultline has to start the app to attach its agent",
             "confirm.min_failing must be between 1 and confirm.runs",
-            "unknown check 'no-lies': use no-lost, no-duplicates, no-unexpected or faults-fired");
+            "unknown check 'no-lies': use no-lost, no-duplicates, no-unexpected, per-key-order or faults-fired");
     }
 
     @Test
     void aRunPinsTheSeedAndItsArgumentsWinOverThePlans() {
         Plan p = TestPlans.valid();
         Plan withArgs = new Plan(p.app(), p.journey(), p.risk(), new Plan.Target(p.target().url(), p.target().jar(), null,
-            List.of("--payments.dedupe=none", "--server.port=8080")), p.database(), p.kafka(), p.traffic(), p.correlateBy(), p.fault(), p.checks(), p.confirm());
+            List.of("--payments.dedupe=none", "--server.port=8080")), p.database(), p.kafka(), null, p.traffic(), p.correlateBy(), null, p.fault(), p.checks(),
+            null, p.confirm());
 
         Plan run = withArgs.forRun(42, null, 50, List.of("--payments.dedupe=claim-first"), 3, null);
 
@@ -107,12 +108,32 @@ class PlanTest {
         assertThat(TestPlans.valid().problems()).isEmpty();
 
         var onAJar = new Plan(TestPlans.valid().app(), null, null, TestPlans.valid().target(), TestPlans.valid().database(), TestPlans.valid().kafka(),
-            TestPlans.valid().traffic(), TestPlans.valid().correlateBy(), new Plan.Fault("process", null, null, "freeze", null, 1, null, "worker-1", null),
-            List.of("no-lost"), null);
+            null, TestPlans.valid().traffic(), TestPlans.valid().correlateBy(), null, new Plan.Fault("process", null, null, "freeze", null, 1, null, "worker-1", null),
+            List.of("no-lost"), null, null);
         assertThat(onAJar.problems()).contains(
             "fault.action must be one of [kill, pause, restart] for a process fault",
             "a process fault needs target.compose: it stops and starts Docker services",
             "fault.at must say when, after the traffic starts, such as 10s",
             "fault.duration must say how long the service stays down, such as 15s");
+    }
+
+    @Test
+    void relayOrderRulesAndTheNewFaultLayersAreChecked() {
+        var corrupt = new Plan.Fault("messaging", null, null, "corrupt", 300L, 1, null, null, null);
+        assertThat(TestPlans.ordered(corrupt).problems()).isEmpty();
+        assertThat(TestPlans.compose(corrupt).problems()).contains("a messaging fault needs a relay: from and to topics");
+
+        var twice = new Plan.Fault("traffic", null, null, "duplicate", 50L, 20, null, null, null);
+        assertThat(TestPlans.compose(twice).problems()).isEmpty();
+        assertThat(TestPlans.compose(new Plan.Fault("traffic", null, null, "drop", 0L, 1, null, null, null)).problems())
+            .contains("fault.action must be one of [duplicate] for a traffic fault", "fault.nth_hit must be at least 1");
+
+        Plan p = TestPlans.ordered(corrupt);
+        Plan bad = new Plan(p.app(), p.journey(), p.risk(), p.target(), p.database(), p.kafka(), new Plan.Relay("t", "t"), p.traffic(),
+            p.correlateBy(), null, p.fault(), p.checks(), List.of(new Plan.Rule("r", "delete from payments")), p.confirm());
+        assertThat(bad.problems()).contains(
+            "relay needs two different topics, from and to",
+            "check per-key-order needs order: key and by",
+            "rule r: sql must be one SELECT (or WITH) statement that returns the offending rows");
     }
 }

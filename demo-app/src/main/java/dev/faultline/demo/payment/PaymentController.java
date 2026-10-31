@@ -1,5 +1,8 @@
 package dev.faultline.demo.payment;
 
+import java.util.UUID;
+
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -11,15 +14,18 @@ import tools.jackson.databind.json.JsonMapper;
 class PaymentController {
     private final KafkaTemplate<String, String> kafka;
     private final JsonMapper json;
+    private final String topic;
 
-    PaymentController(KafkaTemplate<String, String> kafka, JsonMapper json) {
+    PaymentController(KafkaTemplate<String, String> kafka, JsonMapper json, @Value("${payments.inbound-topic:payments.requested}") String topic) {
         this.kafka = kafka;
         this.json = json;
+        this.topic = topic;
     }
 
     @PostMapping("/payments")
     ResponseEntity<Void> pay(@RequestBody PaymentRequested req) throws Exception {
-        kafka.send(TopicConfig.PAYMENTS_REQUESTED, req.accountId(), json.writeValueAsString(req)).get();
+        var event = new PaymentEvent(UUID.randomUUID().toString(), req.paymentId(), req.accountId(), req.amountMinor());
+        kafka.send(topic, req.accountId(), json.writeValueAsString(event)).get();
         return ResponseEntity.accepted().build();
     }
 }

@@ -54,6 +54,33 @@ public final class EffectsTable {
         return counts;
     }
 
+    /** Request IDs in the order their rows were added, by a column that grows with each insert (such as an id). */
+    public List<String> appliedOrder(Connection db, String by) throws SQLException {
+        if (!isIdentifier(by)) throw new IllegalArgumentException("not a column name: " + by);
+        var ids = new ArrayList<String>();
+        try (var st = db.createStatement(); var rs = st.executeQuery("select " + column + " from " + table + " order by " + by)) {
+            while (rs.next()) ids.add(rs.getString(1));
+        }
+        return ids;
+    }
+
+    /** Runs an app rule's query and returns each row it found as text, its columns joined by ", ". At most 1000 rows. */
+    public static List<String> rows(Connection db, String sql) throws SQLException {
+        var rows = new ArrayList<String>();
+        try (var st = db.createStatement()) {
+            st.setMaxRows(1000);
+            try (var rs = st.executeQuery(sql.strip().replaceAll(";$", ""))) {
+                int columns = rs.getMetaData().getColumnCount();
+                while (rs.next()) {
+                    var row = new ArrayList<String>();
+                    for (int c = 1; c <= columns; c++) row.add(rs.getString(c));
+                    rows.add(String.join(", ", row));
+                }
+            }
+        }
+        return rows;
+    }
+
     public record Reset(int ran, List<String> skipped) {}
 
     /**
