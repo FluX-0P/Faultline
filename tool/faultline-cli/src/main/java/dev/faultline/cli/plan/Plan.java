@@ -1,0 +1,205 @@
+package dev.faultline.cli.plan;
+
+import java.io.IOException;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
+import java.util.Set;
+import java.util.regex.Pattern;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import dev.faultline.cli.fault.FaultSpec;
+import dev.faultline.cli.scan.Risks.Risk;
+import dev.faultline.cli.workload.EffectsTable;
+import dev.faultline.cli.workload.RequestTemplate;
+import dev.faultline.cli.workload.Workload;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.DeserializationFeature;
+import tools.jackson.databind.PropertyNamingStrategies;
+import tools.jackson.dataformat.yaml.YAMLMapper;
+import tools.jackson.dataformat.yaml.YAMLWriteFeature;
+
+/**
+ * plan.yaml: everything one run needs, in a file you can read, edit and approve. Which risk it tests, how to reach
+ * the app, its database and Kafka, the traffic to send, how a request is matched to its effect, the fault, and the
+ * checks. {@code risk} and {@code fault} are optional, so a hand-written plan can be a plain fault-free run.
+ */
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public record Plan(String app, String journey, Risk risk, Target target, Database database, Kafka kafka,
+                   Traffic traffic, CorrelateBy correlateBy, Fault fault, List<String> checks) {
+
+    public static final List<String> DATA_CHECKS = List.of("no-lost", "no-duplicates", "no-unexpected");
+    public static final String FAULTS_FIRED = "faults-fired";
+    private static final Set<String> BODY_METHODS = Set.of("POST", "PUT", "PATCH");
+    private static final Pattern RESET_STATEMENT = Pattern.compile("(?is)\\s*(truncate|delete\\s+from|update)\\s+[^;]+");
+
+    // snake_case keys, few quotes, no folded lines, multi-line text (the request body) as a | block, nulls left out,
+    // and unknown keys rejected: a typo in a hand edit should fail loudly, not be ignored
+    private static final YAMLMapper YAML = YAMLMapper.builder()
+        .propertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE)
+        .enable(YAMLWriteFeature.MINIMIZE_QUOTES)
+        .enable(YAMLWriteFeature.LITERAL_BLOCK_STYLE)
+        .disable(YAMLWriteFeature.SPLIT_LINES)
+        .disable(YAMLWriteFeature.WRITE_DOC_START_MARKER)
+        .changeDefaultPropertyInclusion(incl -> incl.withValueInclusion(JsonInclude.Include.NON_NULL))
+        .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+        .build();
+
+    /** The app under test. Without {@code jar}, the app must already be running at {@code url}. */
+    public record Target(String url, String jar, List<String> args) {}
+
+    /** {@code reset} puts the database back to its starting state before each run. */
+    public record Database(String url, String user, String password, List<String> reset) {}
+
+    /** Where to read the consumer group's lag, to know when the app has finished. */
+    public record Kafka(String bootstrap, String topic, String group) {}
+
+    /** Without a {@code seed}, each run picks one and prints it. */
+    public record Traffic(Integer count, Integer rate, Long seed, Request request) {}
+
+    public record Request(String method, String path, String body) {}
+
+    /** A request's {@code requestField} value appears in {@code table}.{@code column} once the app has processed it. */
+    public record CorrelateBy(String requestField, String table, String column) {}
+
+    public record Fault(String point, String action, Long nthHit, Integer times) {
+        public FaultSpec toSpec() {
+            return new FaultSpec(point, nthHit, times);
+        }
+    }
+
+    public static Plan read(Path file) throws IOException {
+        if (!Files.isRegularFile(file)) throw new IllegalArgumentException("no plan at " + file);
+        try {
+            return YAML.readValue(file.toFile(), Plan.class);
+        } catch (JacksonException e) {
+            String where = e.getLocation() == null ? "" : " (line " + e.getLocation().getLineNr() + ")";
+            throw new IllegalArgumentException("cannot read " + file + where + ": " + e.getOriginalMessage());
+        }
+    }
+
+    public String toYaml() {
+        return YAML.writeValueAsString(this);
+    }
+
+    /** Writes the plan with a few # comment lines on top. */
+    public void write(Path file, List<String> header) throws IOException {
+        var text = new StringBuilder();
+        for (String line : header) text.append("# ").append(line).append('\n');
+        text.append(toYaml());
+        Files.writeString(file, text, StandardCharsets.UTF_8);
+    }
+
+    /** The plan as one run actually used it: a fixed seed, maybe other traffic numbers, maybe extra app arguments. */
+    public Plan forRun(long seed, Integer count, Integer rate, List<String> extraArgs) {
+        var args = new ArrayList<>(target.args() == null ? List.of() : target.args());
+        args.addAll(extraArgs);
+        var t = new Target(target.url(), target.jar(), List.copyOf(args));
+        var tr = new Traffic(count != null ? count : traffic.count(), rate != null ? rate : traffic.rate(), seed, traffic.request());
+        return new Plan(app, journey, risk, t, database, kafka, tr, correlateBy, fault, checks);
+    }
+
+    public RequestTemplate template() {
+        return RequestTemplate.parse(traffic.request().body());
+    }
+
+    public List<String> resetStatements() {
+        return database.reset() == null ? List.of() : database.reset();
+    }
+
+    /** Everything wrong with the plan, in words a person editing it can act on. Empty if it can run. */
+    public List<String> problems() {
+        var problems = new ArrayList<String>();
+        if (blank(app)) problems.add("app is missing");
+
+        if (target == null || blank(target.url())) {
+            problems.add("target.url is missing");
+        } else if (!target.url().matches("https?://.+")) {
+            problems.add("target.url must start with http:// or https://");
+        } else {
+            try {
+                URI.create(target.url());
+            } catch (IllegalArgumentException e) {
+                problems.add("target.url is not a URL: " + e.getMessage());
+            }
+        }
+
+        if (database == null || blank(database.url())) {
+            problems.add("database.url is missing");
+        } else {
+            if (!database.url().startsWith("jdbc:postgresql:")) problems.add("database.url must be a jdbc:postgresql: URL (only Postgres for now)");
+            if (database.user() == null) problems.add("database.user is missing");
+            for (String sql : resetStatements()) {
+                if (!RESET_STATEMENT.matcher(sql.strip().replaceAll(";$", "")).matches()) {
+                    problems.add("database.reset: only single TRUNCATE, DELETE FROM and UPDATE statements are allowed, not: " + sql);
+                }
+            }
+        }
+
+        if (kafka == null || blank(kafka.bootstrap()) || blank(kafka.topic()) || blank(kafka.group())) {
+            problems.add("kafka needs bootstrap, topic and group");
+        }
+
+        if (correlateBy == null || blank(correlateBy.requestField())) {
+            problems.add("correlate_by.request_field is missing");
+        } else {
+            if (!EffectsTable.isIdentifier(correlateBy.table())) problems.add("correlate_by.table is not a table name: " + correlateBy.table());
+            if (!EffectsTable.isIdentifier(correlateBy.column())) problems.add("correlate_by.column is not a column name: " + correlateBy.column());
+        }
+
+        if (traffic == null || traffic.request() == null) {
+            problems.add("traffic.request is missing");
+        } else {
+            if (traffic.count() == null || traffic.count() < 1) problems.add("traffic.count must be at least 1");
+            if (traffic.rate() == null || traffic.rate() < 1) problems.add("traffic.rate must be at least 1");
+            var r = traffic.request();
+            if (r.method() == null || !BODY_METHODS.contains(r.method())) problems.add("traffic.request.method must be POST, PUT or PATCH");
+            if (r.path() == null || !r.path().startsWith("/")) problems.add("traffic.request.path must start with /");
+            if (correlateBy != null && !blank(correlateBy.requestField())) problems.addAll(bodyProblems(r.body(), correlateBy.requestField()));
+        }
+
+        if (fault != null) {
+            if (!FaultSpec.POINTS.contains(fault.point())) problems.add("fault.point must be one of " + FaultSpec.POINTS);
+            if (!"crash".equals(fault.action())) problems.add("fault.action must be crash");
+            if (fault.nthHit() == null || fault.nthHit() < 1) problems.add("fault.nth_hit must be at least 1");
+            if (fault.times() == null || fault.times() < 1) problems.add("fault.times must be at least 1");
+            if (target != null && blank(target.jar())) problems.add("a fault needs target.jar: Faultline has to start the app to attach its agent");
+        }
+
+        if (checks == null || checks.isEmpty()) {
+            problems.add("checks is empty");
+        } else {
+            for (String check : checks) {
+                if (!DATA_CHECKS.contains(check) && !check.equals(FAULTS_FIRED)) {
+                    problems.add("unknown check '" + check + "': use " + String.join(", ", DATA_CHECKS) + " or " + FAULTS_FIRED);
+                }
+            }
+            if (checks.contains(FAULTS_FIRED) && fault == null) problems.add("check faults-fired needs a fault");
+        }
+        return problems;
+    }
+
+    /** The template must parse, give JSON with the ID field, and give each request its own ID. */
+    private static List<String> bodyProblems(String body, String idField) {
+        try {
+            var template = RequestTemplate.parse(body);
+            var random = new Random(1);
+            String first = Workload.idOf(template.render(1, 0, random), idField);
+            String second = Workload.idOf(template.render(1, 1, random), idField);
+            String otherSeed = Workload.idOf(template.render(2, 0, new Random(2)), idField);
+            if (first.equals(second)) return List.of("traffic.request.body: '" + idField + "' must differ per request: build it from ${seq}");
+            if (first.equals(otherSeed)) return List.of("traffic.request.body: '" + idField + "' must differ per run: build it from ${seed}");
+            return List.of();
+        } catch (IllegalArgumentException e) {
+            return List.of("traffic.request.body: " + e.getMessage());
+        }
+    }
+
+    private static boolean blank(String s) {
+        return s == null || s.isBlank();
+    }
+}
