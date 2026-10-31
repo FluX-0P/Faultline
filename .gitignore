@@ -33,6 +33,7 @@ Thumbs.db
 # Faultline
 .env
 runs/
+.faultline/
 
 # Docs stay local for now
 docs/
