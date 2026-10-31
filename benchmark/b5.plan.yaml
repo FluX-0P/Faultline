@@ -1,0 +1,63 @@
+# Planted bug B5: a charge that timed out is tried again without an idempotency key. The stub charges every 100th charge
+# request, then replies after 3s, long after the worker's 1s timeout. The worker tries again, and the stub, with no key
+# to recognise the retry by, charges the payment a second time. With the key, it returns the first charge instead.
+# faultline benchmark adds the settings that switch the bug on or off.
+app: demo-app
+journey: make-payment
+risk:
+  id: B5
+  pattern: P5
+  title: Retries a timed-out charge without an idempotency key
+  location: ProviderClient#charge
+  file: src/main/java/dev/faultline/demo/payment/ProviderClient.java
+  line: 48
+  why: Hand-written benchmark plan for planted bug B5.
+target:
+  url: http://localhost:8080
+  compose:
+    file: deploy/docker-compose.yml
+    profile: demo
+    services: [toxiproxy, provider, api, worker-1, worker-2, worker-3]
+    consumers: 3
+database:
+  url: jdbc:postgresql://localhost:5432/demo
+  user: demo
+  password: demo
+  reset:
+  - TRUNCATE payments
+  - TRUNCATE processed_events
+  - UPDATE accounts SET balance_minor = 1000000
+  - UPDATE merchant SET balance_minor = 0
+  - TRUNCATE outbox
+  - TRUNCATE stub.charges
+kafka:
+  bootstrap: localhost:9092
+  topic: payments.requested
+  group: payment-worker
+stub: http://localhost:9090
+traffic:
+  count: 2000
+  rate: 100
+  request:
+    method: POST
+    path: /payments
+    body: |
+      {"paymentId": "pay-${seed}-${seq}", "accountId": "acct-${int:1:100}", "amountMinor": ${int:100:5000}}
+correlate_by:
+  request_field: paymentId
+  table: payments
+  column: payment_id
+fault:
+  layer: service
+  action: late-reply
+  duration: 3s
+  nth_hit: 100
+  times: 5
+checks: [no-lost, no-duplicates, no-unexpected, faults-fired]
+rules:
+- id: one-charge-per-payment-at-the-provider
+  sql: select payment_id, count(*) as charges from stub.charges group by payment_id having count(*) > 1
+confirm:
+  runs: 2
+  baselines: 1
+  min_failing: 2

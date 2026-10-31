@@ -1,0 +1,60 @@
+# Planted bug B2: the worker hands each payment to a thread pool and acknowledges its message at once. Crash worker-1
+# while the pool is in the middle of a payment, twice: those messages were acknowledged, so Kafka never redelivers them.
+# With the fix the payment is processed on the listener's own thread, and acknowledged once it has committed.
+# faultline benchmark adds the settings that switch the bug on or off.
+app: demo-app
+journey: make-payment
+risk:
+  id: B2
+  pattern: P2
+  title: Auto-commit with a thread pool
+  location: PaymentListener#onMessage
+  file: src/main/java/dev/faultline/demo/payment/PaymentListener.java
+  line: 38
+  why: Hand-written benchmark plan for planted bug B2.
+target:
+  url: http://localhost:8080
+  compose:
+    file: deploy/docker-compose.yml
+    profile: demo
+    services: [toxiproxy, provider, api, worker-1, worker-2, worker-3]
+    consumers: 3
+database:
+  url: jdbc:postgresql://localhost:5432/demo
+  user: demo
+  password: demo
+  reset:
+  - TRUNCATE payments
+  - TRUNCATE processed_events
+  - UPDATE accounts SET balance_minor = 1000000
+  - UPDATE merchant SET balance_minor = 0
+  - TRUNCATE outbox
+  - TRUNCATE stub.charges
+kafka:
+  bootstrap: localhost:9092
+  topic: payments.requested
+  group: payment-worker
+traffic:
+  count: 3000
+  rate: 100
+  request:
+    method: POST
+    path: /payments
+    body: |
+      {"paymentId": "pay-${seed}-${seq}", "accountId": "acct-${int:1:100}", "amountMinor": ${int:100:5000}}
+correlate_by:
+  request_field: paymentId
+  table: payments
+  column: payment_id
+fault:
+  point: PaymentService#apply
+  when: before
+  action: crash
+  nth_hit: 150
+  times: 2
+  target: worker-1
+checks: [no-lost, no-duplicates, no-unexpected, faults-fired]
+confirm:
+  runs: 2
+  baselines: 1
+  min_failing: 2

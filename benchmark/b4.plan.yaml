@@ -1,0 +1,71 @@
+# Planted bug B4: every payment credits the shop's balance by reading it, then writing it back plus the amount. The
+# barrier holds worker-1 between its read and its write until another worker has written the balance; worker-1 then
+# writes back a balance without that worker's credit. With the fix the read locks the row, so the other worker waits
+# instead and the barrier gives up after 3s. The payments go out 200ms apart, so without the barrier no two overlap;
+# the warm-up first gets the workers past their slow first payments, which would.
+# faultline benchmark adds the settings that switch the bug on or off.
+app: demo-app
+journey: make-payment
+risk:
+  id: B4
+  pattern: P4
+  title: Read-modify-write on the balance
+  location: MerchantBalance#credit
+  file: src/main/java/dev/faultline/demo/payment/MerchantBalance.java
+  line: 25
+  why: Hand-written benchmark plan for planted bug B4.
+target:
+  url: http://localhost:8080
+  compose:
+    file: deploy/docker-compose.yml
+    profile: demo
+    services: [toxiproxy, provider, api, worker-1, worker-2, worker-3]
+    consumers: 3
+database:
+  url: jdbc:postgresql://localhost:5432/demo
+  user: demo
+  password: demo
+  reset:
+  - TRUNCATE payments
+  - TRUNCATE processed_events
+  - UPDATE accounts SET balance_minor = 1000000
+  - UPDATE merchant SET balance_minor = 0
+  - TRUNCATE outbox
+  - TRUNCATE stub.charges
+kafka:
+  bootstrap: localhost:9092
+  topic: payments.requested
+  group: payment-worker
+traffic:
+  count: 100
+  rate: 5
+  warmup: 30
+  request:
+    method: POST
+    path: /payments
+    body: |
+      {"paymentId": "pay-${seed}-${seq}", "accountId": "acct-${int:1:100}", "amountMinor": ${int:100:5000}}
+correlate_by:
+  request_field: paymentId
+  table: payments
+  column: payment_id
+fault:
+  point: MerchantBalance#read
+  when: after
+  action: barrier
+  until: MerchantBalance#write
+  partners: [worker-2, worker-3]
+  duration: 3s
+  nth_hit: 5
+  times: 3
+  target: worker-1
+checks: [no-lost, no-duplicates, no-unexpected, faults-fired]
+rules:
+- id: shop-balance-adds-up
+  sql: |
+    select balance_minor, (select coalesce(sum(amount_minor), 0) from payments) as paid_in from merchant
+    where balance_minor <> (select coalesce(sum(amount_minor), 0) from payments)
+confirm:
+  runs: 2
+  baselines: 1
+  min_failing: 2
