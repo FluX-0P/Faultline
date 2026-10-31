@@ -43,10 +43,10 @@ class PlanTest {
         Plan broken = new Plan(p.app(), p.journey(), p.risk(),
             new Plan.Target("localhost:8080", null, null, List.of()),
             new Plan.Database("jdbc:mysql://x/y", "demo", "demo", List.of("DROP TABLE payments")),
-            p.kafka(), null,
+            p.kafka(), null, null, null,
             new Plan.Traffic(0, 100, null, new Plan.Request("GET", "/payments", "{\"paymentId\": \"pay-${seq}\"}"), null),
-            new Plan.CorrelateBy("paymentId", "payments; drop table x", "payment_id"), null,
-            p.fault(), List.of("no-lost", "no-lies"), null, new Plan.Confirm(2, 1, 3));
+            new Plan.CorrelateBy("paymentId", "payments; drop table x", "payment_id"), null, null,
+            p.fault(), List.of("no-lost", "no-lies"), null, null, new Plan.Confirm(2, 1, 3));
 
         assertThat(broken.problems()).contains(
             "target.url must start with http:// or https://",
@@ -58,15 +58,15 @@ class PlanTest {
             "correlate_by.table is not a table name: payments; drop table x",
             "a code fault needs target.jar or target.compose: Faultline has to start the app to attach its agent",
             "confirm.min_failing must be between 1 and confirm.runs",
-            "unknown check 'no-lies': use no-lost, no-duplicates, no-unexpected, per-key-order or faults-fired");
+            "unknown check 'no-lies': use no-lost, no-duplicates, no-unexpected, per-key-order, no-lost-downstream, recovery-within or faults-fired");
     }
 
     @Test
     void aRunPinsTheSeedAndItsArgumentsWinOverThePlans() {
         Plan p = TestPlans.valid();
         Plan withArgs = new Plan(p.app(), p.journey(), p.risk(), new Plan.Target(p.target().url(), p.target().jar(), null,
-            List.of("--payments.dedupe=none", "--server.port=8080")), p.database(), p.kafka(), null, p.traffic(), p.correlateBy(), null, p.fault(), p.checks(),
-            null, p.confirm());
+            List.of("--payments.dedupe=none", "--server.port=8080")), p.database(), p.kafka(), null, null, null, p.traffic(), p.correlateBy(),
+            null, null, p.fault(), p.checks(), null, null, p.confirm());
 
         Plan run = withArgs.forRun(42, null, 50, List.of("--payments.dedupe=claim-first"), 3, null);
 
@@ -108,8 +108,8 @@ class PlanTest {
         assertThat(TestPlans.valid().problems()).isEmpty();
 
         var onAJar = new Plan(TestPlans.valid().app(), null, null, TestPlans.valid().target(), TestPlans.valid().database(), TestPlans.valid().kafka(),
-            null, TestPlans.valid().traffic(), TestPlans.valid().correlateBy(), null, new Plan.Fault("process", null, null, "freeze", null, 1, null, "worker-1", null),
-            List.of("no-lost"), null, null);
+            null, null, null, TestPlans.valid().traffic(), TestPlans.valid().correlateBy(), null, null,
+            new Plan.Fault("process", null, null, "freeze", null, 1, null, "worker-1", null), List.of("no-lost"), null, null, null);
         assertThat(onAJar.problems()).contains(
             "fault.action must be one of [kill, pause, restart] for a process fault",
             "a process fault needs target.compose: it stops and starts Docker services",
@@ -129,11 +129,73 @@ class PlanTest {
             .contains("fault.action must be one of [duplicate] for a traffic fault", "fault.nth_hit must be at least 1");
 
         Plan p = TestPlans.ordered(corrupt);
-        Plan bad = new Plan(p.app(), p.journey(), p.risk(), p.target(), p.database(), p.kafka(), new Plan.Relay("t", "t"), p.traffic(),
-            p.correlateBy(), null, p.fault(), p.checks(), List.of(new Plan.Rule("r", "delete from payments")), p.confirm());
+        Plan bad = new Plan(p.app(), p.journey(), p.risk(), p.target(), p.database(), p.kafka(), new Plan.Relay("t", "t"), null, null,
+            p.traffic(), p.correlateBy(), null, null, p.fault(), p.checks(), List.of(new Plan.Rule("r", "delete from payments")), null, p.confirm());
         assertThat(bad.problems()).contains(
             "relay needs two different topics, from and to",
             "check per-key-order needs order: key and by",
             "rule r: sql must be one SELECT (or WITH) statement that returns the offending rows");
+    }
+
+    @Test
+    void aBarrierNeedsAnUntilPointAndPartnersThatAreOtherServices() {
+        var barrier = new Plan.Fault(null, "MerchantBalance#read", "after", "barrier", 5L, 3, "3s", "worker-1", null,
+            "MerchantBalance#write", List.of("worker-2", "worker-3"), null);
+        assertThat(TestPlans.compose(barrier).problems()).isEmpty();
+
+        var bad = new Plan.Fault(null, "MerchantBalance#read", "after", "barrier", 5L, 3, null, "worker-1", null,
+            "write", List.of("worker-1"), null);
+        assertThat(TestPlans.compose(bad).problems()).contains(
+            "a barrier needs until: the Class#method another worker must return from before it lets go",
+            "a barrier needs a duration: the longest it holds, such as 3s",
+            "fault.partners must be other services of target.compose.services, not worker-1");
+        assertThat(TestPlans.compose(new Plan.Fault(null, "A#b", null, "crash", 1L, 1, null, "worker-1", null, "A#c", null, null)).problems())
+            .contains("fault.until and fault.partners are only for a barrier");
+    }
+
+    @Test
+    void networkAndServiceFaultsNeedTheirHelpersAddress() {
+        var slowDb = new Plan.Fault("network", null, null, "latency", null, 1, "10s", "worker-1-db", "5s", null, null, "3s");
+        var outage = new Plan.Fault("service", null, null, "outage", null, 1, "6s", null, "5s");
+        var late = new Plan.Fault("service", null, null, "late-reply", 100L, 5, "3s", null, null);
+        assertThat(TestPlans.helped(slowDb, "recovery-within").problems()).isEmpty();
+        assertThat(TestPlans.helped(outage, "recovery-within", "no-lost-downstream").problems()).isEmpty();
+        assertThat(TestPlans.helped(late).problems()).isEmpty();
+
+        assertThat(TestPlans.compose(slowDb).problems()).contains("a network fault needs toxiproxy: the address of its API, such as http://localhost:8474");
+        assertThat(TestPlans.compose(outage).problems()).contains("a service fault needs stub: the address of the fake payment provider, such as http://localhost:9090");
+        assertThat(TestPlans.helped(new Plan.Fault("network", null, null, "latency", null, 1, null, null, null)).problems()).contains(
+            "fault.target must name the Toxiproxy proxy to break, such as worker-1-db",
+            "a latency fault needs latency, such as 3s",
+            "fault.at must say when, after the traffic starts, such as 10s",
+            "fault.duration must say how long it lasts, such as 15s");
+        assertThat(TestPlans.helped(new Plan.Fault("service", null, null, "late-reply", 0L, 1, null, null, null)).problems()).contains(
+            "fault.nth_hit must be at least 1", "fault.duration must say how late the stub replies, such as 3s");
+    }
+
+    @Test
+    void aWarmUpIsKeptForTheRunAndCannotBeNegative() {
+        Plan p = TestPlans.valid();
+        var t = p.traffic();
+        Plan warm = new Plan(p.app(), p.journey(), p.risk(), p.target(), p.database(), p.kafka(), null, null, null,
+            new Plan.Traffic(t.count(), t.rate(), null, t.request(), null, 30), p.correlateBy(), null, null, p.fault(), p.checks(), null, null, p.confirm());
+
+        assertThat(warm.forRun(42, null, null, List.of(), null, null).traffic().warmupCount()).isEqualTo(30);
+        assertThat(TestPlans.valid().traffic().warmupCount()).isZero();
+        Plan negative = new Plan(p.app(), p.journey(), p.risk(), p.target(), p.database(), p.kafka(), null, null, null,
+            new Plan.Traffic(t.count(), t.rate(), null, t.request(), null, -1), p.correlateBy(), null, null, p.fault(), p.checks(), null, null, p.confirm());
+        assertThat(negative.problems()).contains("traffic.warmup cannot be negative");
+    }
+
+    @Test
+    void recoveryWithinNeedsAFaultThatEndsAndLeavesTheBaseline() {
+        var late = new Plan.Fault("service", null, null, "late-reply", 100L, 5, "3s", null, null);
+        assertThat(TestPlans.helped(late, "recovery-within").problems())
+            .contains("check recovery-within needs recovery_within (such as 30s) and a fault that lasts from at for a duration (process, network or a service outage)");
+
+        var outage = new Plan.Fault("service", null, null, "outage", null, 1, "6s", null, "5s");
+        Plan baseline = TestPlans.helped(outage, "recovery-within").withoutFault();
+        assertThat(baseline.checks()).doesNotContain("recovery-within", "faults-fired");
+        assertThat(baseline.problems()).isEmpty();
     }
 }

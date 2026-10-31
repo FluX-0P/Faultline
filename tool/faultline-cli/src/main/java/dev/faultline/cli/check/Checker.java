@@ -4,6 +4,7 @@ import static dev.faultline.cli.history.HistoryEntry.Status.FAIL;
 import static dev.faultline.cli.history.HistoryEntry.Status.INFO;
 import static dev.faultline.cli.history.HistoryEntry.Status.OK;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -116,6 +117,45 @@ public final class Checker {
             }
         });
         return CheckResult.of("per-key-order", offenders);
+    }
+
+    /** Every request the app applied also reached the downstream topic, such as a "payment completed" event. */
+    public static CheckResult noLostDownstream(Map<String, Integer> applied, Set<String> published, String topic) {
+        var lost = applied.keySet().stream().filter(id -> !published.contains(id)).sorted(NATURAL)
+            .map(id -> id + " (applied, but no event on " + topic + ")").toList();
+        return CheckResult.of("no-lost-downstream", lost);
+    }
+
+    /**
+     * After the fault ended, the app caught up within {@code budget}: every request it had accepted before the end was
+     * applied no later than {@code budget} after it.
+     *
+     * @param faultEnded when the last planned fault ended, null if none did
+     * @param firstApplied when each request ID's effect first appeared
+     */
+    public static CheckResult recoveryWithin(List<HistoryEntry> history, Instant faultEnded, Duration budget, Map<String, Instant> firstApplied) {
+        if (faultEnded == null) return CheckResult.of("recovery-within", List.of("the fault never ended, so there was nothing to recover from"));
+        var deadline = faultEnded.plus(budget);
+        var sentBefore = new LinkedHashMap<String, Instant>();
+        for (var e : history) {
+            if (e.status() == OK && e.sentAt().isBefore(faultEnded)) sentBefore.merge(e.id(), e.sentAt(), (a, b) -> a.isBefore(b) ? a : b);
+        }
+        var late = new ArrayList<String>();
+        Duration caughtUp = Duration.ZERO;
+        for (var id : sentBefore.keySet().stream().sorted(NATURAL).toList()) {
+            Instant at = firstApplied.get(id);
+            if (at == null) {
+                late.add(id + " (never applied)");
+            } else if (at.isAfter(deadline)) {
+                late.add("%s (applied %.1fs after the fault ended)".formatted(id, Duration.between(faultEnded, at).toMillis() / 1000.0));
+            } else if (at.isAfter(faultEnded.plus(caughtUp))) {
+                caughtUp = Duration.between(faultEnded, at);
+            }
+        }
+        String note = late.isEmpty()
+            ? "caught up %.1fs after the fault ended (allowed %ds)".formatted(caughtUp.toMillis() / 1000.0, budget.toSeconds())
+            : "%d requests sent before the fault ended were not applied within %ds of its end".formatted(late.size(), budget.toSeconds());
+        return CheckResult.of("recovery-within", late, note);
     }
 
     /** An app rule: every row its SQL returned is an offender. */

@@ -29,22 +29,29 @@ import tools.jackson.dataformat.yaml.YAMLWriteFeature;
  * plan.yaml: everything one run needs, in a file you can read, edit and approve. Which risk it tests, how to reach
  * the app, its database and Kafka, the traffic to send, how a request is matched to its effect, the fault, and the
  * checks, and how many runs it takes to confirm a bug. {@code risk}, {@code fault} and {@code confirm} are optional, so a
- * hand-written plan can be a plain fault-free run.
+ * hand-written plan can be a plain fault-free run. {@code toxiproxy} and {@code stub} are the addresses Faultline drives
+ * network faults and the fake payment provider through.
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record Plan(String app, String journey, Risk risk, Target target, Database database, Kafka kafka, Relay relay,
-                   Traffic traffic, CorrelateBy correlateBy, Order order, Fault fault, List<String> checks, List<Rule> rules,
-                   Confirm confirm) {
+                   String toxiproxy, String stub, Traffic traffic, CorrelateBy correlateBy, Downstream downstream, Order order,
+                   Fault fault, List<String> checks, List<Rule> rules, String recoveryWithin, Confirm confirm) {
 
     public static final List<String> DATA_CHECKS = List.of("no-lost", "no-duplicates", "no-unexpected");
     public static final String FAULTS_FIRED = "faults-fired";
     public static final String PER_KEY_ORDER = "per-key-order";
+    public static final String NO_LOST_DOWNSTREAM = "no-lost-downstream";
+    public static final String RECOVERY_WITHIN = "recovery-within";
+    private static final List<String> OTHER_CHECKS = List.of(PER_KEY_ORDER, NO_LOST_DOWNSTREAM, RECOVERY_WITHIN, FAULTS_FIRED);
     private static final List<String> TRAFFIC_ACTIONS = List.of("duplicate");
     private static final List<String> MESSAGING_ACTIONS = List.of("duplicate", "reorder", "corrupt");
+    private static final List<String> NETWORK_ACTIONS = List.of("latency", "timeout", "cut");
+    private static final List<String> SERVICE_ACTIONS = List.of("late-reply", "error", "slow", "outage");
     private static final Pattern RULE_SQL = Pattern.compile("(?is)\\s*(select|with)\\s[^;]+;?\\s*");
     private static final Set<String> BODY_METHODS = Set.of("POST", "PUT", "PATCH");
-    private static final List<String> CODE_ACTIONS = List.of("crash", "delay", "throw");
+    private static final List<String> CODE_ACTIONS = List.of("crash", "delay", "throw", "barrier");
     private static final List<String> PROCESS_ACTIONS = List.of("kill", "pause", "restart");
+    private static final String CLASS_AND_METHOD = "[\\w.$]+#\\w+";
     private static final Set<String> CODE_WHEN = Set.of("before", "after");
     private static final Pattern RESET_STATEMENT = Pattern.compile("(?is)\\s*(truncate|delete\\s+from|update)\\s+[^;]+");
 
@@ -78,15 +85,32 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
     /** Where to read the consumer group's lag, to know when the app has finished. */
     public record Kafka(String bootstrap, String topic, String group) {}
 
-    /** Without a {@code seed}, each run picks one and prints it. */
-    /** Without a {@code seed}, each run picks one. {@code drainTimeout} caps the wait for the app to finish (default 3m). */
-    public record Traffic(Integer count, Integer rate, Long seed, Request request, String drainTimeout) {}
+    /**
+     * Without a {@code seed}, each run picks one. {@code drainTimeout} caps the wait for the app to finish (default 3m).
+     * {@code warmup} requests (other IDs, same rate) go first, so a JVM that has just started is not slow on the measured
+     * ones; Faultline waits until the app has finished them and resets the database again before the run starts.
+     */
+    public record Traffic(Integer count, Integer rate, Long seed, Request request, String drainTimeout, Integer warmup) {
+        public Traffic(Integer count, Integer rate, Long seed, Request request, String drainTimeout) {
+            this(count, rate, seed, request, drainTimeout, null);
+        }
+
+        public int warmupCount() {
+            return warmup == null ? 0 : warmup;
+        }
+    }
 
     /**
      * A chaos relay Faultline runs between two topics: the app publishes to {@code from}, the relay forwards to {@code to}
      * and fires messaging faults on the way. The app must be set to publish to {@code from}.
      */
     public record Relay(String from, String to) {}
+
+    /**
+     * A topic the app publishes to once it has done its work, such as payments.completed. Each event names its request
+     * in {@code requestField}; no-lost-downstream checks that every applied request has one.
+     */
+    public record Downstream(String topic, String requestField) {}
 
     /**
      * For per-key-order: requests with the same {@code key} field must be applied in the order they happened, read from
@@ -103,20 +127,40 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
     public record CorrelateBy(String requestField, String table, String column) {}
 
     /**
-     * A fault in the code ({@code layer: code}, the default) fires from the agent: {@code action} crash, delay or throw,
-     * {@code when} before or after the {@code point} method (or at before-ack), on every {@code nth_hit}th call until it has
-     * fired {@code times} times. A {@code layer: process} fault is Docker's: kill, pause or restart the {@code target}
-     * service {@code at} a time after the traffic starts, for {@code duration}. In Compose mode, {@code target} is also the
-     * one service that gets the agent.
+     * A fault in the code ({@code layer: code}, the default) fires from the agent: {@code action} crash, delay, throw or
+     * barrier, {@code when} before or after the {@code point} method (or at before-ack), on every {@code nth_hit}th call until
+     * it has fired {@code times} times. A barrier holds the call for up to {@code duration}, until one of the {@code partners}
+     * (other services) or another thread returns from {@code until}. In Compose mode, {@code target} gets the agent.
+     *
+     * <p>The other layers: {@code process} kills, pauses or restarts the {@code target} service; {@code network} slows
+     * ({@code latency}), stalls ({@code timeout}) or cuts the connections of the {@code target} Toxiproxy proxy;
+     * {@code service} makes the stub answer every nth charge late ({@code late-reply}: after charging it), slowly or with an
+     * error, or go through an {@code outage}. Those that last a while start {@code at} a time after the traffic starts and
+     * last {@code duration}. {@code traffic} and {@code messaging} duplicate (or reorder or corrupt) every nth request or
+     * relayed message.
      */
     public record Fault(String layer, String point, String when, String action, Long nthHit, Integer times,
-                        String duration, String target, String at) {
+                        String duration, String target, String at, String until, List<String> partners, String latency) {
+        public Fault(String layer, String point, String when, String action, Long nthHit, Integer times, String duration,
+                     String target, String at) {
+            this(layer, point, when, action, nthHit, times, duration, target, at, null, null, null);
+        }
+
         public boolean inCode() {
             return layer == null || layer.equals("code");
         }
 
         public int count() {
             return times == null ? 1 : times;
+        }
+
+        /** Whether it lasts from {@code at} for {@code duration}, rather than firing on every nth call. */
+        public boolean timed() {
+            return "process".equals(layer) || "network".equals(layer) || "service".equals(layer) && "outage".equals(action);
+        }
+
+        public List<String> partnerServices() {
+            return partners == null ? List.of() : partners;
         }
     }
 
@@ -156,19 +200,25 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
      */
     public Plan forRun(long seed, Integer count, Integer rate, List<String> extraArgs, Integer runs, Integer baselines) {
         var t = new Target(target.url(), target.jar(), target.compose(), withArgs(extraArgs));
-        var tr = new Traffic(count != null ? count : traffic.count(), rate != null ? rate : traffic.rate(), seed, traffic.request(), traffic.drainTimeout());
+        var tr = new Traffic(count != null ? count : traffic.count(), rate != null ? rate : traffic.rate(), seed, traffic.request(),
+            traffic.drainTimeout(), traffic.warmup());
         Confirm c = confirm();
         if (runs != null || baselines != null) {
             int r = runs != null ? runs : c.runs();
             c = new Confirm(r, baselines != null ? baselines : c.baselines(), Math.min(c.minFailing(), r));
         }
-        return new Plan(app, journey, risk, t, database, kafka, relay, tr, correlateBy, order, fault, checks, rules, c);
+        return new Plan(app, journey, risk, t, database, kafka, relay, toxiproxy, stub, tr, correlateBy, downstream, order, fault,
+            checks, rules, recoveryWithin, c);
     }
 
-    /** The same plan without its fault: a baseline run, to show the checks pass when nothing is broken. */
+    /**
+     * The same plan without its fault: a baseline run, to show the checks pass when nothing is broken. With no fault there
+     * is nothing to recover from, so recovery-within goes too.
+     */
     public Plan withoutFault() {
-        var c = checks.stream().filter(check -> !check.equals(FAULTS_FIRED)).toList();
-        return new Plan(app, journey, risk, target, database, kafka, relay, traffic, correlateBy, order, null, c, rules, confirm);
+        var c = checks.stream().filter(check -> !check.equals(FAULTS_FIRED) && !check.equals(RECOVERY_WITHIN)).toList();
+        return new Plan(app, journey, risk, target, database, kafka, relay, toxiproxy, stub, traffic, correlateBy, downstream, order,
+            null, c, rules, recoveryWithin, confirm);
     }
 
     /** The plan's own confirm settings, or a single run without a baseline for plans that have none. */
@@ -250,6 +300,7 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
             problems.add("traffic.request is missing");
         } else {
             if (traffic.count() == null || traffic.count() < 1) problems.add("traffic.count must be at least 1");
+            if (traffic.warmup() != null && traffic.warmup() < 0) problems.add("traffic.warmup cannot be negative");
             if (traffic.rate() == null || traffic.rate() < 1) problems.add("traffic.rate must be at least 1");
             var r = traffic.request();
             if (r.method() == null || !BODY_METHODS.contains(r.method())) problems.add("traffic.request.method must be POST, PUT or PATCH");
@@ -278,6 +329,13 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
         if (traffic != null && traffic.drainTimeout() != null && !Durations.valid(traffic.drainTimeout())) {
             problems.add("traffic.drain_timeout must be a duration, such as 60s");
         }
+        if (downstream != null && (blank(downstream.topic()) || blank(downstream.requestField()))) {
+            problems.add("downstream needs topic and request_field (the field of each event that holds the request's ID)");
+        }
+        if (recoveryWithin != null && !Durations.valid(recoveryWithin)) problems.add("recovery_within must be a duration, such as 30s");
+        for (var url : new String[] {toxiproxy, stub}) {
+            if (url != null && !url.matches("https?://[^/]+/?")) problems.add("toxiproxy and stub must be addresses such as http://localhost:8474, not " + url);
+        }
         var ruleIds = new HashSet<String>();
         for (Rule rule : rules == null ? List.<Rule>of() : rules) {
             if (blank(rule.id()) || !ruleIds.add(rule.id())) problems.add("every rule needs its own id");
@@ -297,12 +355,17 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
             problems.add("checks is empty");
         } else {
             for (String check : checks) {
-                if (!DATA_CHECKS.contains(check) && !check.equals(FAULTS_FIRED) && !check.equals(PER_KEY_ORDER)) {
-                    problems.add("unknown check '" + check + "': use " + String.join(", ", DATA_CHECKS) + ", " + PER_KEY_ORDER + " or " + FAULTS_FIRED);
+                if (!DATA_CHECKS.contains(check) && !OTHER_CHECKS.contains(check)) {
+                    problems.add("unknown check '" + check + "': use " + String.join(", ", DATA_CHECKS) + ", "
+                        + String.join(", ", OTHER_CHECKS.subList(0, OTHER_CHECKS.size() - 1)) + " or " + OTHER_CHECKS.getLast());
                 }
             }
             if (checks.contains(FAULTS_FIRED) && fault == null) problems.add("check faults-fired needs a fault");
             if (checks.contains(PER_KEY_ORDER) && order == null) problems.add("check per-key-order needs order: key and by");
+            if (checks.contains(NO_LOST_DOWNSTREAM) && downstream == null) problems.add("check no-lost-downstream needs downstream: topic and request_field");
+            if (checks.contains(RECOVERY_WITHIN) && (recoveryWithin == null || fault == null || !fault.timed())) {
+                problems.add("check recovery-within needs recovery_within (such as 30s) and a fault that lasts from at for a duration (process, network or a service outage)");
+            }
         }
         return problems;
     }
@@ -314,7 +377,7 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
         if (fault.times() != null && fault.times() < 1) problems.add("fault.times must be at least 1");
 
         if (fault.inCode()) {
-            if (blank(fault.point()) || !fault.point().equals("before-ack") && !fault.point().matches("[\\w.$]+#\\w+")) {
+            if (blank(fault.point()) || !fault.point().equals("before-ack") && !fault.point().matches(CLASS_AND_METHOD)) {
                 problems.add("fault.point must be before-ack or Class#method, such as PaymentService#apply");
             }
             if (fault.when() != null && !CODE_WHEN.contains(fault.when())) problems.add("fault.when must be before or after");
@@ -324,6 +387,36 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
             if (!startsApp) problems.add("a code fault needs target.jar or target.compose: Faultline has to start the app to attach its agent");
             if (!services.isEmpty() && !services.contains(fault.target())) {
                 problems.add("fault.target must name the service that gets the agent, one of " + services);
+            }
+            if ("barrier".equals(fault.action())) {
+                if (fault.until() == null || !fault.until().matches(CLASS_AND_METHOD)) {
+                    problems.add("a barrier needs until: the Class#method another worker must return from before it lets go");
+                }
+                if (!Durations.valid(fault.duration())) problems.add("a barrier needs a duration: the longest it holds, such as 3s");
+                for (String partner : fault.partnerServices()) {
+                    if (!services.contains(partner) || partner.equals(fault.target())) {
+                        problems.add("fault.partners must be other services of target.compose.services, not " + partner);
+                    }
+                }
+            } else if (fault.until() != null || fault.partners() != null) {
+                problems.add("fault.until and fault.partners are only for a barrier");
+            }
+        } else if (fault.layer().equals("network")) {
+            if (!NETWORK_ACTIONS.contains(fault.action())) problems.add("fault.action must be one of " + NETWORK_ACTIONS + " for a network fault");
+            if (toxiproxy == null) problems.add("a network fault needs toxiproxy: the address of its API, such as http://localhost:8474");
+            if (blank(fault.target())) problems.add("fault.target must name the Toxiproxy proxy to break, such as worker-1-db");
+            if ("latency".equals(fault.action()) && !Durations.valid(fault.latency())) problems.add("a latency fault needs latency, such as 3s");
+            problems.addAll(timeProblems());
+        } else if (fault.layer().equals("service")) {
+            if (!SERVICE_ACTIONS.contains(fault.action())) problems.add("fault.action must be one of " + SERVICE_ACTIONS + " for a service fault");
+            if (stub == null) problems.add("a service fault needs stub: the address of the fake payment provider, such as http://localhost:9090");
+            if ("outage".equals(fault.action())) {
+                problems.addAll(timeProblems());
+            } else {
+                if (fault.nthHit() == null || fault.nthHit() < 1) problems.add("fault.nth_hit must be at least 1");
+                if (!"error".equals(fault.action()) && !Durations.valid(fault.duration())) {
+                    problems.add("fault.duration must say how late the stub replies, such as 3s");
+                }
             }
         } else if (fault.layer().equals("process")) {
             if (!PROCESS_ACTIONS.contains(fault.action())) problems.add("fault.action must be one of " + PROCESS_ACTIONS + " for a process fault");
@@ -341,8 +434,15 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
             if (fault.nthHit() == null || fault.nthHit() < 1) problems.add("fault.nth_hit must be at least 1");
             if (relay == null) problems.add("a messaging fault needs a relay: from and to topics");
         } else {
-            problems.add("fault.layer must be code, process, traffic or messaging");
+            problems.add("fault.layer must be code, process, network, service, traffic or messaging");
         }
+        return problems;
+    }
+
+    private List<String> timeProblems() {
+        var problems = new ArrayList<String>();
+        if (!Durations.valid(fault.at())) problems.add("fault.at must say when, after the traffic starts, such as 10s");
+        if (!Durations.valid(fault.duration())) problems.add("fault.duration must say how long it lasts, such as 15s");
         return problems;
     }
 

@@ -57,8 +57,8 @@ class FindingsTest {
     @Test
     void aPlanWithoutARiskHasNoFindings() {
         var p = PLAN;
-        var noRisk = new Plan(p.app(), p.journey(), null, p.target(), p.database(), p.kafka(), null, p.traffic(), p.correlateBy(), null, p.fault(),
-            p.checks(), null, p.confirm());
+        var noRisk = new Plan(p.app(), p.journey(), null, p.target(), p.database(), p.kafka(), null, null, null, p.traffic(), p.correlateBy(),
+            null, null, p.fault(), p.checks(), null, null, p.confirm());
         assertThat(Findings.of(noRisk, List.of(broken("run-1", 3)))).isEmpty();
     }
 

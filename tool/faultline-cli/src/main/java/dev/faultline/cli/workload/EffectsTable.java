@@ -16,6 +16,7 @@ import java.util.regex.Pattern;
 public final class EffectsTable {
     private static final Pattern IDENTIFIER = Pattern.compile("[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)?");
     private static final String UNDEFINED_TABLE = "42P01";
+    private static final String UNDEFINED_SCHEMA = "3F000";
 
     private final String table;
     private final String column;
@@ -84,8 +85,8 @@ public final class EffectsTable {
     public record Reset(int ran, List<String> skipped) {}
 
     /**
-     * Runs the plan's reset statements in one transaction. A statement on a table that does not exist yet is skipped:
-     * on a fresh database the app creates its tables (and starting data) when it starts.
+     * Runs the plan's reset statements in one transaction. A statement on a table (or schema) that does not exist yet is
+     * skipped: on a fresh database the app, or the stub, creates its tables (and starting data) when it starts.
      */
     public static Reset reset(Connection db, List<String> statements) throws SQLException {
         int ran = 0;
@@ -98,7 +99,9 @@ public final class EffectsTable {
                     st.execute(sql);
                     ran++;
                 } catch (SQLException e) {
-                    if (!UNDEFINED_TABLE.equals(e.getSQLState())) throw new SQLException("reset statement failed: " + sql, e);
+                    if (!UNDEFINED_TABLE.equals(e.getSQLState()) && !UNDEFINED_SCHEMA.equals(e.getSQLState())) {
+                        throw new SQLException("reset statement failed: " + sql, e);
+                    }
                     db.rollback(before);
                     skipped.add(sql);
                 }

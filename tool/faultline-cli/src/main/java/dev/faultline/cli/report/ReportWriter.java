@@ -85,7 +85,8 @@ public final class ReportWriter {
                 .append("</td><td>").append("%,d".formatted(a.drain().rows())).append(a.drain().settled() ? "" : " <span class=\"muted\">(drain gave up)</span>")
                 .append("</td><td><div class=\"ids\">");
             for (CheckResult c : a.checks()) {
-                html.append("<span class=\"chip ").append(c.passed() ? "pass" : "fail").append("\">").append(esc(c.name()))
+                html.append("<span class=\"chip ").append(c.passed() ? "pass" : "fail").append("\"")
+                    .append(c.note() == null ? "" : " title=\"" + esc(c.note()) + "\"").append(">").append(esc(c.name()))
                     .append(c.passed() ? "" : " " + c.offenders().size()).append("</span>");
             }
             html.append("</div></td></tr>\n");
@@ -98,7 +99,8 @@ public final class ReportWriter {
             html.append("<h2>What failed</h2>\n<table>\n<thead><tr><th>Run</th><th>Check</th><th>Offenders</th></tr></thead>\n<tbody>\n");
             for (Failure f : failed) {
                 html.append("<tr><td class=\"mono\">").append(esc(f.attempt().name())).append("</td><td class=\"mono\">").append(esc(f.check().name()))
-                    .append("</td><td>").append(ids(f.check().offenders())).append("</td></tr>\n");
+                    .append("</td><td>").append(f.check().note() == null ? "" : "<p>" + esc(f.check().note()) + "</p>")
+                    .append(ids(f.check().offenders())).append("</td></tr>\n");
             }
             html.append("</tbody>\n</table>\n");
         }

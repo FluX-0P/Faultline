@@ -27,6 +27,7 @@ final class Chaos {
     private final Set<String> corrupted = new LinkedHashSet<>();
     private long hits;
     private int done;
+    private volatile boolean armed = true;
 
     /** @param fired told (action, request ID) each time a fault fires */
     Chaos(String action, long nthHit, int times, String idField, BiConsumer<String, String> fired) {
@@ -37,11 +38,16 @@ final class Chaos {
         this.fired = fired;
     }
 
+    /** Disarmed, every message goes through untouched and uncounted, such as during a warm-up. */
+    void armed(boolean armed) {
+        this.armed = armed;
+    }
+
     /** The messages to forward now, in order. */
     List<Message> accept(Message m) {
         var out = new ArrayList<Message>();
         Message waiting = held.remove(m.key());
-        boolean fire = action != null && ++hits % nthHit == 0 && done < times;
+        boolean fire = action != null && armed && ++hits % nthHit == 0 && done < times;
         if (!fire) {
             out.add(m);
         } else {

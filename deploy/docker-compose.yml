@@ -13,6 +13,16 @@ x-demo-app: &demo-app
     SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/demo
     SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:19092
 
+# a worker reaches Postgres through its own Toxiproxy proxy, so a network fault can hit one worker alone,
+# and charges every payment at the fake payment provider
+x-worker: &worker
+  <<: *demo-app
+  depends_on:
+    postgres: {condition: service_healthy}
+    kafka: {condition: service_started}
+    toxiproxy: {condition: service_healthy}
+    provider: {condition: service_healthy}
+
 services:
   postgres:
     image: postgres:17
@@ -47,6 +57,37 @@ services:
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_NUM_PARTITIONS: 3
 
+  # Network faults: one proxy per worker in front of Postgres (toxiproxy.json). Faultline adds latency, stops the
+  # replies or cuts the connections through its API on port 8474.
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.13.0
+    profiles: [demo]
+    command: ["-host=0.0.0.0", "-config=/config/toxiproxy.json"]
+    volumes: ["./toxiproxy.json:/config/toxiproxy.json:ro"]
+    ports: ["8474:8474"]
+    healthcheck:
+      test: ["CMD", "/toxiproxy-cli", "list"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  # The fake payment provider the workers charge payments at: Faultline's stub, run from the CLI jar, with its ledger
+  # in Postgres (table stub.charges). Faultline breaks it through its control API on port 9090.
+  provider:
+    image: faultline/cli:dev
+    build: ../tool/faultline-cli
+    profiles: [demo]
+    command: [stub, --port, "9090", --db, "jdbc:postgresql://postgres:5432/demo", --db-user, demo, --db-password, demo]
+    restart: on-failure
+    depends_on:
+      postgres: {condition: service_healthy}
+    ports: ["9090:9090"]
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9090 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q 200 <&3"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
   # The demo app, for Faultline's multi-worker runs: docker compose --profile demo up -d --build
   # api takes the HTTP traffic; worker-1..3 consume from Kafka. Faultline starts these itself during a run,
   # with that run's settings and fault agent, so you rarely start them by hand.
@@ -59,13 +100,25 @@ services:
       SPRING_KAFKA_LISTENER_AUTO_STARTUP: "false"
 
   worker-1:
-    <<: *demo-app
+    <<: *worker
     ports: ["8081:8080"]
+    environment:
+      <<: *demo-env
+      SPRING_DATASOURCE_URL: jdbc:postgresql://toxiproxy:15431/demo
+      PAYMENTS_PROVIDER_URL: http://provider:9090
 
   worker-2:
-    <<: *demo-app
+    <<: *worker
     ports: ["8082:8080"]
+    environment:
+      <<: *demo-env
+      SPRING_DATASOURCE_URL: jdbc:postgresql://toxiproxy:15432/demo
+      PAYMENTS_PROVIDER_URL: http://provider:9090
 
   worker-3:
-    <<: *demo-app
+    <<: *worker
     ports: ["8083:8080"]
+    environment:
+      <<: *demo-env
+      SPRING_DATASOURCE_URL: jdbc:postgresql://toxiproxy:15433/demo
+      PAYMENTS_PROVIDER_URL: http://provider:9090

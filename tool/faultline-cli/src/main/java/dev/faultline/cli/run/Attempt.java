@@ -3,6 +3,7 @@ package dev.faultline.cli.run;
 import static java.util.stream.Collectors.counting;
 import static java.util.stream.Collectors.groupingBy;
 
+import java.io.IOException;
 import java.io.PrintWriter;
 import java.net.URI;
 import java.nio.file.Files;
@@ -10,9 +11,11 @@ import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
-import java.util.List;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -24,16 +27,20 @@ import dev.faultline.cli.check.CheckResult;
 import dev.faultline.cli.check.Checker;
 import dev.faultline.cli.drain.Drainer;
 import dev.faultline.cli.fault.Faults;
-import dev.faultline.cli.fault.ProcessFaults;
+import dev.faultline.cli.fault.TimedFaults;
 import dev.faultline.cli.history.HistoryEntry;
 import dev.faultline.cli.history.HistoryEntry.Status;
 import dev.faultline.cli.history.HistoryLog;
+import dev.faultline.cli.kafka.DownstreamReader;
 import dev.faultline.cli.kafka.KafkaLag;
+import dev.faultline.cli.network.Toxiproxy;
 import dev.faultline.cli.plan.Durations;
 import dev.faultline.cli.plan.Plan;
 import dev.faultline.cli.relay.ChaosRelay;
+import dev.faultline.cli.stub.StubControl;
 import dev.faultline.cli.traffic.TrafficSender;
 import dev.faultline.cli.workload.EffectsTable;
+import dev.faultline.cli.workload.EffectsWatcher;
 import dev.faultline.cli.workload.Request;
 import dev.faultline.cli.workload.Workload;
 
@@ -45,6 +52,8 @@ final class Attempt {
     static final String RESULT_FILE = "attempt.json";
     private static final Duration STARTUP_TIMEOUT = Duration.ofSeconds(120);
     private static final int SHOW_OFFENDERS = 10;
+    /** Warm-up requests use the plan's seed plus this, so their IDs never match the run's own. */
+    private static final long WARMUP_SEED_OFFSET = 1_000_000;
 
     private final String name;
     private final String kind;
@@ -55,6 +64,8 @@ final class Attempt {
     private AppProcess process;
     private DockerStack stack;
     private ChaosRelay relay;
+    private DownstreamReader downstream;
+    private EffectsWatcher watcher;
 
     private Attempt(String name, String kind, Plan plan, Path dir, Path agentJar, PrintWriter out) {
         this.name = name;
@@ -81,28 +92,32 @@ final class Attempt {
 
         try (var conn = DriverManager.getConnection(db.url(), db.user(), db.password());
              var sender = new TrafficSender(URI.create(plan.target().url()));
-             var lag = new KafkaLag(plan.kafka().bootstrap(), plan.kafka().group(), plan.kafka().topic())) {
+             var lag = new KafkaLag(plan.kafka().bootstrap(), plan.kafka().group(), plan.kafka().topic());
+             var toxiproxy = plan.toxiproxy() == null ? null : new Toxiproxy(plan.toxiproxy());
+             var stub = plan.stub() == null ? null : new StubControl(plan.stub())) {
             try {
                 prepare(sender, lag);
                 reset(conn);
-                startApp(sender, lag);
+                startApp(sender, lag, toxiproxy, stub);
+                if (toxiproxy != null) toxiproxy.reset();
+                if (stub != null) stub.reset();
+                startRelay();
+                warmUp(conn, sender, lag, effects);
+                arm(toxiproxy, stub);
                 if (fault != null && "traffic".equals(fault.layer())) requests = duplicateSome(requests, fault);
-                if (plan.relay() != null) {
-                    relay = new ChaosRelay(plan.kafka().bootstrap(), plan.relay(), fault, plan.correlateBy().requestField(), dir, line -> Out.line(out, "%s", line));
-                    relay.start();
-                }
+                startWatching(effects);
 
-                ProcessFaults processFaults = fault != null && "process".equals(fault.layer())
-                    ? new ProcessFaults(fault, stack, dir, line -> Out.line(out, "%s", line)) : null;
+                TimedFaults timed = fault != null && fault.timed()
+                    ? new TimedFaults(fault, stack, toxiproxy, stub, dir, line -> Out.line(out, "%s", line)) : null;
                 Out.line(out, "send      %,d x %s %s at %d/s, seed %d", requests.size(), request.method(), request.path(), traffic.rate(), traffic.seed());
                 Path historyFile = dir.resolve("history.jsonl");
                 long sendMillis;
                 try (var history = HistoryLog.create(historyFile)) {
-                    if (processFaults != null) processFaults.start();
+                    if (timed != null) timed.start();
                     sendMillis = sender.send(requests, request.method(), request.path(), traffic.rate(), history).toMillis();
-                    if (processFaults != null) processFaults.awaitDone();
+                    if (timed != null) timed.awaitDone();
                 } finally {
-                    if (processFaults != null) processFaults.close();
+                    if (timed != null) timed.close();
                 }
                 List<HistoryEntry> entries = HistoryLog.read(historyFile);
                 Map<Status, Long> byStatus = entries.stream().collect(groupingBy(HistoryEntry::status, counting()));
@@ -110,43 +125,19 @@ final class Attempt {
                     byStatus.getOrDefault(Status.INFO, 0L), sendMillis);
                 Out.line(out, "          done in %.1fs   ok %d, fail %d, info %d", sendMillis / 1000.0, sent.ok(), sent.fail(), sent.info());
 
-                Out.line(out, "drain     waiting until Kafka lag is 0 and %s stops changing ...", effects.table());
-                var relayLag = relay == null ? null : new KafkaLag(plan.kafka().bootstrap(), relay.group(), plan.relay().from());
-                Drainer.Result drained;
-                try {
-                    drained = Drainer.waitUntilDone(() -> {
-                        if (process != null) process.checkHealthy();
-                        if (relay != null) relay.checkHealthy();
-                        return effects.rows(conn);
-                    }, () -> lag.lag() + (relayLag == null ? 0 : relayLag.lag()), Drainer.QUIET, maxWait, Drainer.POLL);
-                } finally {
-                    if (relayLag != null) relayLag.close();
+                var drain = drain(conn, effects, lag, maxWait);
+                Instant faultEnded = timed == null ? null : timed.lastEnded();
+                if (fault != null && "service".equals(fault.layer()) && !fault.timed()) {
+                    for (var f : stub.fired()) Faults.logFired(dir, "service", f.action(), f.paymentId());
                 }
-                var drain = new AttemptResult.Drain(drained.count(), drained.backlog(), drained.settled(), drained.waited().toMillis());
-                if (drained.settled()) {
-                    Out.line(out, "          %,d rows, lag 0, unchanged for %ds", drained.count(), Drainer.QUIET.toSeconds());
-                } else {
-                    Out.line(out, "          gave up after %ds with lag %d and %,d rows: 'lost' results may be false",
-                        maxWait.toSeconds(), drained.backlog(), drained.count());
-                }
-
                 Integer restarts = process != null ? Integer.valueOf(process.restarts()) : stack != null ? Integer.valueOf(stack.restarts()) : null;
                 closeApp();
 
+                Map<String, Instant> firstApplied = watcher == null ? Map.of() : watcher.stop();
+                Set<String> published = downstream == null ? Set.of() : downstream.requestIds();
                 Set<String> destroyed = relay == null ? Set.of() : relay.corrupted();
-                closeRelay();
-                var checks = new ArrayList<CheckResult>();
-                for (var c : Checker.check(entries, effects.appliedCounts(conn), destroyed)) {
-                    if (plan.checks().contains(c.name())) checks.add(c);
-                }
-                if (plan.checks().contains(Plan.PER_KEY_ORDER)) {
-                    var keyOf = new HashMap<String, String>();
-                    for (var r : requests) keyOf.putIfAbsent(r.id(), Workload.idOf(r.body(), plan.order().key()));
-                    checks.add(Checker.perKeyOrder(entries, keyOf, effects.appliedOrder(conn, plan.order().by())));
-                }
-                for (var rule : plan.rules() == null ? List.<Plan.Rule>of() : plan.rules()) {
-                    checks.add(Checker.rule(rule.id(), EffectsTable.rows(conn, rule.sql())));
-                }
+                closeWatchers();
+                var checks = check(conn, effects, entries, requests, destroyed, published, firstApplied, faultEnded);
                 Integer fired = null;
                 if (fault != null) {
                     fired = Faults.fired(dir);
@@ -159,10 +150,58 @@ final class Attempt {
                 Json.writePretty(dir.resolve(RESULT_FILE), result);
                 return result;
             } finally {
-                closeRelay();
+                closeWatchers();
                 closeApp();
             }
         }
+    }
+
+    /** Waits until Kafka lag (the app's, and the relay's) is 0 and the effects table and downstream topic stop changing. */
+    private AttemptResult.Drain drain(Connection conn, EffectsTable effects, KafkaLag lag, Duration maxWait) throws Exception {
+        Out.line(out, "drain     waiting until Kafka lag is 0 and %s%s stops changing ...", effects.table(),
+            downstream == null ? "" : " and " + plan.downstream().topic());
+        var relayLag = relayLag();
+        Drainer.Result drained;
+        try {
+            drained = Drainer.waitUntilDone(() -> {
+                if (process != null) process.checkHealthy();
+                if (relay != null) relay.checkHealthy();
+                if (downstream != null) downstream.checkHealthy();
+                return effects.rows(conn) + (downstream == null ? 0 : downstream.events());
+            }, () -> lag.lag() + (relayLag == null ? 0 : relayLag.lag()), Drainer.QUIET, maxWait, Drainer.POLL);
+        } finally {
+            if (relayLag != null) relayLag.close();
+        }
+        if (drained.settled()) {
+            Out.line(out, "          %,d rows%s, lag 0, unchanged for %ds", effects.rows(conn),
+                downstream == null ? "" : ", %,d events".formatted(downstream.events()), Drainer.QUIET.toSeconds());
+        } else {
+            Out.line(out, "          gave up after %ds with lag %d and %,d rows: 'lost' results may be false",
+                maxWait.toSeconds(), drained.backlog(), effects.rows(conn));
+        }
+        return new AttemptResult.Drain(effects.rows(conn), drained.backlog(), drained.settled(), drained.waited().toMillis());
+    }
+
+    private List<CheckResult> check(Connection conn, EffectsTable effects, List<HistoryEntry> entries, List<Request> requests, Set<String> destroyed,
+                                    Set<String> published, Map<String, Instant> firstApplied, Instant faultEnded) throws Exception {
+        var checks = new ArrayList<CheckResult>();
+        var applied = effects.appliedCounts(conn);
+        for (var c : Checker.check(entries, applied, destroyed)) {
+            if (plan.checks().contains(c.name())) checks.add(c);
+        }
+        if (plan.checks().contains(Plan.PER_KEY_ORDER)) {
+            var keyOf = new HashMap<String, String>();
+            for (var r : requests) keyOf.putIfAbsent(r.id(), Workload.idOf(r.body(), plan.order().key()));
+            checks.add(Checker.perKeyOrder(entries, keyOf, effects.appliedOrder(conn, plan.order().by())));
+        }
+        if (plan.checks().contains(Plan.NO_LOST_DOWNSTREAM)) checks.add(Checker.noLostDownstream(applied, published, plan.downstream().topic()));
+        if (plan.checks().contains(Plan.RECOVERY_WITHIN)) {
+            checks.add(Checker.recoveryWithin(entries, faultEnded, Durations.parse(plan.recoveryWithin()), firstApplied));
+        }
+        for (var rule : plan.rules() == null ? List.<Plan.Rule>of() : plan.rules()) {
+            checks.add(Checker.rule(rule.id(), EffectsTable.rows(conn, rule.sql())));
+        }
+        return checks;
     }
 
     /** A client that submits some requests twice: every nth one is sent again right after itself, until it has done so times times. */
@@ -180,9 +219,80 @@ final class Attempt {
         return out;
     }
 
-    private void closeRelay() throws InterruptedException {
+    /** The chaos relay's lag, for the drain, or null without a relay. */
+    private KafkaLag relayLag() {
+        return relay == null ? null : new KafkaLag(plan.kafka().bootstrap(), relay.group(), plan.relay().from());
+    }
+
+    /**
+     * Sends the warm-up requests (other IDs than the run's: the same template with another seed), waits until the app
+     * has finished them, and resets the database again. Nothing fires meanwhile: the agent and the relay are not armed yet.
+     */
+    private void warmUp(Connection conn, TrafficSender sender, KafkaLag lag, EffectsTable effects) throws Exception {
+        var traffic = plan.traffic();
+        int n = traffic.warmupCount();
+        if (n == 0) return;
+        var requests = Workload.generate(plan.template(), plan.correlateBy().requestField(), traffic.seed() + WARMUP_SEED_OFFSET, n);
+        Out.line(out, "warm-up   %,d requests at %d/s, then the database is reset again", n, traffic.rate());
+        try (var history = HistoryLog.create(dir.resolve("warmup.jsonl"))) {
+            sender.send(requests, traffic.request().method(), traffic.request().path(), traffic.rate(), history);
+        }
+        var relayLag = relayLag();
+        try {
+            var drained = Drainer.waitUntilDone(() -> effects.rows(conn), () -> lag.lag() + (relayLag == null ? 0 : relayLag.lag()));
+            if (!drained.settled()) throw new IllegalStateException("the app did not finish its warm-up requests (lag " + drained.backlog() + ")");
+        } finally {
+            if (relayLag != null) relayLag.close();
+        }
+        reset(conn);
+    }
+
+    /**
+     * Arms what counts toward the fault: the agent and the relay (if a warm-up kept them waiting), and the stub's
+     * nth-charge faults. A network fault's proxy must exist; it is broken later, on the fault's schedule.
+     */
+    private void arm(Toxiproxy toxiproxy, StubControl stub) throws Exception {
+        var fault = plan.fault();
+        if (relay != null) relay.armed(true);
+        if (fault == null) return;
+        if (fault.inCode() && plan.traffic().warmupCount() > 0) Faults.arm(dir);
+        if ("network".equals(fault.layer())) toxiproxy.checkProxy(fault.target());
+        if ("service".equals(fault.layer()) && !fault.timed()) {
+            Duration delay = fault.duration() == null ? Duration.ZERO : Durations.parse(fault.duration());
+            stub.arm(fault.action(), fault.nthHit(), fault.count(), delay);
+            Out.line(out, "fault     the stub will %s every %dth charge, %d times%s", fault.action().replace('-', ' '), fault.nthHit(), fault.count(),
+                delay.isZero() ? "" : ", by " + fault.duration());
+        }
+    }
+
+    /** The chaos relay, before any traffic; it waits to be armed when there is a warm-up first. */
+    private void startRelay() {
+        if (plan.relay() == null) return;
+        relay = new ChaosRelay(plan.kafka().bootstrap(), plan.relay(), plan.fault(), plan.correlateBy().requestField(), dir, line -> Out.line(out, "%s", line));
+        relay.armed(plan.traffic().warmupCount() == 0);
+        relay.start();
+    }
+
+    /** What watches the run from outside: the downstream topic and the effects table. */
+    private void startWatching(EffectsTable effects) throws Exception {
+        if (plan.downstream() != null) {
+            downstream = new DownstreamReader(plan.kafka().bootstrap(), plan.downstream());
+            downstream.start();
+        }
+        if (plan.checks().contains(Plan.RECOVERY_WITHIN)) {
+            var db = plan.database();
+            watcher = new EffectsWatcher(DriverManager.getConnection(db.url(), db.user(), db.password()), effects);
+            watcher.start();
+        }
+    }
+
+    private void closeWatchers() throws Exception {
         if (relay != null) relay.close();
+        if (downstream != null) downstream.close();
+        if (watcher != null) watcher.close();
         relay = null;
+        downstream = null;
+        watcher = null;
     }
 
     /** Checks Kafka answers, then makes sure no messages from an earlier run will be processed during this one. */
@@ -224,22 +334,27 @@ final class Attempt {
         }
     }
 
-    private void startApp(TrafficSender sender, KafkaLag lag) throws Exception {
+    private void startApp(TrafficSender sender, KafkaLag lag, Toxiproxy toxiproxy, StubControl stub) throws Exception {
         var target = plan.target();
         var fault = plan.fault();
         boolean agent = fault != null && fault.inCode();
+        boolean armLater = plan.traffic().warmupCount() > 0;
         if (agent && !Files.isRegularFile(agentJar)) {
             throw new IllegalStateException("fault agent not found at " + agentJar + ": build it with (cd tool && ./mvnw -q package -DskipTests)");
         }
 
         if (target.compose() != null) {
-            var env = agent ? Faults.writeAgentPlan(fault, dir, DockerStack.RUN_DIR_IN_CONTAINER) : Map.<String, String>of();
+            var agents = new LinkedHashMap<String, Map<String, String>>();
+            if (agent) {
+                agents.put(fault.target(), Faults.writeAgentPlan(fault, dir, DockerStack.RUN_DIR_IN_CONTAINER, armLater));
+                for (String partner : fault.partnerServices()) agents.put(partner, Faults.writePartnerPlan(fault, dir, DockerStack.RUN_DIR_IN_CONTAINER));
+            }
             Out.line(out, "app       starting %s with Docker Compose%s ...", String.join(", ", target.compose().services()),
-                agent ? ", the fault agent on " + fault.target() : "");
+                agent ? ", the fault agent on " + String.join(", ", agents.keySet()) : "");
             long start = System.nanoTime();
-            stack.up(plan.appSettings(), agent ? fault.target() : null, agentJar, env);
+            stack.up(plan.appSettings(), agents, agentJar);
             int consumers = target.compose().consumers() == null ? 0 : target.compose().consumers();
-            while (!sender.isReachable() || consumers > 0 && lag.stableMembers() < consumers) {
+            while (!sender.isReachable() || consumers > 0 && lag.stableMembers() < consumers || !helpersReady(toxiproxy, stub)) {
                 waitOrGiveUp(start);
             }
             Out.line(out, "          ready after %.1fs%s", (System.nanoTime() - start) / 1e9, consumers > 0 ? ", " + consumers + " consumers in the group" : "");
@@ -248,18 +363,32 @@ final class Attempt {
             if (!Files.isRegularFile(appJar)) {
                 throw new IllegalStateException("app jar not found: " + Out.path(appJar) + " (build the app first, for example ./mvnw -q package -DskipTests)");
             }
-            var env = agent ? Faults.writeAgentPlan(fault, dir, dir.toAbsolutePath().toString()) : Map.<String, String>of();
+            var env = agent ? Faults.writeAgentPlan(fault, dir, dir.toAbsolutePath().toString(), armLater) : Map.<String, String>of();
             process = new AppProcess(AppProcess.command(appJar, agent ? agentJar : null, target.args()), env, dir.resolve("app.log"),
                 line -> Out.line(out, "%s", line));
             process.start();
             Out.line(out, "app       started %s (pid %d)%s, waiting for it to answer ...", appJar.getFileName(), process.pid(),
                 agent ? " with the fault agent" : "");
             long start = System.nanoTime();
-            while (!sender.isReachable()) {
+            while (!sender.isReachable() || !helpersReady(toxiproxy, stub)) {
                 process.checkHealthy();
                 waitOrGiveUp(start);
             }
             Out.line(out, "          ready after %.1fs", (System.nanoTime() - start) / 1e9);
+        } else if (!helpersReady(toxiproxy, stub)) {
+            throw new IllegalStateException("the plan's toxiproxy or stub is not answering");
+        }
+    }
+
+    /** Whether Toxiproxy and the stub answer, when the plan uses them. */
+    private static boolean helpersReady(Toxiproxy toxiproxy, StubControl stub) throws InterruptedException {
+        if (stub != null && !stub.isReachable()) return false;
+        if (toxiproxy == null) return true;
+        try {
+            toxiproxy.reset();
+            return true;
+        } catch (IOException e) {
+            return false;
         }
     }
 
@@ -284,12 +413,13 @@ final class Attempt {
     private void printChecks(List<CheckResult> checks) {
         boolean first = true;
         for (var c : checks) {
-            Out.line(out, "%-9s %-14s %s", first ? "check" : "", c.name(), c.passed() ? "PASS" : "FAIL (" + c.offenders().size() + ")");
+            Out.line(out, "%-9s %-20s %s%s", first ? "check" : "", c.name(), c.passed() ? "PASS" : "FAIL (" + c.offenders().size() + ")",
+                c.note() == null ? "" : "   " + c.note());
             for (var offender : c.offenders().stream().limit(SHOW_OFFENDERS).toList()) {
-                Out.line(out, "%-24s %s", "", offender);
+                Out.line(out, "%-30s %s", "", offender);
             }
             if (c.offenders().size() > SHOW_OFFENDERS) {
-                Out.line(out, "%-24s ... and %d more (see %s)", "", c.offenders().size() - SHOW_OFFENDERS, RESULT_FILE);
+                Out.line(out, "%-30s ... and %d more (see %s)", "", c.offenders().size() - SHOW_OFFENDERS, RESULT_FILE);
             }
             first = false;
         }

@@ -40,6 +40,9 @@ public final class BenchmarkCommand implements Callable<Integer> {
     @Option(names = "--bug", split = ",", paramLabel = "ID", description = "Only these bugs, such as --bug B1,B10 (default: all)")
     List<String> only = new ArrayList<>();
 
+    @Option(names = "--plan", paramLabel = "FILE", description = "Run this plan instead of each bug's own, such as another fault for --bug B10")
+    Path plan;
+
     @Option(names = "--seed", defaultValue = "42", description = "Seed for every run (default: ${DEFAULT-VALUE})")
     long seed;
 
@@ -122,7 +125,7 @@ public final class BenchmarkCommand implements Callable<Integer> {
     private record Run(String label, String reason, String dir) {}
 
     private Run run(Bug bug, List<String> args, Path dir, Path agent, PrintWriter out) throws Exception {
-        Path planFile = file.getParent().resolve(bug.plan());
+        Path planFile = this.plan != null ? this.plan : file.getParent().resolve(bug.plan());
         Plan plan = Plan.read(planFile).forRun(seed, null, null, args, runs, baselines);
         var problems = plan.problems();
         if (!problems.isEmpty()) throw new IllegalArgumentException(planFile + " has problems: " + String.join("; ", problems));

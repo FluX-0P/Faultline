@@ -18,7 +18,7 @@ class DockerStackTest {
     void theOverrideGivesEveryServiceTheSettingsAndOnlyTheTargetTheAgent(@TempDir Path runDir) throws Exception {
         Path agentJar = runDir.resolve("faultline-agent.jar");
         try (var stack = new DockerStack(TestPlans.COMPOSE, runDir)) {
-            stack.writeOverride(Map.of("payments.dedupe", "none"), "worker-1", agentJar, Map.of("FAULTLINE_PLAN", "/faultline/run/agent-plan.properties"));
+            stack.writeOverride(Map.of("payments.dedupe", "none"), Map.of("worker-1", Map.of("FAULTLINE_PLAN", "/faultline/run/agent-plan.properties")), agentJar);
         }
 
         JsonNode services = YAMLMapper.builder().build().readTree(Files.readString(runDir.resolve("compose.override.yml"))).path("services");

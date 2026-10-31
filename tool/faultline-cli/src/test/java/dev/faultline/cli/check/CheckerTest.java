@@ -105,6 +105,39 @@ class CheckerTest {
     }
 
     @Test
+    void anAppliedRequestWithoutAnEventDownstreamIsLostThere() {
+        var applied = Map.of("p0", 1, "p1", 1, "p10", 1, "p2", 1);
+
+        var result = Checker.noLostDownstream(applied, Set.of("p0", "p1", "p99"), "payments.completed");
+
+        assertThat(result.offenders()).containsExactly("p2 (applied, but no event on payments.completed)",
+            "p10 (applied, but no event on payments.completed)");
+        assertThat(Checker.noLostDownstream(applied, Set.of("p0", "p1", "p2", "p10"), "payments.completed").passed()).isTrue();
+    }
+
+    @Test
+    void recoveryWithinMeasuresHowSoonEverythingSentBeforeTheEndWasApplied() {
+        var end = Instant.parse("2026-10-31T10:00:10Z");
+        var history = List.of(
+            new HistoryEntry(0, "p0", OK, 202, null, end.minusSeconds(8), end.minusSeconds(8)),
+            new HistoryEntry(1, "p1", OK, 202, null, end.minusSeconds(1), end.minusSeconds(1)),
+            new HistoryEntry(2, "p2", FAIL, null, "refused", end.minusSeconds(1), end.minusSeconds(1)),   // never entered: not waited for
+            new HistoryEntry(3, "p3", OK, 202, null, end.plusSeconds(1), end.plusSeconds(1)));             // sent after the end
+        var budget = java.time.Duration.ofSeconds(30);
+
+        var caughtUp = Checker.recoveryWithin(history, end, budget,
+            Map.of("p0", end.minusSeconds(7), "p1", end.plusMillis(2_500), "p3", end.plusSeconds(90)));
+        assertThat(caughtUp.passed()).isTrue();
+        assertThat(caughtUp.note()).isEqualTo("caught up 2.5s after the fault ended (allowed 30s)");
+
+        var stuck = Checker.recoveryWithin(history, end, budget, Map.of("p1", end.plusSeconds(45)));
+        assertThat(stuck.offenders()).containsExactly("p0 (never applied)", "p1 (applied 45.0s after the fault ended)");
+        assertThat(stuck.note()).isEqualTo("2 requests sent before the fault ended were not applied within 30s of its end");
+
+        assertThat(Checker.recoveryWithin(history, null, budget, Map.of()).passed()).isFalse();
+    }
+
+    @Test
     void aRulesRowsAreItsOffenders() {
         assertThat(Checker.rule("one-row-per-payment", List.of("pay-1")).offenders()).containsExactly("pay-1");
         assertThat(Checker.rule("one-row-per-payment", List.of()).passed()).isTrue();

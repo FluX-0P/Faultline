@@ -21,13 +21,13 @@ public final class TestPlans {
             new Plan.Database("jdbc:postgresql://localhost:5432/demo", "demo", "demo",
                 List.of("TRUNCATE TABLE payments", "UPDATE accounts SET balance_minor = 1000000")),
             new Plan.Kafka("localhost:9092", "payments.requested", "payment-worker"),
-            null,
+            null, null, null,
             new Plan.Traffic(3000, 100, null, new Plan.Request("POST", "/payments", BODY), null),
             new Plan.CorrelateBy("paymentId", "payments", "payment_id"),
-            null,
+            null, null,
             new Plan.Fault(null, "before-ack", null, "crash", 300L, 3, null, null, null),
             List.of("no-lost", "no-duplicates", "no-unexpected", "faults-fired"),
-            null,
+            null, null,
             new Plan.Confirm(2, 1, 2));
     }
 
@@ -35,7 +35,8 @@ public final class TestPlans {
     public static Plan compose(Plan.Fault fault) {
         Plan p = valid();
         return new Plan(p.app(), p.journey(), p.risk(), new Plan.Target(p.target().url(), null, COMPOSE, List.of()), p.database(), p.kafka(),
-            p.relay(), p.traffic(), p.correlateBy(), p.order(), fault, p.checks(), p.rules(), p.confirm());
+            p.relay(), p.toxiproxy(), p.stub(), p.traffic(), p.correlateBy(), p.downstream(), p.order(), fault, p.checks(), p.rules(),
+            p.recoveryWithin(), p.confirm());
     }
 
     /** The B9-style plan: a relay, per-key order and an app rule, with this fault. */
@@ -44,7 +45,18 @@ public final class TestPlans {
         var checks = new ArrayList<>(p.checks());
         checks.add("per-key-order");
         return new Plan(p.app(), p.journey(), p.risk(), p.target(), p.database(), p.kafka(), new Plan.Relay("payments.raw", "payments.requested"),
-            p.traffic(), p.correlateBy(), new Plan.Order("accountId", "id"), fault, checks,
-            List.of(new Plan.Rule("one-row-per-payment", "select payment_id from payments group by payment_id having count(*) > 1")), p.confirm());
+            null, null, p.traffic(), p.correlateBy(), null, new Plan.Order("accountId", "id"), fault, checks,
+            List.of(new Plan.Rule("one-row-per-payment", "select payment_id from payments group by payment_id having count(*) > 1")),
+            null, p.confirm());
+    }
+
+    /** The B6-style plan: Toxiproxy and the stub, a downstream topic and recovery-within, with this fault. */
+    public static Plan helped(Plan.Fault fault, String... extraChecks) {
+        Plan p = compose(fault);
+        var checks = new ArrayList<>(p.checks());
+        checks.addAll(List.of(extraChecks));
+        return new Plan(p.app(), p.journey(), p.risk(), p.target(), p.database(), p.kafka(), null, "http://localhost:8474",
+            "http://localhost:9090", p.traffic(), p.correlateBy(), new Plan.Downstream("payments.completed", "paymentId"), null, fault,
+            checks, null, "30s", p.confirm());
     }
 }

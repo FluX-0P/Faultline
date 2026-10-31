@@ -1,0 +1,5 @@
+[
+  {"name": "worker-1-db", "listen": "0.0.0.0:15431", "upstream": "postgres:5432", "enabled": true},
+  {"name": "worker-2-db", "listen": "0.0.0.0:15432", "upstream": "postgres:5432", "enabled": true},
+  {"name": "worker-3-db", "listen": "0.0.0.0:15433", "upstream": "postgres:5432", "enabled": true}
+]
