@@ -15,11 +15,14 @@ spring:
         # a crashed worker is noticed after 6s instead of the default 45s, so a restarted one resumes quickly
         "[session.timeout.ms]": 6000
         "[heartbeat.interval.ms]": 2000
+        # a worker stuck on one message for 10s is taken out of the group and its partitions handed to another
+        "[max.poll.interval.ms]": 10000
     listener:
       # the offset is committed exactly when the code calls acknowledge()
       ack-mode: manual_immediate
 
-demo:
-  fixes:
-    # B1 fix: skip a payment already recorded in processed_events, checked in the same transaction as the debit
-    dedupe: false
+# The planted bugs, each switched by a setting. Every default here plants one; the bug-free values are in
+# benchmark/bugs.yaml. Faultline's scan reads the defaults, so they are the version it judges.
+payments:
+  # how a redelivered payment is recognised: none (B1), check-then-insert (B10) or claim-first (the fix)
+  dedupe: none

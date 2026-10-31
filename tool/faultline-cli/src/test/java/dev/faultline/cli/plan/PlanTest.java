@@ -41,12 +41,12 @@ class PlanTest {
     void reportsWhatIsWrongInWordsYouCanActOn() {
         Plan p = TestPlans.valid();
         Plan broken = new Plan(p.app(), p.journey(), p.risk(),
-            new Plan.Target("localhost:8080", null, List.of()),
+            new Plan.Target("localhost:8080", null, null, List.of()),
             new Plan.Database("jdbc:mysql://x/y", "demo", "demo", List.of("DROP TABLE payments")),
             p.kafka(),
             new Plan.Traffic(0, 100, null, new Plan.Request("GET", "/payments", "{\"paymentId\": \"pay-${seq}\"}")),
             new Plan.CorrelateBy("paymentId", "payments; drop table x", "payment_id"),
-            p.fault(), List.of("no-lost", "no-lies"));
+            p.fault(), List.of("no-lost", "no-lies"), new Plan.Confirm(2, 1, 3));
 
         assertThat(broken.problems()).contains(
             "target.url must start with http:// or https://",
@@ -56,17 +56,63 @@ class PlanTest {
             "traffic.request.method must be POST, PUT or PATCH",
             "traffic.request.body: 'paymentId' must differ per run: build it from ${seed}",
             "correlate_by.table is not a table name: payments; drop table x",
-            "a fault needs target.jar: Faultline has to start the app to attach its agent",
+            "a code fault needs target.jar or target.compose: Faultline has to start the app to attach its agent",
+            "confirm.min_failing must be between 1 and confirm.runs",
             "unknown check 'no-lies': use no-lost, no-duplicates, no-unexpected or faults-fired");
     }
 
     @Test
-    void aRunPinsTheSeedAndAddsArguments() {
-        Plan run = TestPlans.valid().forRun(42, null, 50, List.of("--demo.fixes.dedupe=true"));
+    void aRunPinsTheSeedAndItsArgumentsWinOverThePlans() {
+        Plan p = TestPlans.valid();
+        Plan withArgs = new Plan(p.app(), p.journey(), p.risk(), new Plan.Target(p.target().url(), p.target().jar(), null,
+            List.of("--payments.dedupe=none", "--server.port=8080")), p.database(), p.kafka(), p.traffic(), p.correlateBy(), p.fault(), p.checks(), p.confirm());
+
+        Plan run = withArgs.forRun(42, null, 50, List.of("--payments.dedupe=claim-first"), 3, null);
 
         assertThat(run.traffic().seed()).isEqualTo(42);
         assertThat(run.traffic().count()).isEqualTo(3000);
         assertThat(run.traffic().rate()).isEqualTo(50);
-        assertThat(run.target().args()).containsExactly("--demo.fixes.dedupe=true");
+        assertThat(run.target().args()).containsExactly("--payments.dedupe=claim-first", "--server.port=8080");
+        assertThat(run.appSettings()).containsEntry("payments.dedupe", "claim-first");
+        assertThat(run.confirm()).isEqualTo(new Plan.Confirm(3, 1, 2));
+    }
+
+    @Test
+    void aBaselineIsThePlanWithoutItsFault() {
+        Plan baseline = TestPlans.valid().withoutFault();
+
+        assertThat(baseline.fault()).isNull();
+        assertThat(baseline.checks()).containsExactly("no-lost", "no-duplicates", "no-unexpected");
+        assertThat(baseline.problems()).isEmpty();
+    }
+
+    @Test
+    void codeFaultsCanHitAnyMethodBeforeOrAfter() {
+        var delay = new Plan.Fault(null, "PaymentService#apply", "before", "delay", 200L, 1, "15s", "worker-1", null);
+        assertThat(TestPlans.compose(delay).problems()).isEmpty();
+
+        var bad = new Plan.Fault("code", "PaymentService", "during", "delay", 0L, 1, null, "worker-9", null);
+        assertThat(TestPlans.compose(bad).problems()).contains(
+            "fault.point must be before-ack or Class#method, such as PaymentService#apply",
+            "fault.when must be before or after",
+            "fault.nth_hit must be at least 1",
+            "a delay needs a duration, such as 15s",
+            "fault.target must name the service that gets the agent, one of [api, worker-1, worker-2, worker-3]");
+    }
+
+    @Test
+    void processFaultsNeedComposeATargetAndATime() {
+        var pause = new Plan.Fault("process", null, null, "pause", null, 1, "12s", "worker-1", "8s");
+        assertThat(TestPlans.compose(pause).problems()).isEmpty();
+        assertThat(TestPlans.valid().problems()).isEmpty();
+
+        var onAJar = new Plan(TestPlans.valid().app(), null, null, TestPlans.valid().target(), TestPlans.valid().database(), TestPlans.valid().kafka(),
+            TestPlans.valid().traffic(), TestPlans.valid().correlateBy(), new Plan.Fault("process", null, null, "freeze", null, 1, null, "worker-1", null),
+            List.of("no-lost"), null);
+        assertThat(onAJar.problems()).contains(
+            "fault.action must be one of [kill, pause, restart] for a process fault",
+            "a process fault needs target.compose: it stops and starts Docker services",
+            "fault.at must say when, after the traffic starts, such as 10s",
+            "fault.duration must say how long the service stays down, such as 15s");
     }
 }

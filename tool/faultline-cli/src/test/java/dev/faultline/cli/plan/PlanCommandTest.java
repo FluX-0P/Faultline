@@ -37,7 +37,8 @@ class PlanCommandTest {
         assertThat(PlanCommand.problems(draft, app, MAP, RISK, PlanCommand.facts(app, RISK))).isEmpty();
         Plan plan = PlanCommand.build(draft, app.name(), RISK, PlanCommand.facts(app, RISK));
         assertThat(plan.database().reset()).containsExactly("TRUNCATE payments");
-        assertThat(plan.fault()).isEqualTo(new Plan.Fault("before-ack", "crash", 300L, 3));
+        assertThat(plan.fault()).isEqualTo(new Plan.Fault(null, "before-ack", null, "crash", 300L, 3, null, null, null));
+        assertThat(plan.confirm()).isEqualTo(new Plan.Confirm(2, 1, 2));
     }
 
     @Test
