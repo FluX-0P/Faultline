@@ -1,12 +1,15 @@
 # The demo app's planted bugs, and the hand-written plans that should confirm them.
 # faultline benchmark runs each plan with only its bug switched on, then every plan with all bugs off,
-# where nothing may be confirmed. Bugs B2 to B9 arrive with the rest of Phase 5.
+# where nothing may be confirmed. B2, B4, B5, B6 and B8 arrive in part 3 of Phase 5.
 app: demo-app
 app_dir: demo-app
 
 # every bug off: the settings of the bug-free build
 bug_free:
   payments.dedupe: claim-first
+  payments.dedupe-key: payment-id
+  payments.bad-messages: dead-letter
+  payments.retries: in-place
 
 bugs:
   - id: B1
@@ -17,6 +20,32 @@ bugs:
     plan: b1.plan.yaml
     settings:
       payments.dedupe: none
+
+  - id: B3
+    title: Dedupes by message ID only, so a double submit slips through
+    pattern: P3
+    location: PaymentService#process
+    check: one-charge-per-payment
+    plan: b3.plan.yaml
+    settings:
+      payments.dedupe-key: event-id
+
+  - id: B7
+    title: No dead-letter handling for bad messages
+    pattern: P7
+    location: PaymentListener#onMessage
+    check: no-lost
+    plan: b7.plan.yaml
+    settings:
+      payments.bad-messages: retry-forever
+
+  - id: B9
+    title: A retry topic reorders events for one account
+    # no code pattern on purpose: only breaking the app finds it
+    check: per-key-order
+    plan: b9.plan.yaml
+    settings:
+      payments.retries: retry-topic
 
   - id: B10
     title: A frozen worker wakes up and writes stale data

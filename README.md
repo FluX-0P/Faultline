@@ -69,11 +69,15 @@ A plan can run the app as Docker Compose services instead of a jar (`target.comp
 ./faultline benchmark                             # every planted bug, then the bug-free build
 ```
 
-Faults come in two layers:
+Faults come in four layers:
 
 - **code** (the agent): `crash`, `delay` or `throw`, `before` or `after` any `Class#method` (or at `before-ack`), on every `nth_hit`th call.
 - **process** (Docker): `kill`, `pause` (freeze) or `restart` a service `at` a time after the traffic starts, for a `duration`.
+- **traffic**: `duplicate` every `nth_hit`th request, like a client that submits twice.
+- **messaging**: a chaos relay between two topics (`relay: {from, to}`) that will `duplicate`, `reorder` or `corrupt` every `nth_hit`th message. The app must publish to `from`.
 
-The demo app's planted bugs are switched by settings, all on by default; [benchmark/bugs.yaml](benchmark/bugs.yaml) lists them with the bug-free values and a hand-written plan for each. `faultline benchmark` runs each plan with only its bug on, then again with every bug off, where nothing may be confirmed, and writes `benchmark.json`. Part 1 of Phase 5 covers B1 (save, then acknowledge) and B10 (a frozen worker wakes up and writes stale data).
+Besides no-lost, no-duplicates and no-unexpected, a plan can check `per-key-order` (requests with the same `order.key` applied in the order they happened) and its own `rules`: SQL that must return no rows, such as one charge per payment.
+
+The demo app's planted bugs are switched by settings, all on by default; [benchmark/bugs.yaml](benchmark/bugs.yaml) lists them with the bug-free values and a hand-written plan for each. `faultline benchmark` runs each plan with only its bug on, then again with every bug off, where nothing may be confirmed, and writes `benchmark.json`. So far it covers B1, B3, B7, B9 and B10; B2, B4, B5, B6 and B8 come in part 3 of Phase 5.
 
 Exit code 0 means every check passed, 1 means a check failed (or you did not approve a plan, or the benchmark confirmed a bug on the bug-free build), 2 means Faultline could not run.

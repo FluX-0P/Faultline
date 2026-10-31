@@ -1,0 +1,59 @@
+# Planted bug B9: a payment that fails is retried later from a retry topic, so later payments for the same account
+# overtake it. The fault makes worker-1 fail every 100th payment, 5 times, as a passing database error would; retried
+# in place, the order holds. per-key-order only counts payments that happened one after the other.
+# faultline benchmark adds the settings that switch the bug on or off.
+app: demo-app
+journey: make-payment
+risk:
+  id: B9
+  title: A retry topic reorders events for one account
+  location: PaymentListener#onMessage
+  file: src/main/java/dev/faultline/demo/payment/PaymentListener.java
+  line: 29
+  why: Hand-written benchmark plan for planted bug B9, which has no code pattern.
+target:
+  url: http://localhost:8080
+  compose:
+    file: deploy/docker-compose.yml
+    profile: demo
+    services: [api, worker-1, worker-2, worker-3]
+    consumers: 3
+database:
+  url: jdbc:postgresql://localhost:5432/demo
+  user: demo
+  password: demo
+  reset:
+  - TRUNCATE payments
+  - TRUNCATE processed_events
+  - UPDATE accounts SET balance_minor = 1000000
+kafka:
+  bootstrap: localhost:9092
+  topic: payments.requested
+  group: payment-worker
+traffic:
+  count: 2000
+  rate: 100
+  request:
+    method: POST
+    path: /payments
+    body: |
+      {"paymentId": "pay-${seed}-${seq}", "accountId": "acct-${int:1:100}", "amountMinor": ${int:100:5000}}
+correlate_by:
+  request_field: paymentId
+  table: payments
+  column: payment_id
+order:
+  key: accountId
+  by: id
+fault:
+  point: PaymentService#apply
+  when: before
+  action: throw
+  nth_hit: 100
+  times: 5
+  target: worker-1
+checks: [no-lost, no-duplicates, no-unexpected, per-key-order, faults-fired]
+confirm:
+  runs: 2
+  baselines: 1
+  min_failing: 2

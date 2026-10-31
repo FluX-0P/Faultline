@@ -1,0 +1,57 @@
+# Planted bug B3: the worker dedupes by the event ID the API gives each submission, not by the payment. A client that
+# submits the same payment twice (every 50th request here, 20 times) gets two event IDs, so it is charged twice.
+# faultline benchmark adds the settings that switch the bug on or off.
+app: demo-app
+journey: make-payment
+risk:
+  id: B3
+  pattern: P3
+  title: Dedupes by message ID only
+  location: PaymentService#process
+  file: src/main/java/dev/faultline/demo/payment/PaymentService.java
+  line: 34
+  why: Hand-written benchmark plan for planted bug B3.
+target:
+  url: http://localhost:8080
+  compose:
+    file: deploy/docker-compose.yml
+    profile: demo
+    services: [api, worker-1, worker-2, worker-3]
+    consumers: 3
+database:
+  url: jdbc:postgresql://localhost:5432/demo
+  user: demo
+  password: demo
+  reset:
+  - TRUNCATE payments
+  - TRUNCATE processed_events
+  - UPDATE accounts SET balance_minor = 1000000
+kafka:
+  bootstrap: localhost:9092
+  topic: payments.requested
+  group: payment-worker
+traffic:
+  count: 2000
+  rate: 100
+  request:
+    method: POST
+    path: /payments
+    body: |
+      {"paymentId": "pay-${seed}-${seq}", "accountId": "acct-${int:1:100}", "amountMinor": ${int:100:5000}}
+correlate_by:
+  request_field: paymentId
+  table: payments
+  column: payment_id
+fault:
+  layer: traffic
+  action: duplicate
+  nth_hit: 50
+  times: 20
+checks: [no-lost, no-duplicates, no-unexpected, faults-fired]
+rules:
+- id: one-charge-per-payment
+  sql: select payment_id from payments group by payment_id having count(*) > 1
+confirm:
+  runs: 2
+  baselines: 1
+  min_failing: 2
