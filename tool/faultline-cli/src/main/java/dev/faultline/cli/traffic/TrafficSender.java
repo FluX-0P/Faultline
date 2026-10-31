@@ -16,11 +16,10 @@ import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Function;
 
 import dev.faultline.cli.history.HistoryEntry;
 import dev.faultline.cli.history.HistoryLog;
-import dev.faultline.cli.workload.Payment;
+import dev.faultline.cli.workload.Request;
 
 /**
  * Sends requests on a fixed schedule, whether or not earlier ones have finished, the way real users keep
@@ -56,46 +55,45 @@ public final class TrafficSender implements AutoCloseable {
         if (!isReachable()) throw new IllegalStateException("nothing is answering at " + target + " (is the app running?)");
     }
 
-    /** Sends every payment at {@code ratePerSecond}, records each outcome, and returns once all have finished. */
-    public Duration send(List<Payment> payments, String path, Function<Payment, String> body,
-                         int ratePerSecond, HistoryLog history) throws InterruptedException {
+    /** Sends every request at {@code ratePerSecond}, records each outcome, and returns once all have finished. */
+    public Duration send(List<Request> requests, String method, String path, int ratePerSecond, HistoryLog history)
+            throws InterruptedException {
         URI endpoint = target.resolve(path);
         long intervalNanos = 1_000_000_000L / ratePerSecond;
         long start = System.nanoTime();
         try (var inFlight = Executors.newVirtualThreadPerTaskExecutor()) {
-            for (int i = 0; i < payments.size(); i++) {
+            for (int i = 0; i < requests.size(); i++) {
                 // due times come from the start, not the previous send, so a slow sleep never lowers the rate
                 long wait = start + i * intervalNanos - System.nanoTime();
                 if (wait > 0) {
                     TimeUnit.NANOSECONDS.sleep(wait);
                 }
-                Payment p = payments.get(i);
-                String json = body.apply(p);
-                inFlight.submit(() -> history.append(sendOne(endpoint, json, p)));
+                Request r = requests.get(i);
+                inFlight.submit(() -> history.append(sendOne(endpoint, method, r)));
             }
         } // closing the executor waits for every in-flight request
         return Duration.ofNanos(System.nanoTime() - start);
     }
 
-    HistoryEntry sendOne(URI endpoint, String json, Payment p) {
+    HistoryEntry sendOne(URI endpoint, String method, Request r) {
         var request = HttpRequest.newBuilder(endpoint)
             .timeout(REQUEST_TIMEOUT)
             .header("Content-Type", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofString(json))
+            .method(method, HttpRequest.BodyPublishers.ofString(r.body()))
             .build();
         Instant sentAt = Instant.now();
         try {
             int code = http.send(request, HttpResponse.BodyHandlers.discarding()).statusCode();
-            return HistoryEntry.response(p, classify(code), code, sentAt, Instant.now());
+            return HistoryEntry.response(r, classify(code), code, sentAt, Instant.now());
         } catch (ConnectException | HttpConnectTimeoutException e) {
             // never reached the app, so it cannot have happened
-            return HistoryEntry.noResponse(p, FAIL, describe(e), sentAt, Instant.now());
+            return HistoryEntry.noResponse(r, FAIL, describe(e), sentAt, Instant.now());
         } catch (IOException e) {
             // timed out or dropped after the request went out: it may or may not have happened
-            return HistoryEntry.noResponse(p, INFO, describe(e), sentAt, Instant.now());
+            return HistoryEntry.noResponse(r, INFO, describe(e), sentAt, Instant.now());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return HistoryEntry.noResponse(p, INFO, "interrupted", sentAt, Instant.now());
+            return HistoryEntry.noResponse(r, INFO, "interrupted", sentAt, Instant.now());
         }
     }
 
