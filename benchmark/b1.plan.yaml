@@ -1,0 +1,57 @@
+# Planted bug B1: the worker commits the payment, then acknowledges the Kafka message. Crash worker-1 in between,
+# twice (a restarted worker takes ~10s to rejoin, so 3000 requests leave room for both). Kafka redelivers each message
+# it had not acknowledged, and without a duplicate check it is applied again.
+# faultline benchmark adds the settings that switch the bug on or off.
+app: demo-app
+journey: make-payment
+risk:
+  id: B1
+  pattern: P1
+  title: "Save, then acknowledge the message"
+  location: PaymentListener#onMessage
+  file: src/main/java/dev/faultline/demo/payment/PaymentListener.java
+  line: 18
+  confidence: high
+  why: Hand-written benchmark plan for planted bug B1.
+target:
+  url: http://localhost:8080
+  compose:
+    file: deploy/docker-compose.yml
+    profile: demo
+    services: [api, worker-1, worker-2, worker-3]
+    consumers: 3
+database:
+  url: jdbc:postgresql://localhost:5432/demo
+  user: demo
+  password: demo
+  reset:
+  - TRUNCATE payments
+  - TRUNCATE processed_events
+  - UPDATE accounts SET balance_minor = 1000000
+kafka:
+  bootstrap: localhost:9092
+  topic: payments.requested
+  group: payment-worker
+traffic:
+  count: 3000
+  rate: 100
+  request:
+    method: POST
+    path: /payments
+    body: |
+      {"paymentId": "pay-${seed}-${seq}", "accountId": "acct-${int:1:100}", "amountMinor": ${int:100:5000}}
+correlate_by:
+  request_field: paymentId
+  table: payments
+  column: payment_id
+fault:
+  point: before-ack
+  action: crash
+  nth_hit: 150
+  times: 2
+  target: worker-1
+checks: [no-lost, no-duplicates, no-unexpected, faults-fired]
+confirm:
+  runs: 2
+  baselines: 1
+  min_failing: 2

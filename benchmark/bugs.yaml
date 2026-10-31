@@ -1,0 +1,27 @@
+# The demo app's planted bugs, and the hand-written plans that should confirm them.
+# faultline benchmark runs each plan with only its bug switched on, then every plan with all bugs off,
+# where nothing may be confirmed. Bugs B2 to B9 arrive with the rest of Phase 5.
+app: demo-app
+app_dir: demo-app
+
+# every bug off: the settings of the bug-free build
+bug_free:
+  payments.dedupe: claim-first
+
+bugs:
+  - id: B1
+    title: Saves, then acknowledges the message
+    pattern: P1
+    location: PaymentListener#onMessage
+    check: no-duplicates
+    plan: b1.plan.yaml
+    settings:
+      payments.dedupe: none
+
+  - id: B10
+    title: A frozen worker wakes up and writes stale data
+    # no code pattern on purpose: only breaking the app finds it
+    check: no-duplicates
+    plan: b10.plan.yaml
+    settings:
+      payments.dedupe: check-then-insert
