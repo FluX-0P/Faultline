@@ -58,8 +58,9 @@ public final class Barrier {
         var packet = new DatagramPacket(new byte[16], 16);
         try {
             while (passes.get() == before) {
-                long left = (deadline - System.nanoTime()) / 1_000_000;
-                if (left <= 0) return false;
+                long leftNanos = deadline - System.nanoTime();
+                if (leftNanos <= 0) return false;
+                long left = (leftNanos + 999_999) / 1_000_000;   // rounded up, so it never gives up early
                 if (in == null) {
                     Thread.sleep(Math.min(left, POLL_MS));
                     continue;
