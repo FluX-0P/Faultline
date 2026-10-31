@@ -12,7 +12,9 @@ import java.sql.DriverManager;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 
 import dev.faultline.cli.Json;
 import dev.faultline.cli.Out;
@@ -27,9 +29,12 @@ import dev.faultline.cli.history.HistoryEntry;
 import dev.faultline.cli.history.HistoryEntry.Status;
 import dev.faultline.cli.history.HistoryLog;
 import dev.faultline.cli.kafka.KafkaLag;
+import dev.faultline.cli.plan.Durations;
 import dev.faultline.cli.plan.Plan;
+import dev.faultline.cli.relay.ChaosRelay;
 import dev.faultline.cli.traffic.TrafficSender;
 import dev.faultline.cli.workload.EffectsTable;
+import dev.faultline.cli.workload.Request;
 import dev.faultline.cli.workload.Workload;
 
 /**
@@ -49,6 +54,7 @@ final class Attempt {
     private final PrintWriter out;
     private AppProcess process;
     private DockerStack stack;
+    private ChaosRelay relay;
 
     private Attempt(String name, String kind, Plan plan, Path dir, Path agentJar, PrintWriter out) {
         this.name = name;
@@ -71,6 +77,7 @@ final class Attempt {
         var effects = new EffectsTable(plan.correlateBy().table(), plan.correlateBy().column());
         var db = plan.database();
         var fault = plan.fault();
+        Duration maxWait = maxWait();
 
         try (var conn = DriverManager.getConnection(db.url(), db.user(), db.password());
              var sender = new TrafficSender(URI.create(plan.target().url()));
@@ -79,10 +86,15 @@ final class Attempt {
                 prepare(sender, lag);
                 reset(conn);
                 startApp(sender, lag);
+                if (fault != null && "traffic".equals(fault.layer())) requests = duplicateSome(requests, fault);
+                if (plan.relay() != null) {
+                    relay = new ChaosRelay(plan.kafka().bootstrap(), plan.relay(), fault, plan.correlateBy().requestField(), dir, line -> Out.line(out, "%s", line));
+                    relay.start();
+                }
 
-                ProcessFaults processFaults = fault != null && !fault.inCode()
+                ProcessFaults processFaults = fault != null && "process".equals(fault.layer())
                     ? new ProcessFaults(fault, stack, dir, line -> Out.line(out, "%s", line)) : null;
-                Out.line(out, "send      %,d x %s %s at %d/s, seed %d", traffic.count(), request.method(), request.path(), traffic.rate(), traffic.seed());
+                Out.line(out, "send      %,d x %s %s at %d/s, seed %d", requests.size(), request.method(), request.path(), traffic.rate(), traffic.seed());
                 Path historyFile = dir.resolve("history.jsonl");
                 long sendMillis;
                 try (var history = HistoryLog.create(historyFile)) {
@@ -99,24 +111,41 @@ final class Attempt {
                 Out.line(out, "          done in %.1fs   ok %d, fail %d, info %d", sendMillis / 1000.0, sent.ok(), sent.fail(), sent.info());
 
                 Out.line(out, "drain     waiting until Kafka lag is 0 and %s stops changing ...", effects.table());
-                var drained = Drainer.waitUntilDone(() -> {
-                    if (process != null) process.checkHealthy();
-                    return effects.rows(conn);
-                }, lag::lag);
+                var relayLag = relay == null ? null : new KafkaLag(plan.kafka().bootstrap(), relay.group(), plan.relay().from());
+                Drainer.Result drained;
+                try {
+                    drained = Drainer.waitUntilDone(() -> {
+                        if (process != null) process.checkHealthy();
+                        if (relay != null) relay.checkHealthy();
+                        return effects.rows(conn);
+                    }, () -> lag.lag() + (relayLag == null ? 0 : relayLag.lag()), Drainer.QUIET, maxWait, Drainer.POLL);
+                } finally {
+                    if (relayLag != null) relayLag.close();
+                }
                 var drain = new AttemptResult.Drain(drained.count(), drained.backlog(), drained.settled(), drained.waited().toMillis());
                 if (drained.settled()) {
                     Out.line(out, "          %,d rows, lag 0, unchanged for %ds", drained.count(), Drainer.QUIET.toSeconds());
                 } else {
                     Out.line(out, "          gave up after %ds with lag %d and %,d rows: 'lost' results may be false",
-                        Drainer.MAX_WAIT.toSeconds(), drained.backlog(), drained.count());
+                        maxWait.toSeconds(), drained.backlog(), drained.count());
                 }
 
                 Integer restarts = process != null ? Integer.valueOf(process.restarts()) : stack != null ? Integer.valueOf(stack.restarts()) : null;
                 closeApp();
 
+                Set<String> destroyed = relay == null ? Set.of() : relay.corrupted();
+                closeRelay();
                 var checks = new ArrayList<CheckResult>();
-                for (var c : Checker.check(entries, effects.appliedCounts(conn))) {
+                for (var c : Checker.check(entries, effects.appliedCounts(conn), destroyed)) {
                     if (plan.checks().contains(c.name())) checks.add(c);
+                }
+                if (plan.checks().contains(Plan.PER_KEY_ORDER)) {
+                    var keyOf = new HashMap<String, String>();
+                    for (var r : requests) keyOf.putIfAbsent(r.id(), Workload.idOf(r.body(), plan.order().key()));
+                    checks.add(Checker.perKeyOrder(entries, keyOf, effects.appliedOrder(conn, plan.order().by())));
+                }
+                for (var rule : plan.rules() == null ? List.<Plan.Rule>of() : plan.rules()) {
+                    checks.add(Checker.rule(rule.id(), EffectsTable.rows(conn, rule.sql())));
                 }
                 Integer fired = null;
                 if (fault != null) {
@@ -130,9 +159,30 @@ final class Attempt {
                 Json.writePretty(dir.resolve(RESULT_FILE), result);
                 return result;
             } finally {
+                closeRelay();
                 closeApp();
             }
         }
+    }
+
+    /** A client that submits some requests twice: every nth one is sent again right after itself, until it has done so times times. */
+    private List<Request> duplicateSome(List<Request> requests, Plan.Fault fault) throws Exception {
+        var out = new ArrayList<Request>();
+        int copies = 0;
+        for (var r : requests) {
+            out.add(new Request(out.size(), r.id(), r.body()));
+            if ((r.index() + 1) % fault.nthHit() == 0 && copies < fault.count()) {
+                out.add(new Request(out.size(), r.id(), r.body()));
+                Faults.logFired(dir, "traffic", "duplicate", r.id());
+                copies++;
+            }
+        }
+        return out;
+    }
+
+    private void closeRelay() throws InterruptedException {
+        if (relay != null) relay.close();
+        relay = null;
     }
 
     /** Checks Kafka answers, then makes sure no messages from an earlier run will be processed during this one. */
@@ -211,6 +261,10 @@ final class Attempt {
             }
             Out.line(out, "          ready after %.1fs", (System.nanoTime() - start) / 1e9);
         }
+    }
+
+    private Duration maxWait() {
+        return plan.traffic().drainTimeout() == null ? Drainer.MAX_WAIT : Durations.parse(plan.traffic().drainTimeout());
     }
 
     private void waitOrGiveUp(long start) throws InterruptedException {
