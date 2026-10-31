@@ -1,0 +1,40 @@
+{
+  "type": "object",
+  "properties": {
+    "journey": {
+      "type": "string",
+      "description": "The name of the app-map journey whose steps reach the risky code."
+    },
+    "request": {
+      "type": "object",
+      "properties": {
+        "method": { "type": "string", "enum": ["POST", "PUT", "PATCH"] },
+        "path": { "type": "string", "description": "Exactly as in the endpoint list, such as /payments." },
+        "body": { "type": "string", "description": "The JSON request body as a template with placeholders." }
+      },
+      "required": ["method", "path", "body"],
+      "additionalProperties": false
+    },
+    "correlateBy": {
+      "type": "string",
+      "description": "The request body field whose value identifies the request."
+    },
+    "effect": {
+      "type": "object",
+      "properties": {
+        "table": { "type": "string", "description": "Where processing one request leaves exactly one row." },
+        "column": { "type": "string", "description": "The column of that table holding the correlateBy value." }
+      },
+      "required": ["table", "column"],
+      "additionalProperties": false
+    },
+    "reset": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "TRUNCATE, DELETE and UPDATE statements that put the database back to its starting state."
+    },
+    "why": { "type": "string", "description": "How this traffic reaches the risky code, in one or two sentences." }
+  },
+  "required": ["journey", "request", "correlateBy", "effect", "reset", "why"],
+  "additionalProperties": false
+}

@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "properties": {
+    "duplicateCheck": {
+      "type": "string",
+      "enum": ["yes", "no"],
+      "description": "yes only if a duplicate check in the same transaction protects every effect of the work."
+    },
+    "confidence": { "type": "string", "enum": ["low", "medium", "high"] },
+    "why": { "type": "string", "description": "Two or three sentences naming the lines that decide it." }
+  },
+  "required": ["duplicateCheck", "confidence", "why"],
+  "additionalProperties": false
+}

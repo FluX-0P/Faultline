@@ -1,0 +1,91 @@
+{
+  "type": "object",
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "What the app does, in one or two sentences."
+    },
+    "modules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "A package or area of the code, such as payment." },
+          "purpose": { "type": "string" }
+        },
+        "required": ["name", "purpose"],
+        "additionalProperties": false
+      }
+    },
+    "entryPoints": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "kind": { "type": "string", "enum": ["http", "kafka", "scheduled", "other"] },
+          "name": { "type": "string", "description": "For example POST /payments, or kafka payments.requested." },
+          "handler": { "type": "string", "description": "Class#method, exactly as in the code outline." },
+          "purpose": { "type": "string" }
+        },
+        "required": ["kind", "name", "handler", "purpose"],
+        "additionalProperties": false
+      }
+    },
+    "dataStores": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "kind": { "type": "string", "enum": ["postgres", "mysql", "mongodb", "redis", "kafka", "other"] },
+          "name": { "type": "string" },
+          "tables": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Tables, collections or topics the app uses in this store."
+          }
+        },
+        "required": ["kind", "name", "tables"],
+        "additionalProperties": false
+      }
+    },
+    "outsideCalls": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "The outside service." },
+          "calledFrom": { "type": "string", "description": "Class#method that makes the call." },
+          "purpose": { "type": "string" }
+        },
+        "required": ["name", "calledFrom", "purpose"],
+        "additionalProperties": false
+      }
+    },
+    "journeys": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "kebab-case, such as place-order." },
+          "description": { "type": "string" },
+          "steps": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "handler": { "type": "string", "description": "Class#method that runs this step, exactly as in the code outline." },
+                "does": { "type": "string" }
+              },
+              "required": ["handler", "does"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["name", "description", "steps"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["summary", "modules", "entryPoints", "dataStores", "outsideCalls", "journeys"],
+  "additionalProperties": false
+}

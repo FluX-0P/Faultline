@@ -6,7 +6,6 @@ import static dev.faultline.cli.history.HistoryEntry.Status.OK;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.time.Instant;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -14,83 +13,56 @@ import dev.faultline.cli.history.HistoryEntry;
 import org.junit.jupiter.api.Test;
 
 class CheckerTest {
-    private static final long START = 1_000_000;
 
     @Test
-    void everyPaymentAppliedOncePasses() {
-        var history = List.of(entry(0, "acct-1", 100, OK), entry(1, "acct-2", 200, OK));
-        var results = check(history, Map.of("p0", 1, "p1", 1), Map.of("acct-1", START - 100, "acct-2", START - 200));
+    void everyRequestAppliedOncePasses() {
+        var results = Checker.check(List.of(entry(0, OK), entry(1, OK)), Map.of("p0", 1, "p1", 1));
+        assertThat(results).extracting(CheckResult::name).containsExactly("no-lost", "no-duplicates", "no-unexpected");
         assertThat(results).allMatch(CheckResult::passed);
     }
 
     @Test
-    void missingOkPaymentIsLost() {
-        var history = List.of(entry(0, "acct-1", 100, OK), entry(1, "acct-1", 200, OK));
-        var results = check(history, Map.of("p0", 1), Map.of("acct-1", START - 100));
+    void missingOkRequestIsLost() {
+        var results = Checker.check(List.of(entry(0, OK), entry(1, OK)), Map.of("p0", 1));
         assertThat(result(results, "no-lost").offenders()).containsExactly("p1");
-        assertThat(result(results, "balances").passed()).isTrue();
     }
 
     @Test
-    void missingInfoPaymentIsNotLost() {
-        var history = List.of(entry(0, "acct-1", 100, INFO));
-        var results = check(history, Map.of(), Map.of("acct-1", START));
-        assertThat(results).allMatch(CheckResult::passed);
+    void missingInfoRequestIsNotLost() {
+        assertThat(Checker.check(List.of(entry(0, INFO)), Map.of())).allMatch(CheckResult::passed);
     }
 
     @Test
-    void appliedInfoPaymentRaisesNoFalseAlarm() {
-        // timed out at the client but went through: allowed once, and the balance must count it
-        var history = List.of(entry(0, "acct-1", 100, INFO));
-        var results = check(history, Map.of("p0", 1), Map.of("acct-1", START - 100));
-        assertThat(results).allMatch(CheckResult::passed);
+    void appliedInfoRequestRaisesNoFalseAlarm() {
+        // timed out at the client but went through: allowed once
+        assertThat(Checker.check(List.of(entry(0, INFO)), Map.of("p0", 1))).allMatch(CheckResult::passed);
     }
 
     @Test
-    void doubleAppliedPaymentFailsDuplicatesAndBalances() {
+    void doubleAppliedRequestIsADuplicate() {
         // bug B1: committed, crashed before acknowledge, redelivered, applied again
-        var history = List.of(entry(0, "acct-1", 100, OK));
-        var results = check(history, Map.of("p0", 2), Map.of("acct-1", START - 200));
+        var results = Checker.check(List.of(entry(0, OK)), Map.of("p0", 2));
         assertThat(result(results, "no-duplicates").offenders()).containsExactly("p0 (2x)");
-        assertThat(result(results, "balances").offenders()).containsExactly("acct-1 (expected 999900, actual 999800)");
         assertThat(result(results, "no-lost").passed()).isTrue();
     }
 
     @Test
-    void duplicatedInfoPaymentIsStillADuplicate() {
-        var history = List.of(entry(0, "acct-1", 100, INFO));
-        var results = check(history, Map.of("p0", 2), Map.of("acct-1", START - 200));
+    void duplicatedInfoRequestIsStillADuplicate() {
+        var results = Checker.check(List.of(entry(0, INFO)), Map.of("p0", 2));
         assertThat(result(results, "no-duplicates").offenders()).containsExactly("p0 (2x)");
     }
 
     @Test
-    void appliedFailPaymentIsUnexpected() {
-        var history = List.of(entry(0, "acct-1", 100, FAIL));
-        var results = check(history, Map.of("p0", 1), Map.of("acct-1", START - 100));
+    void appliedFailRequestIsUnexpected() {
+        var results = Checker.check(List.of(entry(0, FAIL)), Map.of("p0", 1));
         assertThat(result(results, "no-unexpected").offenders()).containsExactly("p0 (sent as fail)");
     }
 
     @Test
-    void paymentThatWasNeverSentIsUnexpected() {
-        var results = check(List.of(), Map.of("pay-old-3", 1), Map.of("acct-1", START));
-        assertThat(result(results, "no-unexpected").offenders()).containsExactly("pay-old-3 (never sent)");
-    }
-
-    @Test
-    void debitWithoutPaymentRowFailsBalances() {
-        var history = List.of(entry(0, "acct-1", 100, OK));
-        var results = check(history, Map.of("p0", 1), Map.of("acct-1", START - 300));
-        assertThat(result(results, "balances").offenders()).containsExactly("acct-1 (expected 999900, actual 999700)");
-    }
-
-    @Test
-    void offendersAreInNaturalOrder() {
-        var balances = new HashMap<String, Long>();
-        for (var account : List.of("acct-10", "acct-2", "acct-100", "acct-1")) balances.put(account, 0L);
-        var results = check(List.of(), Map.of(), balances);
-        assertThat(result(results, "balances").offenders())
-            .extracting(s -> s.substring(0, s.indexOf(' ')))
-            .containsExactly("acct-1", "acct-2", "acct-10", "acct-100");
+    void neverSentRowsAreUnexpectedInNaturalOrder() {
+        var results = Checker.check(List.of(), Map.of("old-10", 1, "old-2", 1, "old-1", 1));
+        assertThat(result(results, "no-unexpected").offenders())
+            .containsExactly("old-1 (never sent)", "old-2 (never sent)", "old-10 (never sent)");
     }
 
     @Test
@@ -100,16 +72,12 @@ class CheckerTest {
         assertThat(Checker.faultsFired(3, 4).offenders()).containsExactly("fired 4 of 3");
     }
 
-    private static List<CheckResult> check(List<HistoryEntry> history, Map<String, Integer> applied, Map<String, Long> balances) {
-        return Checker.check(history, applied, balances, START);
-    }
-
     private static CheckResult result(List<CheckResult> results, String name) {
         return results.stream().filter(r -> r.name().equals(name)).findFirst().orElseThrow();
     }
 
-    private static HistoryEntry entry(int index, String account, long amount, HistoryEntry.Status status) {
+    private static HistoryEntry entry(int index, HistoryEntry.Status status) {
         var now = Instant.now();
-        return new HistoryEntry(index, "p" + index, account, amount, status, status == OK ? 202 : null, null, now, now);
+        return new HistoryEntry(index, "p" + index, status, status == OK ? 202 : null, null, now, now);
     }
 }
