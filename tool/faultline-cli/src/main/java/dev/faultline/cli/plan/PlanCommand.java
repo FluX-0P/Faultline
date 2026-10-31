@@ -74,6 +74,8 @@ public final class PlanCommand implements Callable<Integer> {
     static final int RATE = 100;
     static final long NTH_HIT = 300;
     static final int TIMES = 3;
+    // two runs with the fault must both break the data, and one run without it must not
+    static final Plan.Confirm CONFIRM = new Plan.Confirm(2, 1, 2);
     private static final Pattern INSERT = Pattern.compile("(?i)insert\\s+into\\s+([A-Za-z_][A-Za-z0-9_.]*)");
 
     @Spec
@@ -193,14 +195,15 @@ public final class PlanCommand implements Callable<Integer> {
     static Plan build(PlanDraft d, String appName, Risk risk, Facts f) {
         var reset = d.reset().stream().map(s -> s.strip().replaceAll(";+$", "").strip()).filter(s -> !s.isEmpty()).toList();
         return new Plan(appName, d.journey(), risk,
-            new Plan.Target(f.url(), f.jar(), List.of()),
+            new Plan.Target(f.url(), f.jar(), null, List.of()),
             new Plan.Database(f.dbUrl(), f.dbUser(), f.dbPassword(), reset),
             new Plan.Kafka(f.bootstrap(), f.topic(), f.group()),
             // the closing newline makes plan.yaml show the body as a | block, so its quotes need no escaping
             new Plan.Traffic(COUNT, RATE, null, new Plan.Request(d.request().method(), d.request().path(), d.request().body().strip() + "\n")),
             new Plan.CorrelateBy(d.correlateBy(), d.effect().table(), d.effect().column()),
-            new Plan.Fault("before-ack", "crash", NTH_HIT, TIMES),
-            List.of("no-lost", "no-duplicates", "no-unexpected", Plan.FAULTS_FIRED));
+            new Plan.Fault(null, "before-ack", null, "crash", NTH_HIT, TIMES, null, null, null),
+            List.of("no-lost", "no-duplicates", "no-unexpected", Plan.FAULTS_FIRED),
+            CONFIRM);
     }
 
     /** Checks the LLM's draft against the code and the app map, and the plan it makes against the plan's own rules. */
