@@ -54,12 +54,15 @@ public final class PlanRun {
         }
 
         List<Finding> findings = Findings.of(plan, attempts);
-        boolean pass = attempts.stream().allMatch(AttemptResult::allPassed);
-        var result = new RunResult(pass ? "PASS" : "FAIL", attempts, findings, reproduce);
+        var dropped = Findings.droppedRules(plan, attempts);
+        var ignored = Findings.ignored(plan, attempts);
+        boolean pass = attempts.stream().allMatch(a -> a.allPassed(ignored));
+        var result = new RunResult(pass ? "PASS" : "FAIL", attempts, findings, reproduce, dropped);
         Json.writePretty(dir.resolve("result.json"), result);
         Path report = ReportWriter.write(dir);
 
         Out.line(out, "==");
+        for (var d : dropped) Out.line(out, "dropped   rule %s: %s", d.id(), d.reason());
         for (Finding f : findings) {
             Out.line(out, "finding   %-11s %s %sat %s", f.label().name().replace('_', ' '), f.riskId(), f.pattern() == null ? "" : f.pattern() + " ", f.location());
             Out.line(out, "          %s", f.reason());

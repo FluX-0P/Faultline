@@ -36,6 +36,13 @@ public final class SpringConfig {
         return new SpringConfig(values);
     }
 
+    /** This configuration with some settings changed, as a deployment or a benchmark run would set them. */
+    public SpringConfig with(Map<String, String> settings) {
+        var values = new TreeMap<>(this.values);
+        values.putAll(settings);
+        return new SpringConfig(values);
+    }
+
     public Optional<String> get(String key) {
         String value = values.get(key);
         if (value == null) return Optional.empty();

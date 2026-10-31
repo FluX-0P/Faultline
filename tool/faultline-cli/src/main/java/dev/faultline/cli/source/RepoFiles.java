@@ -15,8 +15,8 @@ import java.util.function.Predicate;
 import java.util.regex.Pattern;
 
 /**
- * The files of an app that Faultline reads: docs, build files, Compose files, Spring configs, database migrations
- * and main Java sources. Build output and tests are skipped, files come back in a fixed order (so an unchanged app
+ * The files of an app that Faultline reads: docs, build files, Compose files, Spring configs, database migrations,
+ * OpenAPI specs and main Java sources. Build output and tests are skipped, files come back in a fixed order (so an unchanged app
  * gives the same LLM prompt, and a cache hit), and each is capped so one huge file cannot blow up a prompt.
  */
 public final class RepoFiles {
@@ -25,6 +25,9 @@ public final class RepoFiles {
         "target", "build", "out", "node_modules");
     private static final Pattern COMPOSE = Pattern.compile("(docker-)?compose(\\.[\\w-]+)?\\.ya?ml");
     private static final Pattern SPRING_CONFIG = Pattern.compile("application\\.(yml|yaml|properties)");
+    private static final Pattern SPEC_FILE = Pattern.compile("(?i).+\\.(ya?ml|json)");
+    private static final Pattern SPEC_START = Pattern.compile("(?m)^[\\s{]*\"?(openapi|swagger)\"?\\s*:");
+    static final long MAX_SPEC_CHARS = 2_000_000;
     private static final Pattern SQL_LINE_COMMENT = Pattern.compile("--[^\\n]*");
     private static final Pattern SQL_BLOCK_COMMENT = Pattern.compile("/\\*.*?\\*/", Pattern.DOTALL);
 
@@ -87,6 +90,26 @@ public final class RepoFiles {
         return read(p -> p.endsWith(".sql") && p.contains("src/main/resources/")).stream()
             .map(f -> new TextFile(f.path(), stripSqlComments(f.text())))
             .toList();
+    }
+
+    /**
+     * OpenAPI and Swagger specs: YAML and JSON files with a top-level openapi or swagger key. Read whole, not cut, since a
+     * cut spec would not parse; one over 2 million characters is left out.
+     */
+    public List<TextFile> openApiSpecs() {
+        var specs = new ArrayList<TextFile>();
+        for (String p : paths) {
+            if (!SPEC_FILE.matcher(fileName(p)).matches() || COMPOSE.matcher(fileName(p)).matches() || SPRING_CONFIG.matcher(fileName(p)).matches()) continue;
+            try {
+                Path file = root.resolve(p);
+                if (Files.size(file) > MAX_SPEC_CHARS) continue;
+                String text = Files.readString(file, StandardCharsets.UTF_8).replace("\r\n", "\n");
+                if (SPEC_START.matcher(text.substring(0, Math.min(text.length(), 2_000))).find()) specs.add(new TextFile(p, text));
+            } catch (IOException e) {
+                throw new UncheckedIOException("cannot read " + p, e);
+            }
+        }
+        return specs;
     }
 
     public List<TextFile> springConfigs() {

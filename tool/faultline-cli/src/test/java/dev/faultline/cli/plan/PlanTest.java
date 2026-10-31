@@ -188,6 +188,28 @@ class PlanTest {
     }
 
     @Test
+    void authNamesItsSecretByEnvironmentVariableAndSurvivesTheRun(@TempDir Path dir) throws Exception {
+        Plan p = TestPlans.valid();
+        var t = p.target();
+        Plan withAuth = new Plan(p.app(), p.journey(), p.risk(), new Plan.Target(t.url(), t.jar(), null, t.args(), new Plan.Auth("Authorization", "Bearer ${env:SHOP_TOKEN}")),
+            new Plan.Database(p.database().url(), p.database().user(), p.database().password(), p.database().reset(), "faultline/seed.sql"),
+            p.kafka(), null, null, null, p.traffic(), p.correlateBy(), null, null, p.fault(), p.checks(), null, null, p.confirm());
+
+        assertThat(withAuth.problems()).isEmpty();
+        Path file = dir.resolve("plan.yaml");
+        withAuth.write(file, List.of());
+        assertThat(Files.readString(file)).contains("value: \"Bearer ${env:SHOP_TOKEN}\"").contains("seed_file: faultline/seed.sql");
+        assertThat(Plan.read(file).forRun(42, null, null, List.of("--a=b"), null, null).target().auth()).isEqualTo(withAuth.target().auth());
+
+        Plan secretInline = new Plan(p.app(), p.journey(), p.risk(), new Plan.Target(t.url(), t.jar(), null, t.args(), new Plan.Auth("Bad Header", "Bearer ${SHOP_TOKEN}")),
+            new Plan.Database(p.database().url(), p.database().user(), p.database().password(), p.database().reset(), "seed.txt"),
+            p.kafka(), null, null, null, p.traffic(), p.correlateBy(), null, null, p.fault(), p.checks(), null, null, p.confirm());
+        assertThat(secretInline.problems()).contains("target.auth.header must be a header name, such as Authorization",
+            "target.auth.value: the only placeholder is ${env:NAME}, an environment variable that holds the secret",
+            "database.seed_file must be a .sql file");
+    }
+
+    @Test
     void recoveryWithinNeedsAFaultThatEndsAndLeavesTheBaseline() {
         var late = new Plan.Fault("service", null, null, "late-reply", 100L, 5, "3s", null, null);
         assertThat(TestPlans.helped(late, "recovery-within").problems())

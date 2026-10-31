@@ -14,6 +14,7 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
@@ -30,13 +31,20 @@ public final class TrafficSender implements AutoCloseable {
     static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(5);
 
     private final URI target;
+    private final Map<String, String> headers;
     private final HttpClient http = HttpClient.newBuilder()
         .version(HttpClient.Version.HTTP_1_1)
         .connectTimeout(CONNECT_TIMEOUT)
         .build();
 
     public TrafficSender(URI target) {
+        this(target, Map.of());
+    }
+
+    /** @param headers sent on every request, such as Authorization; never written to the history */
+    public TrafficSender(URI target, Map<String, String> headers) {
         this.target = target;
+        this.headers = Map.copyOf(headers);
     }
 
     /** Whether anything answers at the target. Any HTTP response, even a 404, counts. */
@@ -76,11 +84,12 @@ public final class TrafficSender implements AutoCloseable {
     }
 
     HistoryEntry sendOne(URI endpoint, String method, Request r) {
-        var request = HttpRequest.newBuilder(endpoint)
+        var builder = HttpRequest.newBuilder(endpoint)
             .timeout(REQUEST_TIMEOUT)
             .header("Content-Type", "application/json")
-            .method(method, HttpRequest.BodyPublishers.ofString(r.body()))
-            .build();
+            .method(method, HttpRequest.BodyPublishers.ofString(r.body()));
+        headers.forEach(builder::header);
+        var request = builder.build();
         Instant sentAt = Instant.now();
         try {
             int code = http.send(request, HttpResponse.BodyHandlers.discarding()).statusCode();

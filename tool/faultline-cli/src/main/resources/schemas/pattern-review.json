@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "properties": {
+    "verdicts": {
+      "type": "array",
+      "description": "One verdict for every candidate, by its ID.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "candidate": { "type": "string", "description": "The candidate's ID, such as C1." },
+          "why": { "type": "string", "description": "First the reasoning: two or three sentences naming the lines and settings that decide it." },
+          "risky": { "type": "boolean", "description": "Then the verdict, following from why: true only if the failure described can really happen in this app as configured." },
+          "confidence": { "type": "string", "enum": ["low", "medium", "high"] }
+        },
+        "required": ["candidate", "why", "risky", "confidence"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["verdicts"],
+  "additionalProperties": false
+}

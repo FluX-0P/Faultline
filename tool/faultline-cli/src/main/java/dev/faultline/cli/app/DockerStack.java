@@ -147,7 +147,7 @@ public final class DockerStack implements AutoCloseable {
         return docker(command);
     }
 
-    private static String docker(List<String> args) throws IOException, InterruptedException {
+    static String docker(List<String> args) throws IOException, InterruptedException {
         var command = new ArrayList<>(List.of("docker"));
         command.addAll(args);
         Process p = new ProcessBuilder(command).redirectErrorStream(true).start();

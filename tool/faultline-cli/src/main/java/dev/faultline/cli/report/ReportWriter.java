@@ -74,6 +74,12 @@ public final class ReportWriter {
             html.append("<p class=\"muted\">This plan names no risk, so there is nothing to label. The checks below still apply.</p>\n");
         }
         for (Finding f : result.findings()) html.append(finding(f, result.reproduce()));
+        var dropped = result.droppedRules() == null ? List.<RunResult.DroppedRule>of() : result.droppedRules();
+        if (!dropped.isEmpty()) {
+            html.append("<h2>Rules left out</h2>\n<p class=\"muted\">The LLM drafted these rules; no verdict above counts them.</p>\n<ul>\n");
+            for (var d : dropped) html.append("<li><span class=\"mono\">").append(esc(d.id())).append("</span>: ").append(esc(d.reason())).append("</li>\n");
+            html.append("</ul>\n");
+        }
 
         html.append("<h2>The runs</h2>\n<div class=\"scroll\"><table>\n<thead><tr><th>Run</th><th>Faults fired</th><th>Restarts</th>")
             .append("<th>ok / fail / info</th><th>Rows</th><th>Checks</th></tr></thead>\n<tbody>\n");
