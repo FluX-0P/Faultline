@@ -14,6 +14,7 @@ import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.kafka.clients.admin.OffsetSpec;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.common.GroupState;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.GroupIdNotFoundException;
 import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
@@ -65,6 +66,12 @@ public final class KafkaLag implements AutoCloseable {
      * Moves the group to the end of the topic, so leftovers from an earlier, aborted run are never processed.
      * Kafka only allows this while no consumer in the group is running. Returns how many messages were skipped.
      */
+    /** How many consumers the group has once it has settled; 0 while it is still rebalancing or has no members. */
+    public int stableMembers() throws Exception {
+        var description = admin.describeConsumerGroups(List.of(group)).describedGroups().get(group).get(TIMEOUT_SECONDS, SECONDS);
+        return description.groupState() == GroupState.STABLE ? description.members().size() : 0;
+    }
+
     public long skipBacklog() throws Exception {
         long lag = lag();
         if (lag == 0) return 0;

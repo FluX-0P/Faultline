@@ -11,6 +11,7 @@ import dev.faultline.cli.Json;
 import dev.faultline.cli.check.CheckResult;
 import dev.faultline.cli.plan.Plan;
 import dev.faultline.cli.report.Finding.Label;
+import dev.faultline.cli.run.AttemptResult;
 import dev.faultline.cli.run.RunInfo;
 import dev.faultline.cli.run.RunResult;
 
@@ -41,7 +42,7 @@ public final class ReportWriter {
         String headline = confirmed > 0 ? confirmed + (confirmed == 1 ? " confirmed bug" : " confirmed bugs")
             : pass ? "No confirmed bugs" : "Checks failed, but no bug is confirmed";
         String sub = confirmed > 0 ? "Faultline broke the app on purpose and the data came out wrong. Each bug below reproduces with its command."
-            : pass ? "Every check passed." : "See the checks below: a failure without the planned fault firing proves nothing yet.";
+            : pass ? "Every check passed in every run." : "A check failed, but not in a way that confirms the bug: see the finding and the runs below.";
 
         var html = new StringBuilder();
         html.append("""
@@ -58,13 +59,14 @@ public final class ReportWriter {
             <header>
               <div class="eyebrow">Faultline report</div>
               <h1>%s</h1>
-              <div class="meta">Run %s &middot; seed %d &middot; %,d requests at %d/s &middot; plan %s</div>
+              <div class="meta">Run %s &middot; seed %d &middot; %,d requests at %d/s &middot; %s &middot; plan %s</div>
             </header>
             <section class="verdict %s">
               <span class="chip %s">%s</span>
               <div><div class="big">%s</div><div>%s</div></div>
             </section>
-            """.formatted(esc(plan.app()), CSS, esc(plan.app()), esc(runName), info.seed(), info.count(), info.rate(), esc(info.plan()),
+            """.formatted(esc(plan.app()), CSS, esc(plan.app()), esc(runName), info.seed(), info.count(), info.rate(),
+            runs(info.runs(), "run") + " with the fault, " + runs(info.baselines(), "baseline"), esc(info.plan()),
             pass ? "pass" : "fail", pass ? "pass" : "fail", pass ? "PASS" : "FAIL", esc(headline), esc(sub)));
 
         html.append("<h2>Findings</h2>\n");
@@ -73,31 +75,38 @@ public final class ReportWriter {
         }
         for (Finding f : result.findings()) html.append(finding(f, result.reproduce()));
 
-        html.append("<h2>The run</h2>\n<div class=\"stats\">\n");
-        stat(html, "%,d".formatted(result.sent().ok()), "accepted (ok)");
-        stat(html, "%,d".formatted(result.sent().fail()), "refused (fail)");
-        stat(html, "%,d".formatted(result.sent().info()), "unknown (info)");
-        stat(html, "%,d".formatted(result.drain().rows()), "rows in " + plan.correlateBy().table());
-        if (result.faultsFired() != null) stat(html, result.faultsFired() + " of " + plan.fault().times(), "crashes fired");
-        if (result.restarts() != null) stat(html, String.valueOf(result.restarts()), "app restarts");
-        stat(html, "%.1fs".formatted(result.sent().millis() / 1000.0), "sending");
-        stat(html, "%.1fs".formatted(result.drain().waitedMillis() / 1000.0), result.drain().settled() ? "draining" : "draining (gave up)");
-        html.append("</div>\n");
-
-        html.append("<h2>Checks</h2>\n<table>\n<thead><tr><th>Check</th><th>Result</th><th>Offenders</th></tr></thead>\n<tbody>\n");
-        for (CheckResult c : result.checks()) {
-            html.append("<tr><td class=\"mono\">").append(esc(c.name())).append("</td><td><span class=\"chip ")
-                .append(c.passed() ? "pass\">PASS" : "fail\">FAIL").append("</span></td><td>");
-            if (c.offenders().isEmpty()) html.append("<span class=\"muted\">none</span>");
-            else html.append(ids(c.offenders()));
-            html.append("</td></tr>\n");
+        html.append("<h2>The runs</h2>\n<div class=\"scroll\"><table>\n<thead><tr><th>Run</th><th>Faults fired</th><th>Restarts</th>")
+            .append("<th>ok / fail / info</th><th>Rows</th><th>Checks</th></tr></thead>\n<tbody>\n");
+        for (AttemptResult a : result.attempts()) {
+            html.append("<tr><td class=\"mono\">").append(esc(a.name())).append("</td><td>")
+                .append(a.faultsFired() == null ? "<span class=\"muted\">none planned</span>" : a.faultsFired() + " of " + plan.fault().count())
+                .append("</td><td>").append(a.restarts() == null ? "" : a.restarts())
+                .append("</td><td>%,d / %,d / %,d".formatted(a.sent().ok(), a.sent().fail(), a.sent().info()))
+                .append("</td><td>").append("%,d".formatted(a.drain().rows())).append(a.drain().settled() ? "" : " <span class=\"muted\">(drain gave up)</span>")
+                .append("</td><td><div class=\"ids\">");
+            for (CheckResult c : a.checks()) {
+                html.append("<span class=\"chip ").append(c.passed() ? "pass" : "fail").append("\">").append(esc(c.name()))
+                    .append(c.passed() ? "" : " " + c.offenders().size()).append("</span>");
+            }
+            html.append("</div></td></tr>\n");
         }
-        html.append("</tbody>\n</table>\n");
+        html.append("</tbody>\n</table></div>\n");
+
+        record Failure(AttemptResult attempt, CheckResult check) {}
+        var failed = result.attempts().stream().flatMap(a -> a.checks().stream().filter(c -> !c.passed()).map(c -> new Failure(a, c))).toList();
+        if (!failed.isEmpty()) {
+            html.append("<h2>What failed</h2>\n<table>\n<thead><tr><th>Run</th><th>Check</th><th>Offenders</th></tr></thead>\n<tbody>\n");
+            for (Failure f : failed) {
+                html.append("<tr><td class=\"mono\">").append(esc(f.attempt().name())).append("</td><td class=\"mono\">").append(esc(f.check().name()))
+                    .append("</td><td>").append(ids(f.check().offenders())).append("</td></tr>\n");
+            }
+            html.append("</tbody>\n</table>\n");
+        }
 
         html.append("<h2>The plan that ran</h2>\n<pre>").append(esc(planText.strip())).append("</pre>\n");
         html.append("""
-            <footer>Also in this run folder: <span class="mono">history.jsonl</span> (every request and its outcome),
-            <span class="mono">result.json</span>, <span class="mono">app.log</span> and <span class="mono">faults.jsonl</span>.</footer>
+            <footer>Each run has its own folder here, with <span class="mono">history.jsonl</span> (every request and its outcome),
+            <span class="mono">attempt.json</span>, <span class="mono">app.log</span> and <span class="mono">faults.jsonl</span>.</footer>
             </main>
             </body>
             </html>
@@ -110,7 +119,7 @@ public final class ReportWriter {
         var html = new StringBuilder();
         html.append("<article class=\"card\">\n")
             .append("<span class=\"chip ").append(label).append("\">").append(label.replace('-', ' ')).append("</span>\n")
-            .append("<h3>").append(esc(f.pattern())).append(" &middot; ").append(esc(f.title())).append("</h3>\n")
+            .append("<h3>").append(f.pattern() == null ? "" : esc(f.pattern()) + " &middot; ").append(esc(f.title())).append("</h3>\n")
             .append("<div class=\"mono\">").append(esc(f.location())).append(" <span class=\"muted\">").append(esc(f.file())).append(':').append(f.line())
             .append("</span></div>\n<dl>\n");
         row(html, "Journey", esc(f.journey()));
@@ -126,8 +135,8 @@ public final class ReportWriter {
         html.append("<dt>").append(term).append("</dt><dd>").append(definition).append("</dd>\n");
     }
 
-    private static void stat(StringBuilder html, String number, String label) {
-        html.append("<div class=\"stat\"><div class=\"n\">").append(esc(number)).append("</div><div class=\"l\">").append(esc(label)).append("</div></div>\n");
+    private static String runs(int n, String what) {
+        return n + " " + what + (n == 1 ? "" : "s");
     }
 
     private static String ids(List<String> ids) {
@@ -175,10 +184,7 @@ public final class ReportWriter {
         .ids{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
         .ids code{background:var(--code);padding:1px 8px;border-radius:6px;font-size:12.5px}
         pre{background:var(--code);padding:14px 16px;border-radius:10px;overflow-x:auto;font-size:12.5px;line-height:1.5;margin:0}
-        .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
-        .stat{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
-        .stat .n{font-size:20px;font-weight:650}
-        .stat .l{color:var(--muted);font-size:12.5px}
+        .scroll{overflow-x:auto}
         table{width:100%;border-collapse:separate;border-spacing:0;background:var(--panel);border:1px solid var(--line);border-radius:10px}
         th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line);vertical-align:top}
         tr:last-child td{border-bottom:0}
