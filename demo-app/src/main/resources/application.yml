@@ -26,3 +26,11 @@ spring:
 payments:
   # how a redelivered payment is recognised: none (B1), check-then-insert (B10) or claim-first (the fix)
   dedupe: none
+  # which ID marks it processed: event-id (B3: a client's second submit gets a new one) or payment-id
+  dedupe-key: event-id
+  # a message that keeps failing: retry-forever (B7: it blocks its partition) or dead-letter
+  bad-messages: retry-forever
+  # a payment that fails: retry-topic (B9: later payments for its account overtake it) or in-place
+  retries: retry-topic
+  # where the API publishes; a chaos relay can sit between payments.raw and payments.requested
+  inbound-topic: payments.requested
