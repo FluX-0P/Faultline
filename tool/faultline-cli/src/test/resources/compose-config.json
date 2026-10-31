@@ -1,0 +1,377 @@
+{
+  "name": "faultline",
+  "networks": {
+    "default": {
+      "name": "faultline_default",
+      "ipam": {}
+    }
+  },
+  "services": {
+    "api": {
+      "profiles": [
+        "demo"
+      ],
+      "restart": "on-failure",
+      "command": null,
+      "entrypoint": null,
+      "environment": {
+        "SPRING_DATASOURCE_URL": "jdbc:postgresql://postgres:5432/demo",
+        "SPRING_KAFKA_BOOTSTRAP_SERVERS": "kafka:19092",
+        "SPRING_KAFKA_LISTENER_AUTO_STARTUP": "false"
+      },
+      "image": "faultline/demo-app:dev",
+      "networks": {
+        "default": null
+      },
+      "build": {
+        "context": "${DEMO_APP}",
+        "dockerfile": "Dockerfile"
+      },
+      "depends_on": {
+        "kafka": {
+          "condition": "service_started",
+          "required": true
+        },
+        "postgres": {
+          "condition": "service_healthy",
+          "required": true
+        }
+      },
+      "ports": [
+        {
+          "mode": "ingress",
+          "target": 8080,
+          "published": "8080",
+          "protocol": "tcp"
+        }
+      ]
+    },
+    "kafka": {
+      "command": null,
+      "entrypoint": null,
+      "environment": {
+        "KAFKA_ADVERTISED_LISTENERS": "PLAINTEXT_HOST://localhost:9092,PLAINTEXT://kafka:19092",
+        "KAFKA_CONTROLLER_LISTENER_NAMES": "CONTROLLER",
+        "KAFKA_CONTROLLER_QUORUM_VOTERS": "1@kafka:29093",
+        "KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS": "0",
+        "KAFKA_INTER_BROKER_LISTENER_NAME": "PLAINTEXT",
+        "KAFKA_LISTENERS": "CONTROLLER://:29093,PLAINTEXT_HOST://:9092,PLAINTEXT://:19092",
+        "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP": "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT",
+        "KAFKA_NODE_ID": "1",
+        "KAFKA_NUM_PARTITIONS": "3",
+        "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR": "1",
+        "KAFKA_PROCESS_ROLES": "broker,controller",
+        "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR": "1",
+        "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR": "1"
+      },
+      "hostname": "kafka",
+      "image": "apache/kafka:4.3.2",
+      "networks": {
+        "default": null
+      },
+      "ports": [
+        {
+          "mode": "ingress",
+          "target": 9092,
+          "published": "9092",
+          "protocol": "tcp"
+        }
+      ]
+    },
+    "postgres": {
+      "command": null,
+      "entrypoint": null,
+      "environment": {
+        "POSTGRES_DB": "demo",
+        "POSTGRES_PASSWORD": "demo",
+        "POSTGRES_USER": "demo"
+      },
+      "image": "postgres:17",
+      "networks": {
+        "default": null
+      },
+      "healthcheck": {
+        "test": [
+          "CMD-SHELL",
+          "pg_isready -U demo -d demo"
+        ],
+        "timeout": "3s",
+        "interval": "5s",
+        "retries": 10
+      },
+      "ports": [
+        {
+          "mode": "ingress",
+          "target": 5432,
+          "published": "5432",
+          "protocol": "tcp"
+        }
+      ]
+    },
+    "provider": {
+      "profiles": [
+        "demo"
+      ],
+      "restart": "on-failure",
+      "command": [
+        "stub",
+        "--port",
+        "9090",
+        "--db",
+        "jdbc:postgresql://postgres:5432/demo",
+        "--db-user",
+        "demo",
+        "--db-password",
+        "demo"
+      ],
+      "entrypoint": null,
+      "image": "faultline/cli:dev",
+      "networks": {
+        "default": null
+      },
+      "build": {
+        "context": "${CLI}",
+        "dockerfile": "Dockerfile"
+      },
+      "depends_on": {
+        "postgres": {
+          "condition": "service_healthy",
+          "required": true
+        }
+      },
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "bash",
+          "-c",
+          "exec 3<>/dev/tcp/127.0.0.1/9090 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q 200 <&3"
+        ],
+        "timeout": "2s",
+        "interval": "2s",
+        "retries": 15
+      },
+      "ports": [
+        {
+          "mode": "ingress",
+          "target": 9090,
+          "published": "9090",
+          "protocol": "tcp"
+        }
+      ]
+    },
+    "toxiproxy": {
+      "profiles": [
+        "demo"
+      ],
+      "command": [
+        "-host=0.0.0.0",
+        "-config=/config/toxiproxy.json"
+      ],
+      "entrypoint": null,
+      "image": "ghcr.io/shopify/toxiproxy:2.13.0",
+      "networks": {
+        "default": null
+      },
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "/config/toxiproxy.json",
+          "target": "/config/toxiproxy.json",
+          "read_only": true,
+          "bind": {}
+        }
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "/toxiproxy-cli",
+          "list"
+        ],
+        "timeout": "2s",
+        "interval": "2s",
+        "retries": 15
+      },
+      "ports": [
+        {
+          "mode": "ingress",
+          "target": 8474,
+          "published": "8474",
+          "protocol": "tcp"
+        }
+      ]
+    },
+    "worker-1": {
+      "profiles": [
+        "demo"
+      ],
+      "restart": "on-failure",
+      "command": null,
+      "entrypoint": null,
+      "environment": {
+        "PAYMENTS_PROVIDER_URL": "http://provider:9090",
+        "SPRING_DATASOURCE_URL": "jdbc:postgresql://toxiproxy:15431/demo",
+        "SPRING_KAFKA_BOOTSTRAP_SERVERS": "kafka:19092"
+      },
+      "image": "faultline/demo-app:dev",
+      "networks": {
+        "default": null
+      },
+      "depends_on": {
+        "kafka": {
+          "condition": "service_started",
+          "required": true
+        },
+        "postgres": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "provider": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "toxiproxy": {
+          "condition": "service_healthy",
+          "required": true
+        }
+      },
+      "ports": [
+        {
+          "mode": "ingress",
+          "target": 8080,
+          "published": "8081",
+          "protocol": "tcp"
+        }
+      ]
+    },
+    "worker-2": {
+      "profiles": [
+        "demo"
+      ],
+      "restart": "on-failure",
+      "command": null,
+      "entrypoint": null,
+      "environment": {
+        "PAYMENTS_PROVIDER_URL": "http://provider:9090",
+        "SPRING_DATASOURCE_URL": "jdbc:postgresql://toxiproxy:15432/demo",
+        "SPRING_KAFKA_BOOTSTRAP_SERVERS": "kafka:19092"
+      },
+      "image": "faultline/demo-app:dev",
+      "networks": {
+        "default": null
+      },
+      "depends_on": {
+        "kafka": {
+          "condition": "service_started",
+          "required": true
+        },
+        "postgres": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "provider": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "toxiproxy": {
+          "condition": "service_healthy",
+          "required": true
+        }
+      },
+      "ports": [
+        {
+          "mode": "ingress",
+          "target": 8080,
+          "published": "8082",
+          "protocol": "tcp"
+        }
+      ]
+    },
+    "worker-3": {
+      "profiles": [
+        "demo"
+      ],
+      "restart": "on-failure",
+      "command": null,
+      "entrypoint": null,
+      "environment": {
+        "PAYMENTS_PROVIDER_URL": "http://provider:9090",
+        "SPRING_DATASOURCE_URL": "jdbc:postgresql://toxiproxy:15433/demo",
+        "SPRING_KAFKA_BOOTSTRAP_SERVERS": "kafka:19092"
+      },
+      "image": "faultline/demo-app:dev",
+      "networks": {
+        "default": null
+      },
+      "depends_on": {
+        "kafka": {
+          "condition": "service_started",
+          "required": true
+        },
+        "postgres": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "provider": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "toxiproxy": {
+          "condition": "service_healthy",
+          "required": true
+        }
+      },
+      "ports": [
+        {
+          "mode": "ingress",
+          "target": 8080,
+          "published": "8083",
+          "protocol": "tcp"
+        }
+      ]
+    }
+  },
+  "x-demo-app": {
+    "depends_on": {
+      "kafka": {
+        "condition": "service_started"
+      },
+      "postgres": {
+        "condition": "service_healthy"
+      }
+    },
+    "environment": {
+      "SPRING_DATASOURCE_URL": "jdbc:postgresql://postgres:5432/demo",
+      "SPRING_KAFKA_BOOTSTRAP_SERVERS": "kafka:19092"
+    },
+    "image": "faultline/demo-app:dev",
+    "profiles": [
+      "demo"
+    ],
+    "restart": "on-failure"
+  },
+  "x-worker": {
+    "depends_on": {
+      "kafka": {
+        "condition": "service_started"
+      },
+      "postgres": {
+        "condition": "service_healthy"
+      },
+      "provider": {
+        "condition": "service_healthy"
+      },
+      "toxiproxy": {
+        "condition": "service_healthy"
+      }
+    },
+    "environment": {
+      "SPRING_DATASOURCE_URL": "jdbc:postgresql://postgres:5432/demo",
+      "SPRING_KAFKA_BOOTSTRAP_SERVERS": "kafka:19092"
+    },
+    "image": "faultline/demo-app:dev",
+    "profiles": [
+      "demo"
+    ],
+    "restart": "on-failure"
+  }
+}

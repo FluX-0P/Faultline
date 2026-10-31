@@ -6,10 +6,12 @@ import static java.util.stream.Collectors.groupingBy;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -18,6 +20,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
 
 import dev.faultline.cli.Json;
 import dev.faultline.cli.Out;
@@ -25,6 +28,7 @@ import dev.faultline.cli.app.AppProcess;
 import dev.faultline.cli.app.DockerStack;
 import dev.faultline.cli.check.CheckResult;
 import dev.faultline.cli.check.Checker;
+import dev.faultline.cli.config.Settings;
 import dev.faultline.cli.drain.Drainer;
 import dev.faultline.cli.fault.Faults;
 import dev.faultline.cli.fault.TimedFaults;
@@ -89,9 +93,10 @@ final class Attempt {
         var db = plan.database();
         var fault = plan.fault();
         Duration maxWait = maxWait();
+        if (db.seedFile() != null && !Files.isRegularFile(Path.of(db.seedFile()))) throw new IllegalStateException("database.seed_file: no file at " + db.seedFile());
 
         try (var conn = DriverManager.getConnection(db.url(), db.user(), db.password());
-             var sender = new TrafficSender(URI.create(plan.target().url()));
+             var sender = new TrafficSender(URI.create(plan.target().url()), headers(plan));
              var lag = new KafkaLag(plan.kafka().bootstrap(), plan.kafka().group(), plan.kafka().topic());
              var toxiproxy = plan.toxiproxy() == null ? null : new Toxiproxy(plan.toxiproxy());
              var stub = plan.stub() == null ? null : new StubControl(plan.stub())) {
@@ -99,6 +104,7 @@ final class Attempt {
                 prepare(sender, lag);
                 reset(conn);
                 startApp(sender, lag, toxiproxy, stub);
+                seed(conn);
                 if (toxiproxy != null) toxiproxy.reset();
                 if (stub != null) stub.reset();
                 startRelay();
@@ -199,7 +205,13 @@ final class Attempt {
             checks.add(Checker.recoveryWithin(entries, faultEnded, Durations.parse(plan.recoveryWithin()), firstApplied));
         }
         for (var rule : plan.rules() == null ? List.<Plan.Rule>of() : plan.rules()) {
-            checks.add(Checker.rule(rule.id(), EffectsTable.rows(conn, rule.sql())));
+            try {
+                checks.add(Checker.rule(rule.id(), EffectsTable.rows(conn, rule.sql())));
+            } catch (SQLException e) {
+                // a person's rule that does not run is a broken plan; the LLM's is one more wrong rule, dropped like the rest
+                if (!rule.byLlm()) throw new IllegalStateException("rule " + rule.id() + " does not run: " + e.getMessage(), e);
+                checks.add(Checker.brokenRule(rule.id(), e.getMessage()));
+            }
         }
         return checks;
     }
@@ -245,6 +257,7 @@ final class Attempt {
             if (relayLag != null) relayLag.close();
         }
         reset(conn);
+        seed(conn);
     }
 
     /**
@@ -332,6 +345,29 @@ final class Attempt {
             Out.line(out, "reset     %d statements%s", reset.ran(),
                 reset.skipped().isEmpty() ? "" : " (%d skipped: table not created yet)".formatted(reset.skipped().size()));
         }
+    }
+
+    /** Loads the plan's test data: after a reset, once the app has created its tables. */
+    private void seed(Connection conn) throws Exception {
+        String file = plan.database().seedFile();
+        if (file == null) return;
+        try (var st = conn.createStatement()) {
+            st.execute(Files.readString(Path.of(file), StandardCharsets.UTF_8));
+        } catch (SQLException e) {
+            throw new IllegalStateException("database.seed_file " + file + " failed: " + e.getMessage()
+                + " (it runs again after every reset, so write it like insert ... on conflict do nothing)", e);
+        }
+        Out.line(out, "seed      loaded %s", file);
+    }
+
+    /** The auth header, with its ${env:NAME} read from the environment or .env. */
+    static Map<String, String> headers(Plan plan) {
+        var auth = plan.target().auth();
+        if (auth == null) return Map.of();
+        var settings = Settings.load();
+        String value = Plan.Auth.ENV.matcher(auth.value()).replaceAll(m -> Matcher.quoteReplacement(
+            settings.require(m.group(1), "target.auth.value needs it: set it in the environment or in .env")));
+        return Map.of(auth.header(), value);
     }
 
     private void startApp(TrafficSender sender, KafkaLag lag, Toxiproxy toxiproxy, StubControl stub) throws Exception {

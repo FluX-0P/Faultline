@@ -17,6 +17,7 @@ class BenchmarkFileTest {
     void everyShippedPlanIsValidWithItsBugOnAndOff() throws Exception {
         var bench = BenchmarkFile.read(BENCHMARK);
         assertThat(bench.bugs()).extracting(BenchmarkFile.Bug::id).containsExactly("B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B9", "B10");
+        assertThat(bench.compose()).isEqualTo(new BenchmarkFile.ComposeFile("deploy/docker-compose.yml", "demo"));
 
         for (var bug : bench.bugs()) {
             Plan plan = Plan.read(BENCHMARK.resolveSibling(bug.plan()));

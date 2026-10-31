@@ -30,6 +30,8 @@ import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.expr.NormalAnnotationExpr;
 import com.github.javaparser.ast.expr.SingleMemberAnnotationExpr;
+import com.github.javaparser.ast.expr.StringLiteralExpr;
+import com.github.javaparser.ast.expr.TextBlockLiteralExpr;
 import com.github.javaparser.printer.DefaultPrettyPrinter;
 import com.github.javaparser.printer.configuration.DefaultConfigurationOption;
 import com.github.javaparser.printer.configuration.DefaultPrinterConfiguration;
@@ -44,6 +46,8 @@ public final class JavaSources {
     private static final Map<String, String> HTTP_MAPPINGS = Map.of("GetMapping", "GET", "PostMapping", "POST",
         "PutMapping", "PUT", "DeleteMapping", "DELETE", "PatchMapping", "PATCH", "RequestMapping", "ANY");
     private static final Pattern PROPERTY = Pattern.compile("\\$\\{([^:}]+)(?::([^}]*))?}");
+    /** Types the app sends Kafka messages through. */
+    private static final Set<String> PRODUCERS = Set.of("KafkaTemplate", "KafkaOperations", "StreamBridge");
 
     /** A method of the app, named Class#method. */
     public record Method(String handler, String file, int line, MethodDeclaration declaration, TypeDeclaration<?> owner) {}
@@ -77,6 +81,11 @@ public final class JavaSources {
             }
         }
         return new JavaSources(units, problems, config);
+    }
+
+    /** The same code, with annotation placeholders resolved against another configuration. */
+    JavaSources withConfig(SpringConfig other) {
+        return new JavaSources(units, problems, other);
     }
 
     /** Files JavaParser could not read; they are left out. */
@@ -142,10 +151,14 @@ public final class JavaSources {
         return endpoints;
     }
 
+    /** Methods with @KafkaListener. */
+    public List<Method> kafkaListeners() {
+        return methods().stream().filter(m -> m.declaration().getAnnotationByName("KafkaListener").isPresent()).toList();
+    }
+
     /** @KafkaListener methods that take an Acknowledgment and call acknowledge(): pattern P1's candidates. */
     public List<Method> kafkaListenersThatAcknowledge() {
-        return methods().stream()
-            .filter(m -> m.declaration().getAnnotationByName("KafkaListener").isPresent())
+        return kafkaListeners().stream()
             .filter(m -> m.declaration().getParameters().stream().anyMatch(p -> typeName(p).equals("Acknowledgment")))
             .filter(m -> !m.declaration().findAll(MethodCallExpr.class, c -> c.getNameAsString().equals("acknowledge")).isEmpty())
             .toList();
@@ -164,6 +177,107 @@ public final class JavaSources {
             fieldType(m.owner(), field).flatMap(this::type).ifPresent(t -> types.putIfAbsent(t.getNameAsString(), t));
         }
         return List.copyOf(types.values());
+    }
+
+    /** The app's own methods this one calls through a field, such as {@code service.process(...)} -> PaymentService#process. */
+    public List<Method> calledMethods(Method m) {
+        var called = new LinkedHashMap<String, Method>();
+        for (var call : m.declaration().findAll(MethodCallExpr.class)) {
+            receiverType(m, call).flatMap(this::type).ifPresent(t -> method(t.getNameAsString() + "#" + call.getNameAsString())
+                .ifPresent(callee -> called.putIfAbsent(callee.handler(), callee)));
+        }
+        return List.copyOf(called.values());
+    }
+
+    /** The app's methods that call this one through a field: who reaches it. */
+    public List<Method> callers(Method m) {
+        return methods().stream().filter(x -> calledMethods(x).stream().anyMatch(c -> c.handler().equals(m.handler()))).toList();
+    }
+
+    /** The method and the methods of its own class it calls (one level deep): where its work really happens. */
+    public List<Method> withOwnCallees(Method m) {
+        var methods = new LinkedHashMap<String, Method>();
+        methods.put(m.handler(), m);
+        for (var call : m.declaration().findAll(MethodCallExpr.class)) {
+            boolean own = call.getScope().isEmpty() || call.getScope().get().isThisExpr();
+            if (own) method(m.owner().getNameAsString() + "#" + call.getNameAsString()).ifPresent(c -> methods.putIfAbsent(c.handler(), c));
+        }
+        return List.copyOf(methods.values());
+    }
+
+    /**
+     * The simple type name of the field a call goes through, following a chain to its start:
+     * {@code http.post().uri("/x").retrieve()} -> the type of field {@code http}. Empty if the call is not on a field.
+     */
+    public Optional<String> receiverType(Method m, MethodCallExpr call) {
+        Expression scope = call.getScope().orElse(null);
+        while (scope != null && scope.isMethodCallExpr()) scope = scope.asMethodCallExpr().getScope().orElse(null);
+        if (scope == null) return Optional.empty();
+        String field = scope.isNameExpr() ? scope.asNameExpr().getNameAsString()
+            : scope.isFieldAccessExpr() && scope.asFieldAccessExpr().getScope().isThisExpr() ? scope.asFieldAccessExpr().getNameAsString()
+            : null;
+        return field == null ? Optional.empty() : fieldType(m.owner(), field);
+    }
+
+    /** The method's send calls on a Kafka producer field, such as {@code kafka.send(topic, key, payload)}. */
+    public List<MethodCallExpr> sends(Method m) {
+        return m.declaration().findAll(MethodCallExpr.class, c -> c.getNameAsString().startsWith("send")
+            && receiverType(m, c).filter(PRODUCERS::contains).isPresent());
+    }
+
+    /** The topics the method's sends name: string constants, or a field set from a ${property} setting. */
+    public List<String> sentTopics(Method m) {
+        var topics = new ArrayList<String>();
+        for (var call : sends(m)) {
+            if (call.getArguments().isEmpty()) continue;
+            var topic = strings(call.getArgument(0), 0);
+            if (topic.isEmpty()) topic = fieldName(call.getArgument(0)).flatMap(f -> setting(m.owner(), f)).map(this::resolveProperties).stream().toList();
+            topic.stream().filter(t -> !topics.contains(t)).forEach(topics::add);
+        }
+        return topics;
+    }
+
+    /**
+     * The setting that names the topic the app sends to, when it names {@code topic} now: a field set from
+     * {@code @Value("${key:default}")}, such as the API's inbound topic. Changing it can put a relay in front of the listener.
+     */
+    public Optional<String> topicSetting(String topic) {
+        for (var m : methods()) {
+            for (var call : sends(m)) {
+                if (call.getArguments().isEmpty()) continue;
+                var value = fieldName(call.getArgument(0)).flatMap(f -> setting(m.owner(), f));
+                if (value.isPresent() && resolveProperties(value.get()).equals(topic)) {
+                    var key = PROPERTY.matcher(value.get());
+                    if (key.find()) return Optional.of(key.group(1));
+                }
+            }
+        }
+        return Optional.empty();
+    }
+
+    /** The raw @Value text a field is set from, on the field or on the constructor parameter of the same name. */
+    private Optional<String> setting(TypeDeclaration<?> owner, String field) {
+        var annotations = new ArrayList<AnnotationExpr>();
+        for (var f : owner.getFields()) {
+            if (f.getVariables().stream().anyMatch(v -> v.getNameAsString().equals(field))) annotations.addAll(f.getAnnotations());
+        }
+        for (var c : owner.getConstructors()) c.getParameterByName(field).ifPresent(p -> annotations.addAll(p.getAnnotations()));
+        return annotations.stream().filter(a -> a.getName().getIdentifier().equals("Value"))
+            .flatMap(a -> rawValues(a, "value").stream()).filter(v -> PROPERTY.matcher(v).find()).findFirst();
+    }
+
+    private static Optional<String> fieldName(Expression e) {
+        if (e.isNameExpr()) return Optional.of(e.asNameExpr().getNameAsString());
+        if (e.isFieldAccessExpr() && e.asFieldAccessExpr().getScope().isThisExpr()) return Optional.of(e.asFieldAccessExpr().getNameAsString());
+        return Optional.empty();
+    }
+
+    /** Every string literal and text block in the method, such as its SQL. */
+    public static List<String> strings(Method m) {
+        var strings = new ArrayList<String>();
+        for (var s : m.declaration().findAll(StringLiteralExpr.class)) strings.add(s.asString());
+        for (var t : m.declaration().findAll(TextBlockLiteralExpr.class)) strings.add(t.stripIndent());
+        return strings;
     }
 
     /** The types of a handler's @RequestBody parameters, when they are the app's own classes or records. */
@@ -227,12 +341,17 @@ public final class JavaSources {
 
     /** The string values of an annotation attribute, with constants and ${property:default} placeholders resolved. */
     private List<String> values(AnnotationExpr a, String... names) {
+        return rawValues(a, names).stream().map(this::resolveProperties).toList();
+    }
+
+    /** The same, with ${property:default} placeholders left as they are. */
+    private List<String> rawValues(AnnotationExpr a, String... names) {
         var exprs = new ArrayList<Expression>();
         if (a instanceof SingleMemberAnnotationExpr s && List.of(names).contains("value")) exprs.add(s.getMemberValue());
         if (a instanceof NormalAnnotationExpr n) {
             n.getPairs().stream().filter(p -> List.of(names).contains(p.getNameAsString())).forEach(p -> exprs.add(p.getValue()));
         }
-        return exprs.stream().flatMap(e -> strings(e, 0).stream()).map(this::resolveProperties).toList();
+        return exprs.stream().flatMap(e -> strings(e, 0).stream()).toList();
     }
 
     private List<String> strings(Expression e, int depth) {

@@ -70,8 +70,21 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
     /**
      * The app under test, started by Faultline from a {@code jar} or as Docker {@code compose} services, or neither:
      * then it must already be running at {@code url}. {@code args} are Spring settings such as --payments.dedupe=none.
+     * {@code auth} (may be null) goes on every request.
      */
-    public record Target(String url, String jar, Compose compose, List<String> args) {}
+    public record Target(String url, String jar, Compose compose, List<String> args, Auth auth) {
+        public Target(String url, String jar, Compose compose, List<String> args) {
+            this(url, jar, compose, args, null);
+        }
+    }
+
+    /**
+     * A header every request carries, such as Authorization: Bearer ${env:SHOP_TOKEN}. {@code ${env:NAME}} is the
+     * environment variable (or .env entry) NAME, read when the run starts, so the secret itself is never in a plan.
+     */
+    public record Auth(String header, String value) {
+        public static final Pattern ENV = Pattern.compile("\\$\\{env:([A-Za-z_][A-Za-z0-9_]*)}");
+    }
 
     /**
      * Services of a Compose file, recreated for each run with its settings. Faultline waits until {@code url} answers and
@@ -79,8 +92,16 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
      */
     public record Compose(String file, String profile, List<String> services, Integer consumers) {}
 
-    /** {@code reset} puts the database back to its starting state before each run. */
-    public record Database(String url, String user, String password, List<String> reset) {}
+    /**
+     * {@code reset} puts the database back to its starting state before each run. {@code seedFile} (may be null) is SQL
+     * that loads test data after every reset, once the app has created its tables; it must be able to run again, such as
+     * insert ... on conflict do nothing.
+     */
+    public record Database(String url, String user, String password, List<String> reset, String seedFile) {
+        public Database(String url, String user, String password, List<String> reset) {
+            this(url, user, password, reset, null);
+        }
+    }
 
     /** Where to read the consumer group's lag, to know when the app has finished. */
     public record Kafka(String bootstrap, String topic, String group) {}
@@ -118,8 +139,21 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
      */
     public record Order(String key, String by) {}
 
-    /** An app rule: SQL that must return no rows once the run is over. Each row it returns is an offender. */
-    public record Rule(String id, String sql) {}
+    /**
+     * An app rule: SQL that must return no rows once the run is over. Each row it returns is an offender. A {@code drafted}
+     * rule is the LLM's: it counts only once a baseline run without the fault has passed it, and one that fails there is
+     * dropped, since the rule is wrong, not the app. Take {@code drafted} out to vouch for a rule yourself.
+     */
+    public record Rule(String id, String sql, String why, Boolean drafted) {
+        public Rule(String id, String sql) {
+            this(id, sql, null, null);
+        }
+
+        // not isDrafted(): Jackson would take that for the drafted property and write drafted: false on every rule
+        public boolean byLlm() {
+            return Boolean.TRUE.equals(drafted);
+        }
+    }
 
     public record Request(String method, String path, String body) {}
 
@@ -199,7 +233,7 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
      * app arguments, which win over the plan's own when they set the same key.
      */
     public Plan forRun(long seed, Integer count, Integer rate, List<String> extraArgs, Integer runs, Integer baselines) {
-        var t = new Target(target.url(), target.jar(), target.compose(), withArgs(extraArgs));
+        var t = new Target(target.url(), target.jar(), target.compose(), withArgs(extraArgs), target.auth());
         var tr = new Traffic(count != null ? count : traffic.count(), rate != null ? rate : traffic.rate(), seed, traffic.request(),
             traffic.drainTimeout(), traffic.warmup());
         Confirm c = confirm();
@@ -278,6 +312,7 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
         } else {
             if (!database.url().startsWith("jdbc:postgresql:")) problems.add("database.url must be a jdbc:postgresql: URL (only Postgres for now)");
             if (database.user() == null) problems.add("database.user is missing");
+            if (database.seedFile() != null && !database.seedFile().endsWith(".sql")) problems.add("database.seed_file must be a .sql file");
             for (String sql : resetStatements()) {
                 if (!RESET_STATEMENT.matcher(sql.strip().replaceAll(";$", "")).matches()) {
                     problems.add("database.reset: only single TRUNCATE, DELETE FROM and UPDATE statements are allowed, not: " + sql);
@@ -310,6 +345,15 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
 
         if (target != null) {
             if (!blank(target.jar()) && target.compose() != null) problems.add("target needs a jar or compose, not both");
+            var auth = target.auth();
+            if (auth != null) {
+                if (blank(auth.header()) || !auth.header().matches("[A-Za-z0-9-]+")) problems.add("target.auth.header must be a header name, such as Authorization");
+                if (blank(auth.value())) {
+                    problems.add("target.auth.value is missing");
+                } else if (auth.value().replaceAll(Auth.ENV.pattern(), "").contains("${")) {
+                    problems.add("target.auth.value: the only placeholder is ${env:NAME}, an environment variable that holds the secret");
+                }
+            }
             var c = target.compose();
             if (c != null) {
                 if (blank(c.file())) problems.add("target.compose.file is missing");

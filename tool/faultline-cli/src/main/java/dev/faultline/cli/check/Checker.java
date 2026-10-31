@@ -163,6 +163,14 @@ public final class Checker {
         return CheckResult.of(id, rows);
     }
 
+    public static final String SQL_FAILED = "its SQL does not run: ";
+
+    /** An app rule whose SQL the database refused: it fails, and says why. */
+    public static CheckResult brokenRule(String id, String error) {
+        String first = error == null ? "" : error.lines().findFirst().orElse("");
+        return CheckResult.of(id, List.of(first), SQL_FAILED + first);
+    }
+
     /** Every planned fault really fired. Without this, a PASS could just mean the fault never happened. */
     public static CheckResult faultsFired(int planned, int fired) {
         return CheckResult.of("faults-fired", fired == planned ? List.of() : List.of("fired " + fired + " of " + planned));

@@ -20,7 +20,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  * the moment Faultline's barrier holds a worker at; here the test holds it with a sleep.
  */
 @Import(TestcontainersConfiguration.class)
-@SpringBootTest
+// no payment provider in tests: payments are not charged
+@SpringBootTest(properties = "payments.provider.url=")
 class MerchantBalanceTest {
 
 	@Autowired

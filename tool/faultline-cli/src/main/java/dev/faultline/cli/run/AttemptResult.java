@@ -1,6 +1,7 @@
 package dev.faultline.cli.run;
 
 import java.util.List;
+import java.util.Set;
 
 import dev.faultline.cli.check.CheckResult;
 import dev.faultline.cli.plan.Plan;
@@ -18,13 +19,14 @@ public record AttemptResult(String name, String kind, Sent sent, Drain drain, In
 
     public record Drain(long rows, long backlog, boolean settled, long waitedMillis) {}
 
-    public boolean allPassed() {
-        return checks.stream().allMatch(CheckResult::passed);
+    /** @param ignored checks that do not count, such as drafted rules a baseline failed */
+    public boolean allPassed(Set<String> ignored) {
+        return checks.stream().allMatch(c -> c.passed() || ignored.contains(c.name()));
     }
 
     /** Whether a data check failed: every check but faults-fired, which is about the fault, not the data. */
-    public boolean dataFailed() {
-        return checks.stream().anyMatch(AttemptResult::dataCheckFailed);
+    public boolean dataFailed(Set<String> ignored) {
+        return checks.stream().anyMatch(c -> dataCheckFailed(c) && !ignored.contains(c.name()));
     }
 
     public static boolean dataCheckFailed(CheckResult c) {

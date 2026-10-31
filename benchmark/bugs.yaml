@@ -3,6 +3,10 @@
 # where nothing may be confirmed.
 app: demo-app
 app_dir: demo-app
+# how the app runs for the plans Faultline draws up itself (benchmark --ai-plans)
+compose:
+  file: deploy/docker-compose.yml
+  profile: demo
 
 # every bug off: the settings of the bug-free build
 bug_free:
@@ -74,7 +78,7 @@ bugs:
   - id: B7
     title: No dead-letter handling for bad messages
     pattern: P7
-    location: PaymentListener#onMessage
+    location: TopicConfig#errorHandler
     check: no-lost
     plan: b7.plan.yaml
     settings:

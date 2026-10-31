@@ -33,8 +33,22 @@
       "items": { "type": "string" },
       "description": "TRUNCATE, DELETE and UPDATE statements that put the database back to its starting state."
     },
+    "rules": {
+      "type": "array",
+      "description": "What the data must keep once every request has been processed, each as SQL that returns the rows breaking it.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "description": "A kebab-case name, such as stock-never-negative." },
+          "why": { "type": "string", "description": "First: what must hold, and which part of the journey keeps it." },
+          "sql": { "type": "string", "description": "Then one SELECT that returns the rows breaking it, and none in a correct run." }
+        },
+        "required": ["id", "why", "sql"],
+        "additionalProperties": false
+      }
+    },
     "why": { "type": "string", "description": "How this traffic reaches the risky code, in one or two sentences." }
   },
-  "required": ["journey", "request", "correlateBy", "effect", "reset", "why"],
+  "required": ["journey", "request", "correlateBy", "effect", "reset", "rules", "why"],
   "additionalProperties": false
 }

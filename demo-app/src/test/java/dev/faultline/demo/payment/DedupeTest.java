@@ -15,7 +15,8 @@ import org.springframework.jdbc.core.simple.JdbcClient;
  * gets a new one. check-then-insert (B10) fails only when two workers race, which takes Faultline's frozen-worker fault.
  */
 @Import(TestcontainersConfiguration.class)
-@SpringBootTest
+// no payment provider in tests: payments are not charged
+@SpringBootTest(properties = "payments.provider.url=")
 class DedupeTest {
 
 	@Autowired

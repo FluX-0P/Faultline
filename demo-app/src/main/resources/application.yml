@@ -41,8 +41,9 @@ payments:
   # the "payment completed" event: after-commit (B8: a crash in between loses it) or outbox
   completed-events: after-commit
   provider:
-    # the payment provider every payment is charged at; empty runs the app without one, and nothing is charged
-    url: ""
+    # the payment provider every payment is charged at (Faultline's stub: docker compose --profile demo up -d provider);
+    # empty runs the app without one, and nothing is charged
+    url: http://localhost:9090
     # how long to wait for the provider's reply before trying again
     timeout: 1s
     # what makes a retried charge safe: none (B5: a charge that timed out is charged again) or payment-id
