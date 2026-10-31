@@ -16,6 +16,8 @@ class TopicConfig {
     static final String PAYMENTS_RETRY = "payments.retry";
     /** Where the API publishes when a chaos relay sits in front of payments.requested (payments.inbound-topic). */
     static final String PAYMENTS_RAW = "payments.raw";
+    /** One event per payment that went through, for the rest of the system. */
+    static final String PAYMENTS_COMPLETED = "payments.completed";
 
     // created at startup if missing, so the listeners never wait on an unknown topic
     @Bean
@@ -31,6 +33,11 @@ class TopicConfig {
     @Bean
     NewTopic paymentsRaw() {
         return TopicBuilder.name(PAYMENTS_RAW).partitions(3).replicas(1).build();
+    }
+
+    @Bean
+    NewTopic paymentsCompleted() {
+        return TopicBuilder.name(PAYMENTS_COMPLETED).partitions(3).replicas(1).build();
     }
 
     /** What happens to a message whose listener keeps throwing. */
