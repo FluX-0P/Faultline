@@ -1,0 +1,126 @@
+package dev.faultline.cli.source;
+
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.FileVisitResult;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+import java.util.function.Predicate;
+import java.util.regex.Pattern;
+
+/**
+ * The files of an app that Faultline reads: docs, build files, Compose files, Spring configs, database migrations
+ * and main Java sources. Build output and tests are skipped, files come back in a fixed order (so an unchanged app
+ * gives the same LLM prompt, and a cache hit), and each is capped so one huge file cannot blow up a prompt.
+ */
+public final class RepoFiles {
+    static final int MAX_CHARS = 20_000;
+    private static final Set<String> SKIP_DIRS = Set.of(".git", ".idea", ".vscode", ".mvn", ".gradle", ".faultline",
+        "target", "build", "out", "node_modules");
+    private static final Pattern COMPOSE = Pattern.compile("(docker-)?compose(\\.[\\w-]+)?\\.ya?ml");
+    private static final Pattern SPRING_CONFIG = Pattern.compile("application\\.(yml|yaml|properties)");
+    private static final Pattern SQL_LINE_COMMENT = Pattern.compile("--[^\\n]*");
+    private static final Pattern SQL_BLOCK_COMMENT = Pattern.compile("/\\*.*?\\*/", Pattern.DOTALL);
+
+    /** A file's text, with its path relative to the app folder and / separators. */
+    public record TextFile(String path, String text) {}
+
+    private final Path root;
+    private final List<String> paths;
+
+    private RepoFiles(Path root, List<String> paths) {
+        this.root = root;
+        this.paths = paths;
+    }
+
+    public static RepoFiles scan(Path root) throws IOException {
+        if (!Files.isDirectory(root)) throw new IllegalArgumentException("not a folder: " + root);
+        var paths = new ArrayList<String>();
+        Files.walkFileTree(root, new SimpleFileVisitor<>() {
+            @Override
+            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                String name = dir.getFileName() == null ? "" : dir.getFileName().toString();
+                boolean testSources = name.equals("test") && dir.getParent() != null && dir.getParent().endsWith("src");
+                return !dir.equals(root) && (SKIP_DIRS.contains(name) || testSources) ? FileVisitResult.SKIP_SUBTREE : FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                paths.add(root.relativize(file).toString().replace('\\', '/'));
+                return FileVisitResult.CONTINUE;
+            }
+        });
+        paths.sort(null);
+        return new RepoFiles(root, List.copyOf(paths));
+    }
+
+    public Path root() {
+        return root;
+    }
+
+    /** The app's name: its folder name. */
+    public String name() {
+        return root.toAbsolutePath().normalize().getFileName().toString();
+    }
+
+    /** README.md at the top, and every Markdown file under docs/. */
+    public List<TextFile> docs() {
+        return read(p -> p.equalsIgnoreCase("README.md") || p.startsWith("docs/") && p.endsWith(".md"));
+    }
+
+    public List<TextFile> buildFiles() {
+        return read(p -> Set.of("pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts").contains(fileName(p)));
+    }
+
+    public List<TextFile> composeFiles() {
+        return read(p -> COMPOSE.matcher(fileName(p)).matches());
+    }
+
+    /** Flyway or Liquibase SQL and schema.sql, without comments: the schema is what counts, not notes about it. */
+    public List<TextFile> migrations() {
+        return read(p -> p.endsWith(".sql") && p.contains("src/main/resources/")).stream()
+            .map(f -> new TextFile(f.path(), stripSqlComments(f.text())))
+            .toList();
+    }
+
+    public List<TextFile> springConfigs() {
+        return read(p -> p.contains("src/main/resources/") && SPRING_CONFIG.matcher(fileName(p)).matches());
+    }
+
+    public List<Path> javaSources() {
+        return paths.stream().filter(p -> p.contains("src/main/java/") && p.endsWith(".java")).map(root::resolve).toList();
+    }
+
+    public String relative(Path file) {
+        return root.relativize(file).toString().replace('\\', '/');
+    }
+
+    private List<TextFile> read(Predicate<String> which) {
+        return paths.stream().filter(which).map(this::read).toList();
+    }
+
+    private TextFile read(String path) {
+        try {
+            String text = Files.readString(root.resolve(path), StandardCharsets.UTF_8).replace("\r\n", "\n");
+            if (text.length() > MAX_CHARS) text = text.substring(0, MAX_CHARS) + "\n... (cut at " + MAX_CHARS + " characters)";
+            return new TextFile(path, text);
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot read " + path, e);
+        }
+    }
+
+    static String stripSqlComments(String sql) {
+        String s = SQL_LINE_COMMENT.matcher(SQL_BLOCK_COMMENT.matcher(sql).replaceAll("")).replaceAll("");
+        return s.replaceAll("[ \\t]+\\n", "\n").replaceAll("\\n{3,}", "\n\n").strip() + "\n";
+    }
+
+    private static String fileName(String path) {
+        return path.substring(path.lastIndexOf('/') + 1);
+    }
+}

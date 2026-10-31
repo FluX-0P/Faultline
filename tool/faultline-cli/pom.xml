@@ -26,6 +26,16 @@
 			<groupId>tools.jackson.core</groupId>
 			<artifactId>jackson-databind</artifactId>
 		</dependency>
+		<!-- plan.yaml, and the app's own application.yml -->
+		<dependency>
+			<groupId>tools.jackson.dataformat</groupId>
+			<artifactId>jackson-dataformat-yaml</artifactId>
+		</dependency>
+		<!-- reads the app's Java source as a syntax tree: endpoints, listeners, and the code the LLM reviews -->
+		<dependency>
+			<groupId>com.github.javaparser</groupId>
+			<artifactId>javaparser-core</artifactId>
+		</dependency>
 		<!-- the Admin API, to read consumer-group lag -->
 		<dependency>
 			<groupId>org.apache.kafka</groupId>
