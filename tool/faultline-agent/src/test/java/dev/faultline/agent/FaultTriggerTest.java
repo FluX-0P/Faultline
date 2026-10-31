@@ -55,6 +55,47 @@ class FaultTriggerTest {
     }
 
     @Test
+    void aBarrierHoldsUntilAnotherThreadPassesTheUntilPoint(@TempDir Path dir) throws Exception {
+        var plan = new FaultPlan("MerchantBalance#read", "after", "barrier", 1, 1, 5_000, dir.resolve("faults.jsonl"), "MerchantBalance#write", 0, null);
+        FaultTrigger.armForTest(plan, 1, crashes::incrementAndGet);
+        var partner = new Thread(() -> {
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                return;
+            }
+            Barrier.passed();
+        });
+        partner.start();
+
+        long start = System.nanoTime();
+        FaultTrigger.hit();
+        long waited = (System.nanoTime() - start) / 1_000_000;
+
+        partner.join();
+        Barrier.resetForTest();
+        assertThat(waited).isBetween(150L, 2_000L);
+        assertThat(Files.readAllLines(dir.resolve("faults.jsonl"))).singleElement().satisfies(line -> assertThat(line).contains("\"action\":\"barrier\""));
+    }
+
+    @Test
+    void withAnArmFileCallsCountOnlyOnceItExists(@TempDir Path dir) throws Exception {
+        Path armFile = dir.resolve("armed");
+        var plan = new FaultPlan("PaymentService#apply", "before", "crash", 2, 1, 0, dir.resolve("faults.jsonl"), null, 0, null, armFile);
+        FaultTrigger.armForTest(plan, 1, crashes::incrementAndGet);
+
+        for (int i = 0; i < 10; i++) FaultTrigger.hit();   // a warm-up: not counted
+        assertThat(crashes).hasValue(0);
+
+        Files.createFile(armFile);
+        Thread.sleep(150);   // the trigger looks for the file at most every 100ms
+        FaultTrigger.hit();
+        assertThat(crashes).hasValue(0);
+        FaultTrigger.hit();   // the 2nd call since it was armed
+        assertThat(crashes).hasValue(1);
+    }
+
+    @Test
     void throwFailsTheCallLikeABugWould(@TempDir Path dir) {
         FaultTrigger.armForTest(plan("throw", 2, 1, 0, dir), 1, crashes::incrementAndGet);
 

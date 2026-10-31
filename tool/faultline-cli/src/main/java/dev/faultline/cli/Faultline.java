@@ -7,6 +7,7 @@ import dev.faultline.cli.plan.PlanCommand;
 import dev.faultline.cli.report.ReportCommand;
 import dev.faultline.cli.run.RunCommand;
 import dev.faultline.cli.scan.ScanCommand;
+import dev.faultline.cli.stub.StubCommand;
 import dev.faultline.cli.understand.UnderstandCommand;
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
@@ -15,7 +16,7 @@ import picocli.CommandLine.Command;
     description = {"Crash-test lab for Spring Boot + Kafka apps.",
         "understand -> scan -> plan -> run: map the app, find risky code, plan a fault for it, then prove the bug."},
     subcommands = {UnderstandCommand.class, ScanCommand.class, PlanCommand.class, RunCommand.class, ReportCommand.class,
-        BenchmarkCommand.class})
+        BenchmarkCommand.class, StubCommand.class})
 public final class Faultline {
     /** Exit codes: every check passed, a check failed, or the tool itself could not run. */
     public static final int PASS = 0;

@@ -1,0 +1,61 @@
+# Planted bug B10 again, this time through the network: for 15s, every reply on worker-1's database link (a Toxiproxy
+# proxy) is held back. Worker-1 is stuck mid-payment past the 10s Kafka allows, so another worker takes its partition
+# and applies the same payment; when the fault ends the held reply arrives, and worker-1 carries on and applies it too.
+# Not part of the benchmark: run it with faultline benchmark --bug B10 --plan benchmark/b10-network.plan.yaml
+app: demo-app
+journey: make-payment
+risk:
+  id: B10
+  title: A frozen worker wakes up and writes stale data
+  location: PaymentService#apply
+  file: src/main/java/dev/faultline/demo/payment/PaymentService.java
+  line: 57
+  why: Hand-written plan that reaches planted bug B10 through a network fault.
+target:
+  url: http://localhost:8080
+  compose:
+    file: deploy/docker-compose.yml
+    profile: demo
+    services: [toxiproxy, provider, api, worker-1, worker-2, worker-3]
+    consumers: 3
+database:
+  url: jdbc:postgresql://localhost:5432/demo
+  user: demo
+  password: demo
+  reset:
+  - TRUNCATE payments
+  - TRUNCATE processed_events
+  - UPDATE accounts SET balance_minor = 1000000
+  - UPDATE merchant SET balance_minor = 0
+  - TRUNCATE outbox
+  - TRUNCATE stub.charges
+kafka:
+  bootstrap: localhost:9092
+  topic: payments.requested
+  group: payment-worker
+toxiproxy: http://localhost:8474
+traffic:
+  count: 2000
+  rate: 100
+  request:
+    method: POST
+    path: /payments
+    body: |
+      {"paymentId": "pay-${seed}-${seq}", "accountId": "acct-${int:1:100}", "amountMinor": ${int:100:5000}}
+correlate_by:
+  request_field: paymentId
+  table: payments
+  column: payment_id
+fault:
+  layer: network
+  action: latency
+  latency: 30s
+  target: worker-1-db
+  at: 5s
+  duration: 15s
+checks: [no-lost, no-duplicates, no-unexpected, recovery-within, faults-fired]
+recovery_within: 30s
+confirm:
+  runs: 2
+  baselines: 1
+  min_failing: 2

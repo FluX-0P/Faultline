@@ -21,10 +21,19 @@ class DedupeTest {
 	@Autowired
 	JdbcClient db;
 
+	@Autowired
+	ProviderClient provider;
+
+	@Autowired
+	MerchantBalance merchant;
+
+	@Autowired
+	CompletedEvents completed;
+
 	@ParameterizedTest
 	@CsvSource({"none, 2", "check-then-insert, 1", "claim-first, 1"})
 	void aRedeliveredPaymentIsAppliedAsOftenAsTheModeAllows(String mode, long expectedRows) {
-		var service = new PaymentService(db, mode, "payment-id");
+		var service = new PaymentService(db, mode, "payment-id", provider, merchant, completed);
 		var event = new PaymentEvent("event-1", "redelivered-" + mode, "acct-2", 1_000);
 
 		service.process(event);
@@ -36,7 +45,7 @@ class DedupeTest {
 	@ParameterizedTest
 	@CsvSource({"event-id, 2", "payment-id, 1"})
 	void aDoubleSubmitIsCaughtOnlyByThePaymentId(String key, long expectedRows) {
-		var service = new PaymentService(db, "claim-first", key);
+		var service = new PaymentService(db, "claim-first", key, provider, merchant, completed);
 		String paymentId = "submitted-twice-" + key;
 
 		service.process(new PaymentEvent("event-a-" + key, paymentId, "acct-3", 1_000));

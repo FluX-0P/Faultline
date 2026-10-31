@@ -23,11 +23,18 @@ class PaymentService {
     private final Dedupe dedupe;
     /** B3 when true: a client that submits the same payment twice gets two event IDs, so both are applied. */
     private final boolean byEventId;
+    private final ProviderClient provider;
+    private final MerchantBalance merchant;
+    private final CompletedEvents completed;
 
-    PaymentService(JdbcClient db, @Value("${payments.dedupe:none}") String dedupe, @Value("${payments.dedupe-key:event-id}") String key) {
+    PaymentService(JdbcClient db, @Value("${payments.dedupe:none}") String dedupe, @Value("${payments.dedupe-key:event-id}") String key,
+                   ProviderClient provider, MerchantBalance merchant, CompletedEvents completed) {
         this.db = db;
         this.dedupe = Dedupe.valueOf(dedupe.toUpperCase(Locale.ROOT).replace('-', '_'));
         this.byEventId = key.equals("event-id");
+        this.provider = provider;
+        this.merchant = merchant;
+        this.completed = completed;
     }
 
     @Transactional
@@ -46,11 +53,15 @@ class PaymentService {
         }
     }
 
+    /** Charges the payment, moves the money from the account to the shop, records it, and says it is done. */
     void apply(PaymentEvent p) {
+        provider.charge(p);
         db.sql("update accounts set balance_minor = balance_minor - ? where account_id = ?")
           .params(p.amountMinor(), p.accountId()).update();
+        merchant.credit(p.amountMinor());
         db.sql("insert into payments(payment_id, account_id, amount_minor) values (?, ?, ?)")
           .params(p.paymentId(), p.accountId(), p.amountMinor()).update();
+        completed.paymentApplied(p);
     }
 
     private boolean alreadyProcessed(PaymentEvent p) {

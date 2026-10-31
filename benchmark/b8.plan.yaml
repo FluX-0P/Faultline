@@ -1,0 +1,63 @@
+# Planted bug B8: the worker saves the payment, then publishes "payment completed" once it has committed. Crash worker-1
+# in between, twice: Kafka redelivers the message, but the payment is already done, so its event is never published.
+# With the outbox the event is saved with the payment and published by whichever worker gets to it, crash or not.
+# faultline benchmark adds the settings that switch the bug on or off.
+app: demo-app
+journey: make-payment
+risk:
+  id: B8
+  pattern: P8
+  title: Saves, then publishes "payment completed"
+  location: CompletedEvents#onCommitted
+  file: src/main/java/dev/faultline/demo/payment/CompletedEvents.java
+  line: 52
+  why: Hand-written benchmark plan for planted bug B8.
+target:
+  url: http://localhost:8080
+  compose:
+    file: deploy/docker-compose.yml
+    profile: demo
+    services: [toxiproxy, provider, api, worker-1, worker-2, worker-3]
+    consumers: 3
+database:
+  url: jdbc:postgresql://localhost:5432/demo
+  user: demo
+  password: demo
+  reset:
+  - TRUNCATE payments
+  - TRUNCATE processed_events
+  - UPDATE accounts SET balance_minor = 1000000
+  - UPDATE merchant SET balance_minor = 0
+  - TRUNCATE outbox
+  - TRUNCATE stub.charges
+kafka:
+  bootstrap: localhost:9092
+  topic: payments.requested
+  group: payment-worker
+traffic:
+  count: 3000
+  rate: 100
+  request:
+    method: POST
+    path: /payments
+    body: |
+      {"paymentId": "pay-${seed}-${seq}", "accountId": "acct-${int:1:100}", "amountMinor": ${int:100:5000}}
+correlate_by:
+  request_field: paymentId
+  table: payments
+  column: payment_id
+downstream:
+  topic: payments.completed
+  request_field: paymentId
+fault:
+  point: CompletedEvents#publish
+  when: before
+  action: crash
+  nth_hit: 100
+  times: 2
+  target: worker-1
+checks: [no-lost, no-duplicates, no-unexpected, no-lost-downstream, faults-fired]
+confirm:
+  runs: 2
+  baselines: 1
+  min_failing: 2

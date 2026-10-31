@@ -1,0 +1,63 @@
+# Planted bug B6: a failed charge is tried again at once, as often as it takes. The stub goes down for 6s and, like a
+# real service coming back, then stays down for as long as it gets more than 50 requests a second. Three workers that
+# retry at once keep it down for good, so payments stop. With backoff (100ms growing to 1s, with jitter) they retry a
+# few times a second, the stub is back as soon as the outage ends, and the backlog drains in seconds.
+# faultline benchmark adds the settings that switch the bug on or off.
+app: demo-app
+journey: make-payment
+risk:
+  id: B6
+  pattern: P6
+  title: Immediate, unlimited retries
+  location: ProviderClient#charge
+  file: src/main/java/dev/faultline/demo/payment/ProviderClient.java
+  line: 48
+  why: Hand-written benchmark plan for planted bug B6.
+target:
+  url: http://localhost:8080
+  compose:
+    file: deploy/docker-compose.yml
+    profile: demo
+    services: [toxiproxy, provider, api, worker-1, worker-2, worker-3]
+    consumers: 3
+database:
+  url: jdbc:postgresql://localhost:5432/demo
+  user: demo
+  password: demo
+  reset:
+  - TRUNCATE payments
+  - TRUNCATE processed_events
+  - UPDATE accounts SET balance_minor = 1000000
+  - UPDATE merchant SET balance_minor = 0
+  - TRUNCATE outbox
+  - TRUNCATE stub.charges
+kafka:
+  bootstrap: localhost:9092
+  topic: payments.requested
+  group: payment-worker
+stub: http://localhost:9090
+traffic:
+  count: 2000
+  rate: 100
+  # an app that never catches up never drains; a healthy one is done well within this
+  drain_timeout: 60s
+  request:
+    method: POST
+    path: /payments
+    body: |
+      {"paymentId": "pay-${seed}-${seq}", "accountId": "acct-${int:1:100}", "amountMinor": ${int:100:5000}}
+correlate_by:
+  request_field: paymentId
+  table: payments
+  column: payment_id
+fault:
+  layer: service
+  action: outage
+  at: 5s
+  duration: 6s
+checks: [no-lost, no-duplicates, no-unexpected, recovery-within, faults-fired]
+recovery_within: 30s
+confirm:
+  runs: 2
+  baselines: 1
+  min_failing: 2

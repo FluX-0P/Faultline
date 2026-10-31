@@ -46,12 +46,32 @@ class FaultPlanTest {
     }
 
     @Test
+    void readsABarrierAndItsPartnersPlan(@TempDir Path dir) throws Exception {
+        Path log = dir.resolve("faults.jsonl");
+        Path holder = writePlan(dir, Map.of("point", "MerchantBalance#read", "when", "after", "action", "barrier", "delay_ms", "3000",
+            "until", "MerchantBalance#write", "listen", "7071", "nth_hit", "5", "times", "3", "log", log.toString()));
+        assertThat(FaultPlan.load(holder)).isEqualTo(new FaultPlan("MerchantBalance#read", "after", "barrier", 5, 3, 3_000, log,
+            "MerchantBalance#write", 7071, null));
+
+        Path partner = writePlan(dir, Map.of("point", "MerchantBalance#write", "when", "after", "action", "signal",
+            "signal_to", "worker-1:7071", "nth_hit", "1", "times", "1", "log", log.toString()));
+        assertThat(FaultPlan.load(partner).signalTo()).isEqualTo("worker-1:7071");
+
+        Path armed = writePlan(dir, Map.of("point", "MerchantBalance#read", "nth_hit", "5", "times", "3", "log", log.toString(),
+            "arm_file", dir.resolve("armed").toString()));
+        assertThat(FaultPlan.load(armed).armFile()).isEqualTo(dir.resolve("armed"));
+    }
+
+    @Test
     void rejectsAMissingOrBadSetting(@TempDir Path dir) throws Exception {
         assertThatThrownBy(() -> FaultPlan.load(writePlan(dir, Map.of("point", "before-ack", "times", "3", "log", "f"))))
             .hasMessageContaining("nth_hit");
         assertThatThrownBy(() -> new FaultPlan("before-ack", "before", "freeze", 1, 1, 0, dir)).hasMessageContaining("unsupported action");
         assertThatThrownBy(() -> new FaultPlan("PaymentService", "before", "crash", 1, 1, 0, dir)).hasMessageContaining("Class#method");
         assertThatThrownBy(() -> new FaultPlan("A#b", "before", "delay", 1, 1, 0, dir)).hasMessageContaining("delay_ms");
+        assertThatThrownBy(() -> new FaultPlan("A#b", "after", "barrier", 1, 1, 100, dir)).hasMessageContaining("until=Class#method");
+        assertThatThrownBy(() -> new FaultPlan("A#b", "after", "barrier", 1, 1, 0, dir, "A#c", 0, null)).hasMessageContaining("delay_ms");
+        assertThatThrownBy(() -> new FaultPlan("A#c", "after", "signal", 1, 1, 0, dir, null, 0, "worker-1")).hasMessageContaining("host:port");
     }
 
     private static Path writePlan(Path dir, Map<String, String> settings) throws Exception {

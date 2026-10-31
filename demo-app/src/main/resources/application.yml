@@ -34,3 +34,18 @@ payments:
   retries: retry-topic
   # where the API publishes; a chaos relay can sit between payments.raw and payments.requested
   inbound-topic: payments.requested
+  # where a payment is processed: thread-pool (B2: its message is acknowledged before it is done) or listener-thread
+  processing: thread-pool
+  # how the shop's balance is credited: read-then-write (B4: two workers can add to the same old balance) or locked
+  merchant-balance: read-then-write
+  # the "payment completed" event: after-commit (B8: a crash in between loses it) or outbox
+  completed-events: after-commit
+  provider:
+    # the payment provider every payment is charged at; empty runs the app without one, and nothing is charged
+    url: ""
+    # how long to wait for the provider's reply before trying again
+    timeout: 1s
+    # what makes a retried charge safe: none (B5: a charge that timed out is charged again) or payment-id
+    idempotency-key: none
+    # how a failed charge is retried: immediately (B6: a provider that is struggling gets buried) or with-backoff
+    retry: immediately

@@ -9,6 +9,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
 
+import org.apache.kafka.clients.consumer.CloseOptions;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
@@ -102,6 +103,11 @@ public final class ChaosRelay implements AutoCloseable {
         }
     }
 
+    /** Disarmed, the relay only forwards; armed, it fires the plan's messaging fault (the default). */
+    public void armed(boolean armed) {
+        chaos.armed(armed);
+    }
+
     /** Request IDs whose message the relay corrupted on purpose. */
     public Set<String> corrupted() {
         return chaos.corrupted();
@@ -116,7 +122,7 @@ public final class ChaosRelay implements AutoCloseable {
     public void close() throws InterruptedException {
         running = false;
         if (thread != null) thread.join(Duration.ofSeconds(5));
-        consumer.close(Duration.ofSeconds(5));
+        consumer.close(CloseOptions.timeout(Duration.ofSeconds(5)));
         producer.close(Duration.ofSeconds(5));
     }
 }

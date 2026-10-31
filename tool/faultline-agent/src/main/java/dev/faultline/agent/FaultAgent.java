@@ -43,7 +43,7 @@ public final class FaultAgent {
         int remaining;
         try {
             plan = FaultPlan.load(Path.of(planFile));
-            remaining = plan.remaining();
+            remaining = plan.action().equals("signal") ? 1 : plan.remaining();
         } catch (Exception e) {
             log("could not read plan " + planFile + " (" + e + "), doing nothing");
             return;
@@ -53,13 +53,28 @@ public final class FaultAgent {
             return;
         }
 
-        FaultTrigger.arm(plan, remaining);
-        log("will %s %s %s on every %dth call (%d of %d left)".formatted(plan.action(),
-            plan.point().equals(BEFORE_ACK) ? "at" : plan.when(), plan.point(), plan.nthHit(), remaining, plan.times()));
-
         // keeps ByteBuddy off sun.misc.Unsafe, which newer JDKs warn about. Shading renames this property along with
         // the package, so it only affects our copy of ByteBuddy, never the app's own.
         System.setProperty("net.bytebuddy.safe", "true");
+
+        try {
+            if (plan.action().equals("signal")) {
+                // a barrier's partner: never fires a fault of its own, only reports its passes to the holding worker
+                Barrier.signalTo(plan.signalTo());
+                log("will tell %s each time %s returns".formatted(plan.signalTo(), plan.point()));
+                installMethod(inst, plan.point(), PassAdvice.class);
+                return;
+            }
+            if (plan.action().equals("barrier") && plan.listen() > 0) Barrier.listen(plan.listen());
+        } catch (Exception e) {
+            log("could not open the barrier's socket (" + e + "), doing nothing");
+            return;
+        }
+
+        FaultTrigger.arm(plan, remaining);
+        log("will %s %s %s on every %dth call (%d of %d left)%s".formatted(plan.action(),
+            plan.point().equals(BEFORE_ACK) ? "at" : plan.when(), plan.point(), plan.nthHit(), remaining, plan.times(),
+            plan.action().equals("barrier") ? ", until another worker passes " + plan.until() : ""));
 
         if (plan.point().equals(BEFORE_ACK)) {
             // only Spring Kafka's own classes: fast startup, and nothing else in the app is touched
@@ -67,14 +82,20 @@ public final class FaultAgent {
                 hasSuperType(named(ACKNOWLEDGMENT)).and(not(isInterface())),
                 named("acknowledge").and(takesNoArguments()), BeforeAdvice.class);
         } else {
-            String type = plan.typeName();
-            // OrderService matches dev.example.OrderService; a Spring proxy (OrderService$$SpringCGLIB$$0) does not
-            ElementMatcher.Junction<TypeDescription> types = type.contains(".") ? named(type) : named(type).or(nameEndsWith("." + type));
-            install(inst, nameStartsWith("java.").or(nameStartsWith("jdk.")).or(nameStartsWith("sun.")).or(nameStartsWith("com.sun."))
-                    .or(nameStartsWith("dev.faultline.agent.")),
-                types.and(not(isInterface())), named(plan.methodName()).and(not(isAbstract())),
-                plan.when().equals("after") ? AfterAdvice.class : BeforeAdvice.class);
+            installMethod(inst, plan.point(), plan.when().equals("after") ? AfterAdvice.class : BeforeAdvice.class);
         }
+        // passes by this app's own threads release the barrier too
+        if (plan.action().equals("barrier")) installMethod(inst, plan.until(), PassAdvice.class);
+    }
+
+    /** Copies {@code advice} into the app's {@code Class#method}. */
+    private static void installMethod(Instrumentation inst, String classAndMethod, Class<?> advice) {
+        String type = FaultPlan.typeOf(classAndMethod);
+        // OrderService matches dev.example.OrderService; a Spring proxy (OrderService$$SpringCGLIB$$0) does not
+        ElementMatcher.Junction<TypeDescription> types = type.contains(".") ? named(type) : named(type).or(nameEndsWith("." + type));
+        install(inst, nameStartsWith("java.").or(nameStartsWith("jdk.")).or(nameStartsWith("sun.")).or(nameStartsWith("com.sun."))
+                .or(nameStartsWith("dev.faultline.agent.")),
+            types.and(not(isInterface())), named(FaultPlan.methodOf(classAndMethod)).and(not(isAbstract())), advice);
     }
 
     private static void install(Instrumentation inst, ElementMatcher<? super TypeDescription> ignore, ElementMatcher<? super TypeDescription> types,

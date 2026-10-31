@@ -37,6 +37,17 @@ class ChaosTest {
     }
 
     @Test
+    void disarmedItForwardsAndCountsNothing() {
+        var chaos = chaos("duplicate", 2, 1);
+        chaos.armed(false);
+        for (int i = 0; i < 5; i++) assertThat(chaos.accept(m("a", i))).containsExactly(m("a", i));   // a warm-up
+        chaos.armed(true);
+
+        assertThat(chaos.accept(m("a", 10))).containsExactly(m("a", 10));
+        assertThat(chaos.accept(m("a", 11))).containsExactly(m("a", 11), m("a", 11));   // the 2nd message since arming
+    }
+
+    @Test
     void corruptsIntoInvalidJsonAndRemembersWhichRequest() {
         var chaos = chaos("corrupt", 1, 1);
 

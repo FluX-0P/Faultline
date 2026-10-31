@@ -42,10 +42,10 @@ public final class DockerStack implements AutoCloseable {
 
     /**
      * (Re)builds and starts every service with these settings. Call {@link #removeLeftovers()} first.
-     * {@code agentService} (may be null) also gets the agent, the agent jar and the run folder mounted.
+     * Each service in {@code agents} also gets the agent with that environment, the agent jar and the run folder mounted.
      */
-    public void up(Map<String, String> settings, String agentService, Path agentJar, Map<String, String> agentEnv) throws IOException, InterruptedException {
-        writeOverride(settings, agentService, agentJar, agentEnv);
+    public void up(Map<String, String> settings, Map<String, Map<String, String>> agents, Path agentJar) throws IOException, InterruptedException {
+        writeOverride(settings, agents, agentJar);
         Runtime.getRuntime().addShutdownHook(shutdownHook);
         up = true;
         var args = new ArrayList<>(List.of("up", "-d", "--build", "--force-recreate", "--no-deps"));
@@ -53,16 +53,16 @@ public final class DockerStack implements AutoCloseable {
         compose(args);
     }
 
-    void writeOverride(Map<String, String> settings, String agentService, Path agentJar, Map<String, String> agentEnv) throws IOException {
+    void writeOverride(Map<String, String> settings, Map<String, Map<String, String>> agents, Path agentJar) throws IOException {
         var services = new LinkedHashMap<String, Object>();
         String json = Json.MAPPER.writeValueAsString(settings);
         for (String name : compose.services()) {
             var env = new LinkedHashMap<String, String>();
             env.put("SPRING_APPLICATION_JSON", json);
             var service = new LinkedHashMap<String, Object>();
-            if (name.equals(agentService)) {
+            if (agents.containsKey(name)) {
                 env.put("JAVA_TOOL_OPTIONS", "-javaagent:" + AGENT_IN_CONTAINER);
-                env.putAll(agentEnv);
+                env.putAll(agents.get(name));
                 service.put("volumes", List.of(
                     Map.of("type", "bind", "source", Out.path(agentJar.toAbsolutePath()), "target", AGENT_IN_CONTAINER, "read_only", true),
                     Map.of("type", "bind", "source", Out.path(runDir.toAbsolutePath()), "target", RUN_DIR_IN_CONTAINER)));

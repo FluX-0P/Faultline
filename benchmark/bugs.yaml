@@ -1,6 +1,6 @@
 # The demo app's planted bugs, and the hand-written plans that should confirm them.
 # faultline benchmark runs each plan with only its bug switched on, then every plan with all bugs off,
-# where nothing may be confirmed. B2, B4, B5, B6 and B8 arrive in part 3 of Phase 5.
+# where nothing may be confirmed.
 app: demo-app
 app_dir: demo-app
 
@@ -10,6 +10,11 @@ bug_free:
   payments.dedupe-key: payment-id
   payments.bad-messages: dead-letter
   payments.retries: in-place
+  payments.processing: listener-thread
+  payments.merchant-balance: locked
+  payments.completed-events: outbox
+  payments.provider.idempotency-key: payment-id
+  payments.provider.retry: with-backoff
 
 bugs:
   - id: B1
@@ -21,6 +26,15 @@ bugs:
     settings:
       payments.dedupe: none
 
+  - id: B2
+    title: Auto-commit with a thread pool
+    pattern: P2
+    location: PaymentListener#onMessage
+    check: no-lost
+    plan: b2.plan.yaml
+    settings:
+      payments.processing: thread-pool
+
   - id: B3
     title: Dedupes by message ID only, so a double submit slips through
     pattern: P3
@@ -30,6 +44,33 @@ bugs:
     settings:
       payments.dedupe-key: event-id
 
+  - id: B4
+    title: Read-modify-write on the balance
+    pattern: P4
+    location: MerchantBalance#credit
+    check: shop-balance-adds-up
+    plan: b4.plan.yaml
+    settings:
+      payments.merchant-balance: read-then-write
+
+  - id: B5
+    title: Retries a timed-out charge without an idempotency key
+    pattern: P5
+    location: ProviderClient#charge
+    check: one-charge-per-payment-at-the-provider
+    plan: b5.plan.yaml
+    settings:
+      payments.provider.idempotency-key: none
+
+  - id: B6
+    title: Immediate, unlimited retries
+    pattern: P6
+    location: ProviderClient#charge
+    check: recovery-within
+    plan: b6.plan.yaml
+    settings:
+      payments.provider.retry: immediately
+
   - id: B7
     title: No dead-letter handling for bad messages
     pattern: P7
@@ -38,6 +79,15 @@ bugs:
     plan: b7.plan.yaml
     settings:
       payments.bad-messages: retry-forever
+
+  - id: B8
+    title: Saves, then publishes "payment completed"
+    pattern: P8
+    location: CompletedEvents#onCommitted
+    check: no-lost-downstream
+    plan: b8.plan.yaml
+    settings:
+      payments.completed-events: after-commit
 
   - id: B9
     title: A retry topic reorders events for one account

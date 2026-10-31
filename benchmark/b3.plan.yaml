@@ -9,14 +9,14 @@ risk:
   title: Dedupes by message ID only
   location: PaymentService#process
   file: src/main/java/dev/faultline/demo/payment/PaymentService.java
-  line: 34
+  line: 41
   why: Hand-written benchmark plan for planted bug B3.
 target:
   url: http://localhost:8080
   compose:
     file: deploy/docker-compose.yml
     profile: demo
-    services: [api, worker-1, worker-2, worker-3]
+    services: [toxiproxy, provider, api, worker-1, worker-2, worker-3]
     consumers: 3
 database:
   url: jdbc:postgresql://localhost:5432/demo
@@ -26,6 +26,9 @@ database:
   - TRUNCATE payments
   - TRUNCATE processed_events
   - UPDATE accounts SET balance_minor = 1000000
+  - UPDATE merchant SET balance_minor = 0
+  - TRUNCATE outbox
+  - TRUNCATE stub.charges
 kafka:
   bootstrap: localhost:9092
   topic: payments.requested

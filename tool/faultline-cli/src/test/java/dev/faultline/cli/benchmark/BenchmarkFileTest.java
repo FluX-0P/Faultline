@@ -2,6 +2,7 @@ package dev.faultline.cli.benchmark;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 
 import dev.faultline.cli.plan.Durations;
@@ -15,7 +16,7 @@ class BenchmarkFileTest {
     @Test
     void everyShippedPlanIsValidWithItsBugOnAndOff() throws Exception {
         var bench = BenchmarkFile.read(BENCHMARK);
-        assertThat(bench.bugs()).extracting(BenchmarkFile.Bug::id).contains("B1", "B3", "B7", "B9", "B10");
+        assertThat(bench.bugs()).extracting(BenchmarkFile.Bug::id).containsExactly("B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B9", "B10");
 
         for (var bug : bench.bugs()) {
             Plan plan = Plan.read(BENCHMARK.resolveSibling(bug.plan()));
@@ -25,12 +26,24 @@ class BenchmarkFileTest {
     }
 
     @Test
+    void extraPlansNextToTheBenchmarkAreValidToo() throws Exception {
+        var bench = BenchmarkFile.read(BENCHMARK);
+        try (var files = Files.list(BENCHMARK.getParent())) {
+            for (Path file : files.filter(f -> f.getFileName().toString().endsWith(".plan.yaml")).toList()) {
+                assertThat(Plan.read(file).forRun(42, null, null, bench.args(null), null, null).problems()).as(file.toString()).isEmpty();
+            }
+        }
+    }
+
+    @Test
     void aBugsSettingsWinOverTheBugFreeOnes() throws Exception {
         var bench = BenchmarkFile.read(BENCHMARK);
         var b1 = bench.bugs().stream().filter(b -> b.id().equals("B1")).findFirst().orElseThrow();
 
         assertThat(bench.args(b1)).containsExactly("--payments.dedupe=none", "--payments.dedupe-key=payment-id",
-            "--payments.bad-messages=dead-letter", "--payments.retries=in-place");
+            "--payments.bad-messages=dead-letter", "--payments.retries=in-place", "--payments.processing=listener-thread",
+            "--payments.merchant-balance=locked", "--payments.completed-events=outbox", "--payments.provider.idempotency-key=payment-id",
+            "--payments.provider.retry=with-backoff");
         assertThat(bench.args(null)).first().isEqualTo("--payments.dedupe=claim-first");
     }
 
