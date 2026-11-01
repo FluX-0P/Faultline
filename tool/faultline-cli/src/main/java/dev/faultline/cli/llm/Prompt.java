@@ -1,6 +1,7 @@
 package dev.faultline.cli.llm;
 
 import java.util.List;
+import java.util.Map;
 
 import dev.faultline.cli.source.RepoFiles.TextFile;
 
@@ -22,6 +23,12 @@ public final class Prompt {
     public Prompt code(String title, String language, String code) {
         if (code == null || code.isBlank()) return this;
         return section(title, fence(language, code));
+    }
+
+    /** A code section for each title, in order. */
+    public Prompt codes(Map<String, String> byTitle, String language) {
+        byTitle.forEach((title, code) -> code(title, language, code));
+        return this;
     }
 
     public Prompt files(String title, List<TextFile> files, String language) {

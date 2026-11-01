@@ -38,6 +38,8 @@ public final class SpringConfig {
         "spring.kafka.consumer.auto-offset-reset", "spring.kafka.consumer.enable-auto-commit", "spring.kafka.listener.ack-mode",
         "spring.kafka.listener.auto-startup", "spring.jpa.hibernate.ddl-auto", "spring.datasource.driver-class-name");
     private static final String APPLICATION_JSON = "SPRING_APPLICATION_JSON";
+    /** No settings: what code outside every Spring Boot app of a repo runs with, as far as Faultline can tell. */
+    public static final SpringConfig EMPTY = new SpringConfig(Map.of());
 
     private final Map<String, String> values;
     private final Map<String, String> environment;

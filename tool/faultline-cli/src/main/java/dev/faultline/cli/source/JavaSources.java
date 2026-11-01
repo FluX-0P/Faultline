@@ -3,9 +3,14 @@ package dev.faultline.cli.source;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
@@ -48,26 +53,53 @@ public final class JavaSources {
     private static final Pattern PROPERTY = Pattern.compile("\\$\\{([^:}]+)(?::([^}]*))?}");
     /** Types the app sends Kafka messages through. */
     private static final Set<String> PRODUCERS = Set.of("KafkaTemplate", "KafkaOperations", "StreamBridge");
+    /** Parameter annotations that bind a handler's parameter from anything but form fields. */
+    private static final Set<String> OTHER_BINDINGS = Set.of("RequestBody", "PathVariable", "RequestParam", "RequestHeader", "CookieValue",
+        "RequestPart", "RequestAttribute", "SessionAttribute", "MatrixVariable", "AuthenticationPrincipal");
 
-    /** A method of the app, named Class#method. */
-    public record Method(String handler, String file, int line, MethodDeclaration declaration, TypeDeclaration<?> owner) {}
+    /**
+     * A method of the app, named Class#method, or module:Class#method when another module of the repo has a class of the
+     * same name. {@code module} is the path of its module, null for code outside every module (a library of the repo).
+     */
+    public record Method(String handler, String file, int line, MethodDeclaration declaration, TypeDeclaration<?> owner, String module) {}
 
-    private record Unit(String path, CompilationUnit cu) {}
+    /** {@code module}: the path of the module the file is in, null if none. */
+    private record Unit(String path, CompilationUnit cu, String module) {}
 
     private final List<Unit> units;
     private final List<String> problems;
-    private final SpringConfig config;
+    /** Each module's configuration and name, by its path. */
+    private final Map<String, SpringConfig> configs;
+    private final Map<String, String> names;
+    /** Simple names of types that more than one module declares: their methods' handlers carry the module. */
+    private final Set<String> clashing;
+    private final Map<CompilationUnit, Unit> unitOf = new IdentityHashMap<>();
     private final DefaultPrettyPrinter noComments = new DefaultPrettyPrinter(new DefaultPrinterConfiguration()
         .removeOption(new DefaultConfigurationOption(ConfigOption.PRINT_COMMENTS))
         .removeOption(new DefaultConfigurationOption(ConfigOption.PRINT_JAVADOC)));
 
-    private JavaSources(List<Unit> units, List<String> problems, SpringConfig config) {
+    private JavaSources(List<Unit> units, List<String> problems, Map<String, SpringConfig> configs, Map<String, String> names) {
         this.units = units;
         this.problems = problems;
-        this.config = config;
+        this.configs = configs;
+        this.names = names;
+        units.forEach(u -> unitOf.put(u.cu(), u));
+        var declaredIn = new HashMap<String, Set<String>>();
+        for (var u : units) {
+            for (TypeDeclaration<?> type : u.cu().findAll(TypeDeclaration.class)) {
+                declaredIn.computeIfAbsent(type.getNameAsString(), k -> new HashSet<>()).add(moduleName(u));
+            }
+        }
+        this.clashing = declaredIn.entrySet().stream().filter(e -> e.getValue().size() > 1).map(Map.Entry::getKey).collect(Collectors.toSet());
     }
 
+    /** The code of a folder that is one app, with its configuration. */
     public static JavaSources parse(RepoFiles repo, SpringConfig config) throws IOException {
+        return parse(repo, List.of(new App.Module(App.ROOT_MODULE, repo.name(), repo, config)));
+    }
+
+    /** The code of a repo; each file belongs to the deepest of the modules whose folder holds it. */
+    static JavaSources parse(RepoFiles repo, List<App.Module> modules) throws IOException {
         var parser = new JavaParser(new ParserConfiguration().setLanguageLevel(LanguageLevel.JAVA_25));
         var units = new ArrayList<Unit>();
         var problems = new ArrayList<String>();
@@ -75,17 +107,44 @@ public final class JavaSources {
             var result = parser.parse(file);
             String path = repo.relative(file);
             if (result.isSuccessful() && result.getResult().isPresent()) {
-                units.add(new Unit(path, result.getResult().get()));
+                String module = modules.stream().map(App.Module::path).filter(m -> m.isEmpty() || path.startsWith(m + "/"))
+                    .max(Comparator.comparingInt(String::length)).orElse(null);
+                units.add(new Unit(path, result.getResult().get(), module));
             } else {
                 problems.add(path + ": " + result.getProblems().stream().findFirst().map(p -> p.getVerboseMessage()).orElse("cannot parse"));
             }
         }
-        return new JavaSources(units, problems, config);
+        return new JavaSources(units, problems, configs(modules), names(modules));
     }
 
-    /** The same code, with annotation placeholders resolved against another configuration. */
-    JavaSources withConfig(SpringConfig other) {
-        return new JavaSources(units, problems, other);
+    /** The same code, with annotation placeholders resolved against the modules' changed configurations. */
+    JavaSources withModules(List<App.Module> modules) {
+        return new JavaSources(units, problems, configs(modules), names(modules));
+    }
+
+    private static Map<String, SpringConfig> configs(List<App.Module> modules) {
+        return modules.stream().collect(Collectors.toMap(App.Module::path, App.Module::config));
+    }
+
+    private static Map<String, String> names(List<App.Module> modules) {
+        return modules.stream().collect(Collectors.toMap(App.Module::path, App.Module::name));
+    }
+
+    /** A module's name; code outside every module goes by its top folder, such as common. */
+    private String moduleName(Unit u) {
+        if (u.module() != null) return names.get(u.module());
+        return u.path().contains("/") ? u.path().substring(0, u.path().indexOf('/')) : u.path();
+    }
+
+    /** The path of the module a type's file is in, null for the repo's code outside every module. */
+    public String moduleOf(TypeDeclaration<?> type) {
+        return type.findCompilationUnit().map(unitOf::get).map(Unit::module).orElse(null);
+    }
+
+    /** OrderKafkaListener, or shipping:OrderKafkaListener when another module has a type of that name. */
+    private String qualified(TypeDeclaration<?> type, Unit u) {
+        String name = type.getNameAsString();
+        return clashing.contains(name) ? moduleName(u) + ":" + name : name;
     }
 
     /** Files JavaParser could not read; they are left out. */
@@ -109,16 +168,30 @@ public final class JavaSources {
         return types().stream().filter(t -> t.getNameAsString().equals(simpleName)).findFirst();
     }
 
+    /** A type as the code of a module sees it: the module's own first, then the repo's code outside every module, then any. */
+    public Optional<TypeDeclaration<?>> type(String module, String simpleName) {
+        var named = types().stream().filter(t -> t.getNameAsString().equals(simpleName)).toList();
+        return named.stream().filter(t -> Objects.equals(moduleOf(t), module)).findFirst()
+            .or(() -> named.stream().filter(t -> moduleOf(t) == null).findFirst())
+            .or(() -> named.stream().findFirst());
+    }
+
     public List<Method> methods() {
         var methods = new ArrayList<Method>();
         for (var unit : units) {
             for (TypeDeclaration<?> type : unit.cu().findAll(TypeDeclaration.class)) {
+                String owner = qualified(type, unit);
                 for (var m : type.getMethods()) {
-                    methods.add(new Method(type.getNameAsString() + "#" + m.getNameAsString(), unit.path(), line(m), m, type));
+                    methods.add(new Method(owner + "#" + m.getNameAsString(), unit.path(), line(m), m, type, unit.module()));
                 }
             }
         }
         return methods;
+    }
+
+    /** The first method of this name that the type declares. */
+    private Optional<Method> methodIn(TypeDeclaration<?> type, String name) {
+        return methods().stream().filter(m -> m.owner() == type && m.declaration().getNameAsString().equals(name)).findFirst();
     }
 
     public Optional<Method> method(String handler) {
@@ -133,18 +206,19 @@ public final class JavaSources {
     public List<Endpoint> endpoints() {
         var endpoints = new ArrayList<Endpoint>();
         for (var m : methods()) {
-            String prefix = m.owner().getAnnotationByName("RequestMapping").map(a -> first(values(a, "value", "path"))).orElse("");
+            String module = m.module();
+            String prefix = m.owner().getAnnotationByName("RequestMapping").map(a -> first(values(a, module, "value", "path"))).orElse("");
             for (AnnotationExpr a : m.declaration().getAnnotations()) {
                 String name = a.getName().getIdentifier();
                 if (HTTP_MAPPINGS.containsKey(name)) {
                     String httpMethod = name.equals("RequestMapping") ? requestMethod(a) : HTTP_MAPPINGS.get(name);
-                    var paths = values(a, "value", "path");
+                    var paths = values(a, module, "value", "path");
                     for (String path : paths.isEmpty() ? List.of("") : paths) {
                         endpoints.add(Endpoint.http(httpMethod, joinPaths(prefix, path), m.handler(), m.file(), m.line()));
                     }
                 } else if (name.equals("KafkaListener")) {
-                    var group = values(a, "groupId");
-                    endpoints.add(Endpoint.kafka(values(a, "topics"), group.isEmpty() ? null : group.getFirst(), m.handler(), m.file(), m.line()));
+                    var group = values(a, module, "groupId");
+                    endpoints.add(Endpoint.kafka(values(a, module, "topics"), group.isEmpty() ? null : group.getFirst(), m.handler(), m.file(), m.line()));
                 }
             }
         }
@@ -174,7 +248,7 @@ public final class JavaSources {
                 : scope.isFieldAccessExpr() && scope.asFieldAccessExpr().getScope().isThisExpr() ? scope.asFieldAccessExpr().getNameAsString()
                 : null;
             if (field == null) continue;
-            fieldType(m.owner(), field).flatMap(this::type).ifPresent(t -> types.putIfAbsent(t.getNameAsString(), t));
+            fieldType(m.owner(), field).flatMap(t -> type(m.module(), t)).ifPresent(t -> types.putIfAbsent(t.getNameAsString(), t));
         }
         return List.copyOf(types.values());
     }
@@ -183,8 +257,8 @@ public final class JavaSources {
     public List<Method> calledMethods(Method m) {
         var called = new LinkedHashMap<String, Method>();
         for (var call : m.declaration().findAll(MethodCallExpr.class)) {
-            receiverType(m, call).flatMap(this::type).ifPresent(t -> method(t.getNameAsString() + "#" + call.getNameAsString())
-                .ifPresent(callee -> called.putIfAbsent(callee.handler(), callee)));
+            receiverType(m, call).flatMap(t -> type(m.module(), t)).flatMap(t -> methodIn(t, call.getNameAsString()))
+                .ifPresent(callee -> called.putIfAbsent(callee.handler(), callee));
         }
         return List.copyOf(called.values());
     }
@@ -200,7 +274,7 @@ public final class JavaSources {
         methods.put(m.handler(), m);
         for (var call : m.declaration().findAll(MethodCallExpr.class)) {
             boolean own = call.getScope().isEmpty() || call.getScope().get().isThisExpr();
-            if (own) method(m.owner().getNameAsString() + "#" + call.getNameAsString()).ifPresent(c -> methods.putIfAbsent(c.handler(), c));
+            if (own) methodIn(m.owner(), call.getNameAsString()).ifPresent(c -> methods.putIfAbsent(c.handler(), c));
         }
         return List.copyOf(methods.values());
     }
@@ -230,8 +304,10 @@ public final class JavaSources {
         var topics = new ArrayList<String>();
         for (var call : sends(m)) {
             if (call.getArguments().isEmpty()) continue;
-            var topic = strings(call.getArgument(0), 0);
-            if (topic.isEmpty()) topic = fieldName(call.getArgument(0)).flatMap(f -> setting(m.owner(), f)).map(this::resolveProperties).stream().toList();
+            var topic = strings(call.getArgument(0), m.module(), 0);
+            if (topic.isEmpty()) {
+                topic = fieldName(call.getArgument(0)).flatMap(f -> setting(m.owner(), f)).map(v -> resolveProperties(m.module(), v)).stream().toList();
+            }
             topic.stream().filter(t -> !topics.contains(t)).forEach(topics::add);
         }
         return topics;
@@ -246,7 +322,7 @@ public final class JavaSources {
             for (var call : sends(m)) {
                 if (call.getArguments().isEmpty()) continue;
                 var value = fieldName(call.getArgument(0)).flatMap(f -> setting(m.owner(), f));
-                if (value.isPresent() && resolveProperties(value.get()).equals(topic)) {
+                if (value.isPresent() && resolveProperties(m.module(), value.get()).equals(topic)) {
                     var key = PROPERTY.matcher(value.get());
                     if (key.find()) return Optional.of(key.group(1));
                 }
@@ -263,7 +339,7 @@ public final class JavaSources {
         }
         for (var c : owner.getConstructors()) c.getParameterByName(field).ifPresent(p -> annotations.addAll(p.getAnnotations()));
         return annotations.stream().filter(a -> a.getName().getIdentifier().equals("Value"))
-            .flatMap(a -> rawValues(a, "value").stream()).filter(v -> PROPERTY.matcher(v).find()).findFirst();
+            .flatMap(a -> rawValues(a, moduleOf(owner), "value").stream()).filter(v -> PROPERTY.matcher(v).find()).findFirst();
     }
 
     private static Optional<String> fieldName(Expression e) {
@@ -285,8 +361,42 @@ public final class JavaSources {
         return m.declaration().getParameters().stream()
             .filter(p -> p.getAnnotationByName("RequestBody").isPresent())
             .map(JavaSources::typeName)
-            .flatMap(name -> type(name).stream())
+            .flatMap(name -> type(m.module(), name).stream())
             .toList();
+    }
+
+    /**
+     * The types of a handler's parameters that Spring binds from form fields: the app's own classes and records with no
+     * annotation that binds them otherwise (@RequestBody, @PathVariable, @RequestParam ...), such as {@code post(Order order)}.
+     */
+    public List<TypeDeclaration<?>> formBodyTypes(Method m) {
+        return m.declaration().getParameters().stream()
+            .filter(p -> p.getAnnotations().stream().noneMatch(a -> OTHER_BINDINGS.contains(a.getName().getIdentifier())))
+            .map(JavaSources::typeName)
+            .flatMap(name -> type(m.module(), name).stream())
+            .filter(t -> !t.isEnumDeclaration() && !(t.isClassOrInterfaceDeclaration() && t.asClassOrInterfaceDeclaration().isInterface()))
+            .toList();
+    }
+
+    /**
+     * The app's types that a Formatter or a Converter from String of the module reads from one text value, such as a
+     * Customer from its ID, by type name, with the class that reads it.
+     */
+    public Map<String, String> textBoundTypes(String module) {
+        var bound = new LinkedHashMap<String, String>();
+        for (var type : types()) {
+            if (!Objects.equals(moduleOf(type), module) || !type.isClassOrInterfaceDeclaration()) continue;
+            for (var parent : type.asClassOrInterfaceDeclaration().getImplementedTypes()) {
+                var args = parent.getTypeArguments().orElse(null);
+                if (args == null || args.isEmpty()) continue;
+                String name = parent.getNameAsString();
+                if (name.equals("Formatter")) bound.putIfAbsent(simpleName(args.get(0).asString()), type.getNameAsString());
+                if (name.equals("Converter") && args.size() == 2 && simpleName(args.get(0).asString()).equals("String")) {
+                    bound.putIfAbsent(simpleName(args.get(1).asString()), type.getNameAsString());
+                }
+            }
+        }
+        return bound;
     }
 
     /** The code of a type, without comments. */
@@ -303,7 +413,7 @@ public final class JavaSources {
         for (var unit : units) {
             sb.append(unit.path()).append('\n');
             for (TypeDeclaration<?> type : unit.cu().findAll(TypeDeclaration.class)) {
-                sb.append("  ").append(annotations(type.getAnnotations())).append(kind(type)).append(' ').append(type.getNameAsString());
+                sb.append("  ").append(annotations(type.getAnnotations())).append(kind(type)).append(' ').append(qualified(type, unit));
                 if (type instanceof RecordDeclaration r) {
                     sb.append(r.getParameters().stream().map(this::print).collect(Collectors.joining(", ", "(", ")")));
                 }
@@ -340,44 +450,47 @@ public final class JavaSources {
     }
 
     /** The string values of an annotation attribute, with constants and ${property:default} placeholders resolved. */
-    private List<String> values(AnnotationExpr a, String... names) {
-        return rawValues(a, names).stream().map(this::resolveProperties).toList();
+    private List<String> values(AnnotationExpr a, String module, String... names) {
+        return rawValues(a, module, names).stream().map(v -> resolveProperties(module, v)).toList();
     }
 
     /** The same, with ${property:default} placeholders left as they are. */
-    private List<String> rawValues(AnnotationExpr a, String... names) {
+    private List<String> rawValues(AnnotationExpr a, String module, String... names) {
         var exprs = new ArrayList<Expression>();
         if (a instanceof SingleMemberAnnotationExpr s && List.of(names).contains("value")) exprs.add(s.getMemberValue());
         if (a instanceof NormalAnnotationExpr n) {
             n.getPairs().stream().filter(p -> List.of(names).contains(p.getNameAsString())).forEach(p -> exprs.add(p.getValue()));
         }
-        return exprs.stream().flatMap(e -> strings(e, 0).stream()).toList();
+        return exprs.stream().flatMap(e -> strings(e, module, 0).stream()).toList();
     }
 
-    private List<String> strings(Expression e, int depth) {
+    private List<String> strings(Expression e, String module, int depth) {
         if (depth > 5) return List.of();
         if (e.isStringLiteralExpr()) return List.of(e.asStringLiteralExpr().asString());
-        if (e.isArrayInitializerExpr()) return e.asArrayInitializerExpr().getValues().stream().flatMap(v -> strings(v, depth + 1).stream()).toList();
-        if (e.isNameExpr()) return constant(null, e.asNameExpr().getNameAsString(), depth);
+        if (e.isArrayInitializerExpr()) return e.asArrayInitializerExpr().getValues().stream().flatMap(v -> strings(v, module, depth + 1).stream()).toList();
+        if (e.isNameExpr()) return constant(null, e.asNameExpr().getNameAsString(), module, depth);
         if (e.isFieldAccessExpr()) {
             String scope = e.asFieldAccessExpr().getScope().toString();
-            return constant(scope.substring(scope.lastIndexOf('.') + 1), e.asFieldAccessExpr().getNameAsString(), depth);
+            return constant(scope.substring(scope.lastIndexOf('.') + 1), e.asFieldAccessExpr().getNameAsString(), module, depth);
         }
         if (e instanceof BinaryExpr b && b.getOperator() == BinaryExpr.Operator.PLUS) {
-            var left = strings(b.getLeft(), depth + 1);
-            var right = strings(b.getRight(), depth + 1);
+            var left = strings(b.getLeft(), module, depth + 1);
+            var right = strings(b.getRight(), module, depth + 1);
             if (left.size() == 1 && right.size() == 1) return List.of(left.getFirst() + right.getFirst());
         }
         return List.of();
     }
 
-    private List<String> constant(String typeName, String fieldName, int depth) {
-        for (var type : types()) {
+    /** A string constant, looked up as the module's code sees it: in its own types first. */
+    private List<String> constant(String typeName, String fieldName, String module, int depth) {
+        var types = new ArrayList<>(types());
+        types.sort(Comparator.comparing((TypeDeclaration<?> t) -> !Objects.equals(moduleOf(t), module)).thenComparing(t -> moduleOf(t) != null));
+        for (var type : types) {
             if (typeName != null && !type.getNameAsString().equals(typeName)) continue;
             for (var field : type.getFields()) {
                 for (var v : field.getVariables()) {
                     if (v.getNameAsString().equals(fieldName) && v.getInitializer().isPresent()) {
-                        return strings(v.getInitializer().get(), depth + 1);
+                        return strings(v.getInitializer().get(), module, depth + 1);
                     }
                 }
             }
@@ -385,7 +498,9 @@ public final class JavaSources {
         return List.of();
     }
 
-    private String resolveProperties(String value) {
+    /** ${property:default} placeholders, resolved by the module's configuration; code outside every module has none. */
+    private String resolveProperties(String module, String value) {
+        var config = module == null ? SpringConfig.EMPTY : configs.getOrDefault(module, SpringConfig.EMPTY);
         return PROPERTY.matcher(value).replaceAll(m -> Matcher.quoteReplacement(
             config.get(m.group(1)).orElse(m.group(2) != null ? m.group(2) : m.group())));
     }

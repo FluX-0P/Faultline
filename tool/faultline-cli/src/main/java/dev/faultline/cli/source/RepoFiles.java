@@ -23,7 +23,8 @@ public final class RepoFiles {
     static final int MAX_CHARS = 20_000;
     private static final Set<String> SKIP_DIRS = Set.of(".git", ".idea", ".vscode", ".mvn", ".gradle", ".faultline",
         "target", "build", "out", "node_modules");
-    private static final Pattern COMPOSE = Pattern.compile("(docker-)?compose(\\.[\\w-]+)?\\.ya?ml");
+    private static final Set<String> BUILD_FILES = Set.of("pom.xml", "build.gradle", "build.gradle.kts");
+    private static final Pattern COMPOSE =Pattern.compile("(docker-)?compose(\\.[\\w-]+)?\\.ya?ml");
     private static final Pattern SPRING_CONFIG = Pattern.compile("application\\.(yml|yaml|properties)");
     private static final Pattern SPRING_PROFILE_CONFIG = Pattern.compile("application(-[\\w.-]+)?\\.(yml|yaml|properties)");
     private static final Pattern SPEC_FILE = Pattern.compile("(?i).+\\.(ya?ml|json)");
@@ -68,6 +69,32 @@ public final class RepoFiles {
         return root;
     }
 
+    /** The files under a folder of this one ("" is all of them), with paths from that folder. */
+    public RepoFiles within(String folder) {
+        if (folder.isEmpty()) return this;
+        String prefix = folder + "/";
+        return new RepoFiles(root.resolve(folder), paths.stream().filter(p -> p.startsWith(prefix)).map(p -> p.substring(prefix.length())).toList());
+    }
+
+    /**
+     * The Spring Boot apps in this folder, as paths from it ("" for the folder itself): each a folder with a build file
+     * whose src/main/java has a class annotated @SpringBootApplication. Empty when there is none.
+     */
+    public List<String> springBootModules() {
+        var modules = new ArrayList<String>();
+        for (String p : paths) {
+            if (!BUILD_FILES.contains(fileName(p))) continue;
+            String folder = p.contains("/") ? p.substring(0, p.lastIndexOf('/')) : "";
+            String sources = (folder.isEmpty() ? "" : folder + "/") + "src/main/java/";
+            if (modules.contains(folder)) continue;
+            boolean app = paths.stream().filter(j -> j.startsWith(sources) && j.endsWith(".java"))
+                .anyMatch(j -> readWhole(j).contains("@SpringBootApplication"));
+            if (app) modules.add(folder);
+        }
+        modules.sort(null);
+        return modules;
+    }
+
     /** The app's name: its folder name. */
     public String name() {
         return root.toAbsolutePath().normalize().getFileName().toString();
@@ -80,6 +107,14 @@ public final class RepoFiles {
 
     public List<TextFile> buildFiles() {
         return read(p -> Set.of("pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts").contains(fileName(p)));
+    }
+
+    private String readWhole(String path) {
+        try {
+            return Files.readString(root.resolve(path), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot read " + path, e);
+        }
     }
 
     public List<TextFile> composeFiles() {
