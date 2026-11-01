@@ -9,6 +9,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.function.Function;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import com.github.javaparser.ast.expr.BooleanLiteralExpr;
@@ -20,6 +21,7 @@ import com.github.javaparser.ast.stmt.Statement;
 import com.github.javaparser.ast.stmt.TryStmt;
 import com.github.javaparser.ast.stmt.WhileStmt;
 import dev.faultline.cli.source.App;
+import dev.faultline.cli.source.Endpoint;
 import dev.faultline.cli.source.JavaSources;
 import dev.faultline.cli.source.JavaSources.Method;
 import dev.faultline.cli.source.SpringConfig;
@@ -44,28 +46,35 @@ final class Detectors {
     private static final Set<String> RETRY_TYPES = Set.of("FixedBackOff", "ExponentialBackOff", "ExponentialBackOffWithMaxRetries", "RetryTemplate");
     private static final Set<String> ERROR_HANDLERS = Set.of("DefaultErrorHandler", "SeekToCurrentErrorHandler", "CommonLoggingErrorHandler");
 
+    /** A Kafka Connect image in a Compose file, such as debezium/connect or confluentinc/cp-kafka-connect. */
+    private static final Pattern CONNECT_IMAGE = Pattern.compile("(?m)image:\\s*\\S*(debezium/connect|cp-kafka-connect|kafka-connect|/connect:)");
+
     private final JavaSources code;
     /** The configuration a method runs with: its module's. */
     private final Function<Method, SpringConfig> config;
+    /** Whether the app runs Kafka Connect, so some of its topics are filled by a connector rather than its code. */
+    private final boolean connect;
 
     Detectors(JavaSources code, SpringConfig config) {
-        this(code, m -> config);
+        this(code, m -> config, false);
     }
 
-    private Detectors(JavaSources code, Function<Method, SpringConfig> config) {
+    private Detectors(JavaSources code, Function<Method, SpringConfig> config, boolean connect) {
         this.code = code;
         this.config = config;
+        this.connect = connect;
     }
 
     /** The detectors for every module of the app, each judged by its own configuration. */
     static Detectors of(App app) {
-        return new Detectors(app.code(), app::configOf);
+        boolean connect = app.files().composeFiles().stream().anyMatch(f -> CONNECT_IMAGE.matcher(f.text()).find());
+        return new Detectors(app.code(), app::configOf, connect);
     }
 
     /** Every candidate for every pattern, at most one per pattern and method. */
     List<Candidate> all() {
         var found = new LinkedHashMap<String, Candidate>();
-        for (var c : List.of(p1(), p2(), p3(), p4(), p5(), p6(), p7(), p8()).stream().flatMap(List::stream).toList()) {
+        for (var c : List.of(p1(), p2(), p3(), p4(), p5(), p6(), p7(), p8(), p9()).stream().flatMap(List::stream).toList()) {
             found.putIfAbsent(c.pattern() + " " + c.method().handler(), c);
         }
         return List.copyOf(found.values());
@@ -208,6 +217,23 @@ final class Detectors {
             if (!written.isEmpty() || saves) {
                 found.add(new Candidate("P8", m, "writes " + (written.isEmpty() ? "to a repository" : String.join(", ", written)) + " and publishes" + via(m)));
             }
+        }
+        return found;
+    }
+
+    /**
+     * Listeners on a topic no code of the app sends to, in an app that runs Kafka Connect: a connector fills it, such as
+     * Debezium carrying an outbox to Kafka, and a connector delivers at least once.
+     */
+    List<Candidate> p9() {
+        if (!connect) return List.of();
+        var sent = new HashSet<String>();
+        code.methods().forEach(m -> sent.addAll(code.sentTopics(m)));
+        var found = new ArrayList<Candidate>();
+        for (var e : code.endpoints()) {
+            if (e.kind() != Endpoint.Kind.KAFKA || e.topics().isEmpty() || e.topics().stream().anyMatch(sent::contains)) continue;
+            code.method(e.handler()).ifPresent(m -> found.add(new Candidate("P9", m, "%s on %s, which no code of the app sends to: Kafka Connect fills it, and delivers at least once"
+                .formatted(listenerKind(m), String.join(", ", e.topics())))));
         }
         return found;
     }

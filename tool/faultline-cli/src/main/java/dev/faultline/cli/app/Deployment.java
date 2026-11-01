@@ -30,9 +30,10 @@ import tools.jackson.databind.JsonNode;
  * @param toxiproxy Toxiproxy's API address, else null
  * @param services the app's services with their modules; empty for a jar
  * @param faultTarget the service a code fault goes on (the first consumer), or none when the app is one process
+ * @param connectService the service that runs Kafka Connect, such as Debezium carrying an outbox to Kafka, else null
  */
 public record Deployment(Plan.Compose compose, String url, List<String> consumers, String stub, String toxiproxy,
-                         List<Service> services, String faultTarget) {
+                         List<Service> services, String faultTarget, String connectService) {
     static final int STUB_PORT = 9090;
     static final int TOXIPROXY_PORT = 8474;
     static final int CONNECT_PORT = 8083;
@@ -52,6 +53,11 @@ public record Deployment(Plan.Compose compose, String url, List<String> consumer
 
     public Deployment(Plan.Compose compose, String url, List<String> consumers, String stub, String toxiproxy) {
         this(compose, url, consumers, stub, toxiproxy, List.of(), consumers.isEmpty() ? null : consumers.getFirst());
+    }
+
+    public Deployment(Plan.Compose compose, String url, List<String> consumers, String stub, String toxiproxy, List<Service> services,
+                      String faultTarget) {
+        this(compose, url, consumers, stub, toxiproxy, services, faultTarget, null);
     }
 
     public static Deployment jar(String url) {
@@ -112,6 +118,7 @@ public record Deployment(Plan.Compose compose, String url, List<String> consumer
         String stub = null;
         String toxiproxy = null;
         String connect = null;
+        String connectService = null;
         for (var e : services.properties()) {
             String name = e.getKey();
             JsonNode s = e.getValue();
@@ -134,6 +141,7 @@ public record Deployment(Plan.Compose compose, String url, List<String> consumer
                 // Kafka Connect carries the app's events to Kafka (an outbox through Debezium): part of the journey
                 helpers.add(name);
                 connect = published(s, CONNECT_PORT).map(Deployment::local).orElse(null);
+                connectService = name;
             }
         }
         if (appServices.isEmpty()) throw new IllegalStateException(file + " has no service built from " + appDir + ", or running its image");
@@ -161,7 +169,7 @@ public record Deployment(Plan.Compose compose, String url, List<String> consumer
         var recreated = new ArrayList<>(helpers);
         appServices.forEach(a -> recreated.add(a.name()));
         return new Deployment(new Plan.Compose(file, profile, recreated, consumers.size(), override, connect, flush.isEmpty() ? null : List.copyOf(flush)),
-            url, List.copyOf(consumers), stub, toxiproxy, List.copyOf(appServices), consumers.isEmpty() ? null : consumers.getFirst());
+            url, List.copyOf(consumers), stub, toxiproxy, List.copyOf(appServices), consumers.isEmpty() ? null : consumers.getFirst(), connectService);
     }
 
     /**
@@ -180,7 +188,7 @@ public record Deployment(Plan.Compose compose, String url, List<String> consumer
             .map(Service::name).orElse(null);
         var c = new Plan.Compose(compose.file(), compose.profile(), compose.services(), listening.size(), compose.override(), compose.connect(),
             compose.flush());
-        return new Deployment(c, api, listening, stub, toxiproxy, services, target);
+        return new Deployment(c, api, listening, stub, toxiproxy, services, target, connectService);
     }
 
     /** Where a module's HTTP API answers: a service of it that publishes its port, one that consumes no Kafka messages first. */

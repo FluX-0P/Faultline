@@ -2,6 +2,7 @@ package dev.faultline.cli.scan;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 
@@ -47,5 +48,22 @@ class ListenerShapesTest {
         String prompt = ScanCommand.prompt(app, RiskPattern.byId("P3").orElseThrow(), p3, null);
 
         assertThat(prompt).contains("public record NotificationEvent(String eventId, String userId)");
+    }
+
+    @Test
+    void aListenerOnATopicNoCodeSendsToIsP9OnlyWhenTheAppRunsKafkaConnect(@TempDir Path dir) throws Exception {
+        Path repo = TestRepos.ecommerce(dir);
+        assertThat(Detectors.of(App.read(repo)).p9()).isEmpty();
+
+        Files.writeString(repo.resolve("docker-compose.yml"), """
+            services:
+              connect:
+                image: quay.io/debezium/connect:2.7.3.Final
+            """);
+
+        assertThat(found(Detectors.of(App.read(repo)).p9())).containsExactlyInAnyOrder(
+            "NotificationHandler#handleBatch: a batch Kafka listener (the container commits the whole batch once it returns) on ecommerce-notifications-topic, "
+                + "which no code of the app sends to: Kafka Connect fills it, and delivers at least once",
+            "AuditListener#onAudit: a Kafka listener on ecommerce-audit-topic, which no code of the app sends to: Kafka Connect fills it, and delivers at least once");
     }
 }
