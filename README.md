@@ -72,13 +72,16 @@ LLM answers are cached in `.faultline/cache/`, so running a step again on an unc
 ./faultline doctor ../microservice-kafka --compose ../microservice-kafka/docker/docker-compose.yml
 ```
 
-`doctor` is the first command on a new repo. It says whether Faultline can test it, and why not: Spring Boot on Java 17 or newer, `@KafkaListener` consumers (not Spring Cloud Stream or RabbitMQ), a Postgres database (not H2, MySQL or MongoDB), a Compose service that builds the app, and a complete checkout (on Windows, a clone silently leaves out paths that are too long: clone with `git -c core.longpaths=true`). Exit code 1 means out of scope.
+`doctor` is the first command on a new repo. It says whether Faultline can test it, and why not: Spring Boot on Java 17 or newer, `@KafkaListener` consumers (not Spring Cloud Stream or RabbitMQ), a Postgres database (not H2, MySQL or MongoDB), a Compose service that builds the app, and a complete checkout (on Windows, a clone silently leaves out paths that are too long: clone with `git -c core.longpaths=true`, and run `git config core.longpaths true` in it so later git commands see them too). Exit code 1 means out of scope.
+
+A stack split over several Compose files takes them all, comma-separated or with `--compose` again, read in that order as `docker compose -f a -f b` reads them. Services that run images a build script makes (`image: order-service:local`) count as the app once `builds:` in the hints names the Dockerfile that makes each: Faultline's override builds it there.
 
 Then it boots the stack once and writes `.faultline/<repo>/environment.json`, which `understand`, `scan` and `plan` read:
 
 - **the app's services**: those that build a Spring Boot module of the repo (the Dockerfile's folder, or the build context), each judged by its configuration as it runs: the module's files, the profiles `SPRING_PROFILES_ACTIVE` switches on, and its Compose environment (`SPRING_DATASOURCE_URL` sets `spring.datasource.url`). Values Compose fills in from your shell or `.env` are not written down.
 - **how Faultline reaches Kafka and each database from this machine**: a port the Compose file publishes, else Faultline's own override (`.faultline/<repo>/compose.faultline.yml`) publishes the database on 127.0.0.1 and gives Kafka a listener for this machine (apache/kafka, confluentinc/cp-kafka, bitnami/kafka and wurstmeister/kafka). The app's files stay as they are.
 - **the live schema** of every database, as the app made it (migrations, Liquibase or Hibernate's `ddl-auto`), with the rows each table started with and the first keys of those that have some (so requests refer to rows that exist), and the topics and consumer groups.
+- **what else the app needs running**: besides its Kafka and databases, any service its settings name by host and port, such as a schema registry or a load balancer in front of another of its services, though no `depends_on` says so.
 
 Before booting it checks every port the stack publishes, and names the container that holds a taken one instead of moving it elsewhere; it also stops when a Dockerfile copies a jar that is not built yet, with the build command. Then it removes the stack again (`--keep` leaves it up). Exit code 2 means it could not run.
 
@@ -100,6 +103,14 @@ A repo that holds several Spring Boot apps (each a folder with a build file and 
 - **HTML forms**: a handler that binds a form (`post(Order order)`, no `@RequestBody`) gets `content_type: application/x-www-form-urlencoded`. The body template stays JSON and goes out as form fields: `{"address": {"street": "x"}, "lines": [{"count": 1}]}` is `address.street=x&lines[0].count=1`. A field a `Formatter` reads (a customer by its ID) is one text value.
 - **What else the journey goes through**: a Kafka Connect service (Debezium carrying an outbox to Kafka) is recreated with the app, and a run waits until each connector runs. A Redis the app's services point at is emptied at every reset, since it holds state a run leaves behind, such as answers by idempotency key.
 
+## Request and message formats
+
+- **Controllers generated from an OpenAPI spec**: an operation of a spec in the repo that no annotation in the code maps is still an endpoint. Its handler is the method of the operation's name (as openapi-generator names it: `cartUserIdItemsPost` for `POST /cart/{userId}/items` without an operationId) in a class that implements the generated interface, else `openapi:<operationId>`. Its body and its JSON answer come from the spec. A Feign client's mappings are calls the app makes, not ways into it.
+- **IDs in the path**: write `/cart/{userId}/checkout` as it is, and Faultline fills each `{name}` from the body's field of that name, also for an endpoint that takes no body. `${seq:4}` and `${seed:12}` pad with zeros, for an ID of a fixed form the test data has too: `00000000-0000-0000-${seq:4}-${seed:12}` is a UUID Postgres prints back the same (a run's seed has up to 6 digits). A seed file may use `${seed}` and `${seed:N}` as well: Faultline fills in the run's seed before loading it, so its test data matches the IDs the requests use.
+- **Listener shapes**: a batch listener (`List<ConsumerRecord<String, OrderEvent>>`), a class-level `@KafkaListener` with `@KafkaHandler` methods, a message inside a `ConsumerRecord` or a `Message`, with or without `@Payload`. The scan follows a listener's work through the methods of its own class it calls (a batch listener's method for one record), and shows the reviewer the message type. A listener whose `@SendTo` publishes what it returns saves, then publishes (P8): the fault crashes it the moment it returns, before Spring Kafka sends the reply.
+- **Avro, Protobuf and other binary messages**: the relay and the reader of the downstream topic move bytes and never decode them. A message that is not JSON is matched to its request by the run's IDs, found as whole strings in its bytes (Avro and Protobuf write a string as its length and its UTF-8 bytes). A corrupted message that names none of them is counted, and no-lost excuses as many missing requests.
+- **A topic the code names** (`ORDERS_TOPIC = "orders"`, no setting to move it): the relay still sits in front of the listener. The agent goes into each service that sends to the topic (`relay.senders`) and sends what it sends there to `<topic>.faultline` instead, where the relay reads it. Every send goes through `KafkaProducer.send`, so `KafkaTemplate`, `@SendTo` replies and plain producers are all moved.
+
 ## Onboard an app: faultline/hints.yaml
 
 What Faultline cannot read from the code goes in one file in the app's folder, `faultline/hints.yaml`, the only thing you add to the app. `plan` copies it into the plan:
@@ -116,9 +127,11 @@ images:                     # a helper service's image that today's Docker canno
 skip: [notification-service]   # services of the app to leave out, such as one that does not start under the repo's Compose file
 services:                   # the module a service runs, when its build does not say (its folder in the repo)
   billing: services/invoicing
+builds:                     # a service that runs a prebuilt image: the Dockerfile that makes it, built in its folder
+  order-service: order-service/Dockerfile.svc
 ```
 
-The seed runs again after every reset, so write it to allow that (`insert ... on conflict do nothing`, or `do update` to put changed rows back). In a repo of several services it runs in the database of the table it first inserts into. If the app uses Spring Security and there is no `auth`, `plan` warns that its requests may be refused.
+The seed runs again after every reset, so write it to allow that (`insert ... on conflict do nothing`, or `do update` to put changed rows back). In a repo of several services it runs in the database of the table it first inserts into or updates, and `seed: products.sql, carts.sql` names one file per database. If the app uses Spring Security and there is no `auth`, `plan` warns that its requests may be refused.
 
 ## Read the result
 
@@ -150,7 +163,7 @@ Faults come in six layers:
 - **network** (Toxiproxy, `toxiproxy:` in the plan): add `latency` to, stall (`timeout`) or `cut` the connections of a proxy, such as `worker-1-db`, `at` a time for a `duration`.
 - **service** (the stub, `stub:` in the plan): make the fake provider answer every `nth_hit`th charge with an `error`, `slow`ly, or charge it and reply too late (`late-reply`), or go through an `outage`, after which it stays down while it gets more than 50 requests a second.
 - **traffic**: `duplicate` every `nth_hit`th request, like a client that submits twice.
-- **messaging**: a chaos relay between two topics (`relay: {from, to}`) that will `duplicate`, `reorder` or `corrupt` every `nth_hit`th message. The app must publish to `from`.
+- **messaging**: a chaos relay between two topics (`relay: {from, to}`) that will `duplicate`, `reorder` or `corrupt` every `nth_hit`th message. The app must publish to `from`: a setting moves it, or `senders: [api]` puts the agent in those services to rename their sends to `to` (when the code names the topic).
 
 Besides no-lost, no-duplicates and no-unexpected, a plan can check:
 
