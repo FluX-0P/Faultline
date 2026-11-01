@@ -11,6 +11,7 @@ import dev.faultline.cli.Faultline;
 import dev.faultline.cli.Json;
 import dev.faultline.cli.Out;
 import dev.faultline.cli.Workspace;
+import dev.faultline.cli.app.Environment;
 import dev.faultline.cli.llm.Asker;
 import dev.faultline.cli.llm.Prompt;
 import dev.faultline.cli.llm.Schema;
@@ -49,7 +50,8 @@ public final class UnderstandCommand implements Callable<Integer> {
     @Override
     public Integer call() throws Exception {
         PrintWriter out = spec.commandLine().getOut();
-        App app = App.read(appDir);
+        App app = App.read(appDir, Environment.read(Workspace.forApp(appDir)).orElse(null));
+        if (app.environment() != null) Out.line(out, "doctor    judging %s as it runs, from %s", app.name(), Environment.FILE);
         for (String problem : app.code().problems()) Out.line(out, "warning   skipped %s", problem);
         List<Endpoint> endpoints = app.code().endpoints();
         Out.line(out, "read      %d Java files, %d endpoints, %d migrations, %d docs, %d build and compose files",
@@ -89,6 +91,7 @@ public final class UnderstandCommand implements Callable<Integer> {
             .section("Endpoints found in the code", endpointList)
             .code("Spring configuration (application.yml, flattened)", "properties", app.config().asText())
             .files("Database migrations", app.files().migrations(), "sql")
+            .code(Environment.SCHEMA_TITLE, "sql", app.liveSchema())
             .files("Build files", app.files().buildFiles(), "xml")
             .files("Compose files", app.files().composeFiles(), "yaml")
             .files("Docs", app.files().docs(), "markdown")

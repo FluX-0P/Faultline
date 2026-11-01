@@ -279,7 +279,7 @@ final class Attempt {
     }
 
     /** The chaos relay, before any traffic; it waits to be armed when there is a warm-up first. */
-    private void startRelay() {
+    private void startRelay() throws Exception {
         if (plan.relay() == null) return;
         relay = new ChaosRelay(plan.kafka().bootstrap(), plan.relay(), plan.fault(), plan.correlateBy().requestField(), dir, line -> Out.line(out, "%s", line));
         relay.armed(plan.traffic().warmupCount() == 0);

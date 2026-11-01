@@ -26,6 +26,16 @@ class DeploymentTest {
     }
 
     @Test
+    void doctorsOverrideIsReadAfterTheAppsComposeFile() throws Exception {
+        var d = Deployment.parse(TestDeployments.config(), "deploy/docker-compose.yml", ".faultline/demo-app/compose.faultline.yml", "demo",
+            TestDeployments.DEMO_APP, 8080);
+
+        assertThat(d.compose().files()).containsExactly("deploy/docker-compose.yml", ".faultline/demo-app/compose.faultline.yml");
+        assertThat(TestDeployments.demo().compose().files()).containsExactly("deploy/docker-compose.yml");
+        assertThat(TestDeployments.demo().compose().override()).isNull();
+    }
+
+    @Test
     void theStubCountsOnlyWhenTheAppIsPointedAtIt() throws Exception {
         String config = TestDeployments.config().replace("http://provider:9090", "http://elsewhere:9090");
 

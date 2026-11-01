@@ -29,16 +29,25 @@ public record Deployment(Plan.Compose compose, String url, List<String> consumer
         return new Deployment(null, url, List.of(), null, null);
     }
 
-    /** Resolves the Compose file with the docker CLI, so anchors, merges and profiles come out as Compose sees them. */
-    public static Deployment compose(String file, String profile, Path appDir, int serverPort) throws Exception {
+    /**
+     * Resolves the Compose file with the docker CLI, so anchors, merges and profiles come out as Compose sees them.
+     *
+     * @param override Faultline's override from faultline doctor, read after the file, or null
+     */
+    public static Deployment compose(String file, String override, String profile, Path appDir, int serverPort) throws Exception {
         var args = new ArrayList<>(List.of("compose", "-f", file));
+        if (override != null) args.addAll(List.of("-f", override));
         if (profile != null) args.addAll(List.of("--profile", profile));
         args.addAll(List.of("config", "--format", "json"));
-        return parse(DockerStack.docker(args), file, profile, appDir, serverPort);
+        return parse(DockerStack.docker(args), file, override, profile, appDir, serverPort);
+    }
+
+    static Deployment parse(String config, String file, String profile, Path appDir, int serverPort) {
+        return parse(config, file, null, profile, appDir, serverPort);
     }
 
     /** @param config the output of {@code docker compose config --format json} */
-    static Deployment parse(String config, String file, String profile, Path appDir, int serverPort) {
+    static Deployment parse(String config, String file, String override, String profile, Path appDir, int serverPort) {
         JsonNode services = Json.MAPPER.readTree(config).path("services");
         Path app = appDir.toAbsolutePath().normalize();
         var images = new ArrayList<String>();
@@ -86,7 +95,7 @@ public record Deployment(Plan.Compose compose, String url, List<String> consumer
         }
         var recreated = new ArrayList<>(helpers);
         recreated.addAll(appServices);
-        return new Deployment(new Plan.Compose(file, profile, recreated, consumers.size()), url, List.copyOf(consumers), stub, toxiproxy);
+        return new Deployment(new Plan.Compose(file, profile, recreated, consumers.size(), override), url, List.copyOf(consumers), stub, toxiproxy);
     }
 
     /** The service a code fault goes on: the first consumer, or none when the app is one process. */

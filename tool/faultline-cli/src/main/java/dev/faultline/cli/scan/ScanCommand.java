@@ -17,6 +17,7 @@ import dev.faultline.cli.Faultline;
 import dev.faultline.cli.Json;
 import dev.faultline.cli.Out;
 import dev.faultline.cli.Workspace;
+import dev.faultline.cli.app.Environment;
 import dev.faultline.cli.llm.Asker;
 import dev.faultline.cli.llm.Prompt;
 import dev.faultline.cli.llm.Schema;
@@ -79,7 +80,7 @@ public final class ScanCommand implements Callable<Integer> {
         Path dir = Workspace.forApp(appDir);
         Path mapFile = dir.resolve(Workspace.APP_MAP);
         String appMap = Files.isRegularFile(mapFile) ? Files.readString(mapFile) : null;
-        App app = App.read(appDir).withSettings(settings);
+        App app = App.read(appDir, Environment.read(dir).orElse(null)).withSettings(settings);
 
         Risks result = scan(app, settings, patterns, appMap, () -> Asker.fromSettings(message -> Out.line(out, "          %s", message)), out);
 
@@ -192,6 +193,7 @@ public final class ScanCommand implements Callable<Integer> {
             .code("Outline of the whole app", "text", code.outline())
             .code("Spring configuration (flattened)", "properties", app.config().asText())
             .files("Database schema (migrations)", app.files().migrations(), "sql")
+            .code(Environment.SCHEMA_TITLE, "sql", app.liveSchema())
             .code("App map (from faultline understand)", "json", appMap)
             .toString();
     }

@@ -34,6 +34,7 @@ import dev.faultline.cli.Json;
 import dev.faultline.cli.Out;
 import dev.faultline.cli.Workspace;
 import dev.faultline.cli.app.Deployment;
+import dev.faultline.cli.app.Environment;
 import dev.faultline.cli.llm.Asker;
 import dev.faultline.cli.llm.Prompt;
 import dev.faultline.cli.llm.Schema;
@@ -169,7 +170,7 @@ public final class PlanCommand implements Callable<Integer> {
         }
         // the plan runs the app with the settings the scan judged it with
         var settings = risks.settings() == null ? Map.<String, String>of() : risks.settings();
-        App app = App.read(appDir).withSettings(settings);
+        App app = App.read(appDir, Environment.read(dir).orElse(null)).withSettings(settings);
         Deployment deployment = deployment(app);
 
         Risk risk;
@@ -209,7 +210,11 @@ public final class PlanCommand implements Callable<Integer> {
             if (profile != null) throw new IllegalArgumentException("--profile needs --compose");
             return Deployment.jar("http://localhost:" + port);
         }
-        return Deployment.compose(compose, profile, appDir, port);
+        // doctor's override reaches Kafka and the databases from this machine, for the Compose file it booted
+        String override = app.runtime().map(Environment::compose)
+            .filter(c -> Path.of(c.file()).toAbsolutePath().normalize().equals(Path.of(compose).toAbsolutePath().normalize()))
+            .map(Environment.Compose::override).orElse(null);
+        return Deployment.compose(compose, override, profile, appDir, port);
     }
 
     /**
@@ -478,14 +483,16 @@ public final class PlanCommand implements Callable<Integer> {
     }
 
     /**
-     * The tables of the migrations with their columns, and the fake provider's ledger when the deployment has it. Columns
-     * come from create table and alter table ... add column; a table whose columns cannot be read has an empty set.
+     * The tables with their columns: as the running app made them when doctor has read them, else from the migrations'
+     * create table and alter table ... add column (a table whose columns cannot be read has an empty set). The fake
+     * provider's ledger is added when the deployment has it.
      */
     static Map<String, Set<String>> schema(App app, Deployment deployment) {
         var schema = new TreeMap<String, Set<String>>();
         var sql = new ArrayList<String>();
-        app.files().migrations().forEach(f -> sql.add(f.text()));
-        if (deployment.stub() != null) sql.add(STUB_LEDGER);
+        if (app.environment() != null) schema.putAll(app.environment().schemaOf(App.ROOT_MODULE));
+        else app.files().migrations().forEach(f -> sql.add(f.text()));
+        if (deployment.stub() != null && !schema.containsKey("stub.charges")) sql.add(STUB_LEDGER);
         for (String text : sql) {
             CREATE_TABLE.matcher(text).results().forEach(m -> schema.putIfAbsent(m.group(1).toLowerCase(Locale.ROOT), new TreeSet<>()));
             for (var m : CREATE_BODY.matcher(text).results().toList()) {
@@ -519,8 +526,12 @@ public final class PlanCommand implements Callable<Integer> {
         return items;
     }
 
-    /** Tables the migrations insert rows into, such as accounts the app needs from the start. */
+    /**
+     * Tables the app needs rows in from the start, such as accounts: those that had rows once the running app had started,
+     * when doctor has read them, else those the migrations insert into.
+     */
     static Set<String> seededTables(App app) {
+        if (app.environment() != null) return app.environment().seededTablesOf(App.ROOT_MODULE);
         var tables = new TreeSet<String>();
         for (var f : app.files().migrations()) INSERT.matcher(f.text()).results().forEach(m -> tables.add(m.group(1).toLowerCase(Locale.ROOT)));
         return tables;
@@ -630,7 +641,8 @@ public final class PlanCommand implements Callable<Integer> {
             .code("Their handlers and request types", "java", handlerTypes.values().stream().map(app.code()::source).collect(Collectors.joining("\n\n")))
             .code("The listener " + aim.listener().handler() + ", the classes its work goes through, and the risky code", "java",
                 journeyTypes.values().stream().map(app.code()::source).collect(Collectors.joining("\n\n")))
-            .files("Database migrations", app.files().migrations(), "sql");
+            .files("Database migrations", app.files().migrations(), "sql")
+            .code(Environment.SCHEMA_TITLE, "sql", app.liveSchema());
         if (facts.seedFile() != null) {
             prompt.code("Test data Faultline loads after every reset (" + facts.seedFile() + ")", "sql", Files.readString(Path.of(facts.seedFile()), StandardCharsets.UTF_8));
         }
@@ -658,10 +670,15 @@ public final class PlanCommand implements Callable<Integer> {
             .orElseThrow(() -> new IllegalStateException("cannot tell the consumer group of " + aim.listener().handler()));
         String dbUrl = config.get("spring.datasource.url")
             .orElseThrow(() -> new IllegalStateException("the app's configuration has no spring.datasource.url"));
+        String bootstrap = config.get("spring.kafka.bootstrap-servers").orElse("localhost:9092");
+        // the app's services use in-network addresses; doctor knows where the same database and broker are from here
+        if (app.environment() != null) {
+            dbUrl = app.environment().hostJdbcUrl(dbUrl, App.ROOT_MODULE);
+            bootstrap = app.environment().hostBootstrap(bootstrap);
+        }
         return new Facts(deployment, deployment.compose() == null ? jar(app) : null, dbUrl,
             config.get("spring.datasource.username").orElse(""), config.get("spring.datasource.password").orElse(""),
-            config.get("spring.kafka.bootstrap-servers").orElse("localhost:9092"), aim.topic(), group,
-            RequestShapes.of(app), hints.auth(), hints.seedFile(app.dir()));
+            bootstrap, aim.topic(), group, RequestShapes.of(app), hints.auth(), hints.seedFile(app.dir()));
     }
 
     /** The jar in target/, or the name Maven will give it once built. */

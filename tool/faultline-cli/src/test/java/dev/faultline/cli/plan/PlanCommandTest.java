@@ -9,6 +9,7 @@ import java.util.Set;
 import java.util.TreeSet;
 
 import dev.faultline.cli.app.Deployment;
+import dev.faultline.cli.app.Environment;
 import dev.faultline.cli.app.TestDeployments;
 import dev.faultline.cli.scan.Risks.Risk;
 import dev.faultline.cli.source.App;
@@ -119,6 +120,35 @@ class PlanCommandTest {
         assertThat(plan.database().reset()).last().isEqualTo("TRUNCATE stub.charges");
         assertThat(plan.target().compose()).isEqualTo(deployment.compose());
         assertThat(plan.target().jar()).isNull();
+    }
+
+    @Test
+    void withDoctorsEnvironmentThePlanJudgesTheAppAsItRunsAndReachesItFromHere(@TempDir Path dir) throws Exception {
+        var environment = new Environment("payments", new Environment.Compose("compose.yml", null, "payments", null),
+            List.of(new Environment.Service("worker", "", Map.of("SPRING_DATASOURCE_URL", "jdbc:postgresql://pg:5432/pay",
+                "SPRING_KAFKA_BOOTSTRAP_SERVERS", "kafka:9092"), List.of(), true)),
+            new Environment.Kafka("kafka", List.of("kafka:9092"), "localhost:39092", "a listener Faultline's override adds"),
+            List.of(new Environment.Database("pg", "pg:5432", "pay", "localhost:15432", "pay", "secret", List.of("worker"), List.of(
+                new Environment.Table("payments", List.of(new Environment.Column("payment_id", "text"), new Environment.Column("amount", "bigint")), 0),
+                new Environment.Table("accounts", List.of(new Environment.Column("account_id", "text")), 5)))),
+            List.of(), List.of(), "2026-11-01T00:00:00Z");
+        var app = App.read(TestApps.payments(dir), environment);
+        var aim = PlanCommand.aim(app, MAP, RISK, JAR);
+        var facts = PlanCommand.facts(app, JAR, aim);
+
+        assertThat(app.config().get("spring.datasource.url")).contains("jdbc:postgresql://pg:5432/pay");
+        assertThat(facts.dbUrl()).isEqualTo("jdbc:postgresql://localhost:15432/pay");
+        assertThat(facts.bootstrap()).isEqualTo("localhost:39092");
+        // the live tables, even though the migrations create only payments
+        assertThat(PlanCommand.schema(app, JAR)).containsOnlyKeys("payments", "accounts");
+        assertThat(PlanCommand.seededTables(app)).containsExactly("accounts");
+        assertThat(PlanCommand.prompt(app, MAP, aim, JAR, facts)).contains(Environment.SCHEMA_TITLE)
+            .contains("table payments (payment_id text, amount bigint) -- 0 rows after the app started");
+
+        // without one, the prompt is what it was, so earlier answers stay cached
+        var files = App.read(dir);
+        var filesAim = PlanCommand.aim(files, MAP, RISK, JAR);
+        assertThat(PlanCommand.prompt(files, MAP, filesAim, JAR, PlanCommand.facts(files, JAR, filesAim))).doesNotContain(Environment.SCHEMA_TITLE);
     }
 
     private static PlanDraft draft(String journey, String path, List<String> reset, List<PlanDraft.Rule> rules) {
