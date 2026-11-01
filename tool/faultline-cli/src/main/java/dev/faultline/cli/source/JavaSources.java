@@ -37,6 +37,7 @@ import com.github.javaparser.ast.expr.NormalAnnotationExpr;
 import com.github.javaparser.ast.expr.SingleMemberAnnotationExpr;
 import com.github.javaparser.ast.expr.StringLiteralExpr;
 import com.github.javaparser.ast.expr.TextBlockLiteralExpr;
+import com.github.javaparser.ast.type.Type;
 import com.github.javaparser.printer.DefaultPrettyPrinter;
 import com.github.javaparser.printer.configuration.DefaultConfigurationOption;
 import com.github.javaparser.printer.configuration.DefaultPrinterConfiguration;
@@ -71,6 +72,8 @@ public final class JavaSources {
     /** Each module's configuration and name, by its path. */
     private final Map<String, SpringConfig> configs;
     private final Map<String, String> names;
+    /** The repo's OpenAPI specs: endpoints whose controllers are generated at build time are only there. */
+    private final List<RepoFiles.TextFile> specs;
     /** Simple names of types that more than one module declares: their methods' handlers carry the module. */
     private final Set<String> clashing;
     private final Map<CompilationUnit, Unit> unitOf = new IdentityHashMap<>();
@@ -78,11 +81,13 @@ public final class JavaSources {
         .removeOption(new DefaultConfigurationOption(ConfigOption.PRINT_COMMENTS))
         .removeOption(new DefaultConfigurationOption(ConfigOption.PRINT_JAVADOC)));
 
-    private JavaSources(List<Unit> units, List<String> problems, Map<String, SpringConfig> configs, Map<String, String> names) {
+    private JavaSources(List<Unit> units, List<String> problems, Map<String, SpringConfig> configs, Map<String, String> names,
+                        List<RepoFiles.TextFile> specs) {
         this.units = units;
         this.problems = problems;
         this.configs = configs;
         this.names = names;
+        this.specs = specs;
         units.forEach(u -> unitOf.put(u.cu(), u));
         var declaredIn = new HashMap<String, Set<String>>();
         for (var u : units) {
@@ -114,12 +119,12 @@ public final class JavaSources {
                 problems.add(path + ": " + result.getProblems().stream().findFirst().map(p -> p.getVerboseMessage()).orElse("cannot parse"));
             }
         }
-        return new JavaSources(units, problems, configs(modules), names(modules));
+        return new JavaSources(units, problems, configs(modules), names(modules), repo.openApiSpecs());
     }
 
     /** The same code, with annotation placeholders resolved against the modules' changed configurations. */
     JavaSources withModules(List<App.Module> modules) {
-        return new JavaSources(units, problems, configs(modules), names(modules));
+        return new JavaSources(units, problems, configs(modules), names(modules), specs);
     }
 
     private static Map<String, SpringConfig> configs(List<App.Module> modules) {
@@ -210,7 +215,8 @@ public final class JavaSources {
             String prefix = m.owner().getAnnotationByName("RequestMapping").map(a -> first(values(a, module, "value", "path"))).orElse("");
             for (AnnotationExpr a : m.declaration().getAnnotations()) {
                 String name = a.getName().getIdentifier();
-                if (HTTP_MAPPINGS.containsKey(name)) {
+                // a Feign client's mappings are the calls the app makes to another service, not ways into it
+                if (HTTP_MAPPINGS.containsKey(name) && m.owner().getAnnotationByName("FeignClient").isEmpty()) {
                     String httpMethod = name.equals("RequestMapping") ? requestMethod(a) : HTTP_MAPPINGS.get(name);
                     var paths = values(a, module, "value", "path");
                     for (String path : paths.isEmpty() ? List.of("") : paths) {
@@ -219,15 +225,128 @@ public final class JavaSources {
                 } else if (name.equals("KafkaListener")) {
                     var group = values(a, module, "groupId");
                     endpoints.add(Endpoint.kafka(values(a, module, "topics"), group.isEmpty() ? null : group.getFirst(), m.handler(), m.file(), m.line()));
+                } else if (name.equals("KafkaHandler")) {
+                    // a class-level @KafkaListener: its topics and group, with each @KafkaHandler taking one kind of message
+                    m.owner().getAnnotationByName("KafkaListener").ifPresent(l -> {
+                        var group = values(l, module, "groupId");
+                        endpoints.add(Endpoint.kafka(values(l, module, "topics"), group.isEmpty() ? null : group.getFirst(), m.handler(), m.file(), m.line()));
+                    });
                 }
             }
         }
+        endpoints.addAll(specEndpoints(endpoints));
         return endpoints;
     }
 
-    /** Methods with @KafkaListener. */
+    /**
+     * The operations of the repo's OpenAPI specs that no annotation in the code maps: controllers that openapi-generator
+     * makes at build time, which the app's classes implement. Each goes to the method of the operation's name in a class
+     * that implements an interface the code does not declare (the generated one), under that class's @RequestMapping,
+     * else the module's openapi.*.base-path (the generated interface's, when it has one); with no such class, its
+     * handler is openapi:operationId.
+     */
+    private List<Endpoint> specEndpoints(List<Endpoint> annotated) {
+        var mapped = new HashSet<String>();
+        annotated.stream().filter(e -> e.kind() == Endpoint.Kind.HTTP).forEach(e -> mapped.add(e.method() + " " + bareParameters(e.path())));
+        var found = new ArrayList<Endpoint>();
+        for (var spec : specs) {
+            for (var op : OpenApi.operations(spec)) {
+                var impl = implementationOf(op.javaName());
+                // Spring takes the class's own @RequestMapping over the interface's
+                String prefix = impl.map(m -> m.owner().getAnnotationByName("RequestMapping").map(a -> first(values(a, m.module(), "value", "path")))
+                    .orElseGet(() -> configs.getOrDefault(m.module(), SpringConfig.EMPTY).find(BASE_PATH).orElse(""))).orElse("");
+                String path = joinPaths(prefix, op.path());
+                String key = bareParameters(path);
+                if (mapped.contains(op.method() + " " + key) || mapped.contains("ANY " + key) || !mapped.add(op.method() + " " + key)) continue;
+                found.add(impl.map(m -> Endpoint.fromSpec(op.method(), path, m.handler(), m.file(), m.line(), spec.path()))
+                    .orElse(Endpoint.fromSpec(op.method(), path, Endpoint.UNIMPLEMENTED + op.javaName(), spec.path(), op.line(), spec.path())));
+            }
+        }
+        return found;
+    }
+
+    private static final Pattern BASE_PATH = Pattern.compile("openapi\\.[\\w-]+\\.base-path");
+
+    /** /orders/{orderId} and /orders/{id} are the same path. */
+    private static String bareParameters(String path) {
+        return path.replaceAll("\\{[^}]*}", "{}");
+    }
+
+    /**
+     * The method that implements a generated operation: one of that name, with a body, in a class that implements an
+     * interface the code does not declare; one marked @Override first.
+     */
+    private Optional<Method> implementationOf(String javaName) {
+        return methods().stream()
+            .filter(m -> m.declaration().getNameAsString().equals(javaName) && m.declaration().getBody().isPresent())
+            .filter(m -> m.owner().isClassOrInterfaceDeclaration() && !m.owner().asClassOrInterfaceDeclaration().isInterface()
+                && m.owner().asClassOrInterfaceDeclaration().getImplementedTypes().stream().anyMatch(t -> type(m.module(), t.getNameAsString()).isEmpty()))
+            .min(Comparator.comparing(m -> m.declaration().getAnnotationByName("Override").isEmpty()));
+    }
+
+    /** Methods with @KafkaListener, and the @KafkaHandler methods of a class with @KafkaListener. */
     public List<Method> kafkaListeners() {
-        return methods().stream().filter(m -> m.declaration().getAnnotationByName("KafkaListener").isPresent()).toList();
+        return methods().stream().filter(m -> m.declaration().getAnnotationByName("KafkaListener").isPresent()
+            || m.declaration().getAnnotationByName("KafkaHandler").isPresent() && m.owner().getAnnotationByName("KafkaListener").isPresent()).toList();
+    }
+
+    /** What the container passes a listener besides its message. */
+    private static final Set<String> NOT_THE_MESSAGE = Set.of("Acknowledgment", "Consumer", "ConsumerRecordMetadata", "MessageHeaders", "Headers");
+    /** What a listener's message comes in: the message is the last type argument (ConsumerRecord<String, OrderEvent>). */
+    private static final Set<String> MESSAGE_WRAPPERS = Set.of("ConsumerRecord", "ConsumerRecords", "Message", "List", "Collection", "Iterable", "Optional");
+    private static final Set<String> BATCHES = Set.of("List", "Collection", "Iterable", "ConsumerRecords");
+
+    /** The listener's parameters that carry its message: neither the container's extras nor a @Header. */
+    private static List<Parameter> messageParameters(Method listener) {
+        return listener.declaration().getParameters().stream()
+            .filter(p -> !NOT_THE_MESSAGE.contains(typeName(p)))
+            .filter(p -> p.getAnnotationByName("Header").isEmpty() && p.getAnnotationByName("Headers").isEmpty())
+            .toList();
+    }
+
+    /** Whether a Kafka listener takes a whole poll at once: a List of messages or records, ConsumerRecords, or batch = "true". */
+    public boolean isBatchListener(Method listener) {
+        return messageParameters(listener).stream().anyMatch(p -> BATCHES.contains(typeName(p)))
+            || listener.declaration().getAnnotationByName("KafkaListener").map(a -> rawValues(a, listener.module(), "batch").contains("true")).orElse(false);
+    }
+
+    /**
+     * The app's own types of the message a Kafka listener takes, however the container hands it over: as the payload
+     * (with or without @Payload), in a ConsumerRecord or a Message, or a batch of them, such as
+     * {@code List<ConsumerRecord<String, OrderEvent>>} -> OrderEvent.
+     */
+    public List<TypeDeclaration<?>> messageTypes(Method listener) {
+        var types = new LinkedHashMap<String, TypeDeclaration<?>>();
+        for (var p : messageParameters(listener)) {
+            Type t = p.getType();
+            for (int depth = 0; depth < 4 && t.isClassOrInterfaceType() && MESSAGE_WRAPPERS.contains(t.asClassOrInterfaceType().getNameAsString()); depth++) {
+                var args = t.asClassOrInterfaceType().getTypeArguments().orElse(null);
+                if (args == null || args.isEmpty()) break;
+                t = args.get(args.size() - 1);
+            }
+            if (t.isClassOrInterfaceType()) type(listener.module(), t.asClassOrInterfaceType().getNameAsString()).ifPresent(x -> types.putIfAbsent(x.getNameAsString(), x));
+        }
+        return List.copyOf(types.values());
+    }
+
+    /** Whether a listener replies with what it returns: @SendTo, which Spring Kafka sends once the method has returned. */
+    public boolean replies(Method m) {
+        return m.declaration().getAnnotationByName("SendTo").isPresent();
+    }
+
+    /** The topics a listener's @SendTo names; empty when it names none, so each message's reply-topic header decides. */
+    public List<String> replyTopics(Method m) {
+        return m.declaration().getAnnotationByName("SendTo").map(a -> values(a, m.module(), "value")).orElse(List.of());
+    }
+
+    /**
+     * The app's methods a method's work goes to: those it calls through a field, from its own body (lambdas included)
+     * and from the methods of its own class it calls, such as a batch listener's method for one record.
+     */
+    public List<Method> workOf(Method m) {
+        var work = new LinkedHashMap<String, Method>();
+        for (var x : withOwnCallees(m)) calledMethods(x).forEach(c -> work.putIfAbsent(c.handler(), c));
+        return List.copyOf(work.values());
     }
 
     /** @KafkaListener methods that take an Acknowledgment and call acknowledge(): pattern P1's candidates. */
@@ -299,9 +418,12 @@ public final class JavaSources {
             && receiverType(m, c).filter(PRODUCERS::contains).isPresent());
     }
 
-    /** The topics the method's sends name: string constants, or a field set from a ${property} setting. */
+    /**
+     * The topics the method's sends name: string constants, or a field set from a ${property} setting; and the topics
+     * its @SendTo replies go to.
+     */
     public List<String> sentTopics(Method m) {
-        var topics = new ArrayList<String>();
+        var topics = new ArrayList<String>(replyTopics(m));
         for (var call : sends(m)) {
             if (call.getArguments().isEmpty()) continue;
             var topic = strings(call.getArgument(0), m.module(), 0);

@@ -69,7 +69,21 @@ public final class RequestShapes {
                 shapes.put(shapes.containsKey(any) ? any : endpoint, shape);
             });
         }
+        underPrefixes(code, shapes);
         return shapes;
+    }
+
+    /**
+     * A spec's entries also under the path its endpoint really has, when the class that implements the generated
+     * interface maps it under a prefix of its own: /api + /orders.
+     */
+    private static <T> void underPrefixes(JavaSources code, Map<String, T> bySpecPath) {
+        for (var e : code.endpoints()) {
+            if (e.spec() == null || bySpecPath.containsKey(e.name())) continue;
+            bySpecPath.entrySet().stream()
+                .filter(s -> s.getKey().startsWith(e.method() + " /") && e.path().endsWith(s.getKey().substring(s.getKey().indexOf(' ') + 1)))
+                .findFirst().ifPresent(s -> bySpecPath.put(e.name(), s.getValue()));
+        }
     }
 
     /**
@@ -156,13 +170,18 @@ public final class RequestShapes {
 
     /**
      * The fields of each endpoint's JSON answer, by "METHOD /path", when its handler returns one of the app's own types
-     * (in a ResponseEntity, Optional ...): a nested object's as a.b. An endpoint that answers with anything else is left out.
+     * (in a ResponseEntity, Optional ...): a nested object's as a.b. An endpoint that answers with anything else is left
+     * out, unless an OpenAPI spec describes its answer, such as a generated model the code never declares.
      */
     public static Map<String, List<String>> answers(App app) {
         var answers = new LinkedHashMap<String, List<String>>();
         var code = app.code();
+        var specs = new LinkedHashMap<String, List<String>>();
+        for (var spec : app.files().openApiSpecs()) OpenApi.answers(spec).forEach(specs::putIfAbsent);
+        underPrefixes(code, specs);
         for (var e : code.endpoints()) {
             if (e.kind() != Endpoint.Kind.HTTP) continue;
+            if (specs.containsKey(e.name())) answers.put(e.name(), specs.get(e.name()));
             code.method(e.handler()).ifPresent(m -> {
                 Type type = m.declaration().getType();
                 while (type.isClassOrInterfaceType() && WRAPPERS.contains(type.asClassOrInterfaceType().getNameAsString())) {

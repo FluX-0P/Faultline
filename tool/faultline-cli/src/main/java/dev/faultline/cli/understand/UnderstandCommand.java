@@ -4,6 +4,7 @@ import java.io.PrintWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.TreeSet;
 import java.util.concurrent.Callable;
 import java.util.stream.Collectors;
 
@@ -60,8 +61,11 @@ public final class UnderstandCommand implements Callable<Integer> {
 
         var asker = Asker.fromSettings(message -> Out.line(out, "          %s", message));
         Out.line(out, "llm       asking %s to map the app ...", asker.model());
+        // an operation of a spec that no class implements is still a step a journey can name
+        var handlers = new TreeSet<>(app.code().handlers());
+        endpoints.forEach(e -> handlers.add(e.handler()));
         var answer = asker.ask(SYSTEM, prompt(app, endpoints), Schema.load("app-map"), AppMap.class,
-            map -> map.problems(endpoints, app.code().handlers()));
+            map -> map.problems(endpoints, handlers));
         Out.line(out, answer.cached() ? "          cached answer, no call made" : "          answered in %.1fs".formatted(answer.took().toMillis() / 1000.0));
 
         AppMap map = answer.value().withSource(app.name(), answer.model());
@@ -83,7 +87,9 @@ public final class UnderstandCommand implements Callable<Integer> {
 
     static String prompt(App app, List<Endpoint> endpoints) {
         String endpointList = endpoints.stream()
-            .map(e -> "- " + e.name() + (e.groupId() != null ? " (group " + e.groupId() + ")" : "") + " -> " + e.handler())
+            .map(e -> "- " + e.name() + (e.groupId() != null ? " (group " + e.groupId() + ")" : "") + " -> " + e.handler()
+                + (e.spec() == null ? "" : " (from the OpenAPI spec " + e.spec() + ": the controller is generated at build time"
+                    + (e.handler().startsWith(Endpoint.UNIMPLEMENTED) ? ", and no class of the code implements it)" : ")")))
             .collect(Collectors.joining("\n"));
         String modules = app.describeModules();
         if (modules != null) {

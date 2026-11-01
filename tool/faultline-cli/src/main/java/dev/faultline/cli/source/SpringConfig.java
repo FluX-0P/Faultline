@@ -90,6 +90,11 @@ public final class SpringConfig {
         return value == null ? Optional.empty() : Optional.of(resolve(value, 0));
     }
 
+    /** The first setting, by key, whose key matches, such as openapi.petstore.base-path; resolved like {@link #get}. */
+    public Optional<String> find(Pattern key) {
+        return values.keySet().stream().filter(k -> key.matcher(k).matches()).findFirst().flatMap(this::get);
+    }
+
     /** The Spring profiles the environment or the base files switch on, in order. */
     public static List<String> activeProfiles(Map<String, String> base, Map<String, String> environment) {
         String active = environment.entrySet().stream().filter(e -> binds(e.getKey(), "spring.profiles.active"))
@@ -113,6 +118,11 @@ public final class SpringConfig {
             String replacement = found != null ? resolve(found, depth + 1) : match.group(2) != null ? match.group(2) : match.group();
             return Matcher.quoteReplacement(replacement);
         });
+    }
+
+    /** key=value lines, sorted, with each value's ${placeholders} resolved as {@link #get} does. */
+    public String asResolvedText() {
+        return values.keySet().stream().map(k -> k + "=" + get(k).orElse("")).collect(Collectors.joining("\n"));
     }
 
     /** key=value lines, sorted. */

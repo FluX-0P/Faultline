@@ -168,13 +168,19 @@ public final class ScanCommand implements Callable<Integer> {
         var code = app.code();
         var lines = new StringBuilder();
         var types = new LinkedHashMap<String, TypeDeclaration<?>>();
+        var listeners = code.kafkaListeners().stream().map(Method::handler).collect(Collectors.toSet());
         ids(candidates).forEach((id, c) -> {
             Method m = c.method();
             lines.append("- %s: %s (%s, line %d): %s%n".formatted(id, m.handler(), m.file(), m.line(), c.saw()));
             var near = new ArrayList<TypeDeclaration<?>>(List.of(m.owner()));
             near.addAll(code.calledTypes(m));
             code.withOwnCallees(m).forEach(x -> near.addAll(code.calledTypes(x)));
-            if (c.caller() != null) near.add(c.caller().owner());
+            // the message a listener takes, even inside a ConsumerRecord or a batch: which IDs it carries decides P3
+            if (listeners.contains(m.handler())) near.addAll(code.messageTypes(m));
+            if (c.caller() != null) {
+                near.add(c.caller().owner());
+                near.addAll(code.messageTypes(c.caller()));
+            }
             for (var caller : code.callers(m)) {
                 near.add(caller.owner());
                 code.callers(caller).forEach(cc -> near.add(cc.owner()));
