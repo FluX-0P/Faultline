@@ -33,7 +33,7 @@ Faultline talks to any OpenAI-compatible LLM API; Google Gemini is the default. 
 
 ## Point Faultline at an app
 
-Four steps, each writing a file the next one reads. Everything about an app goes in `.faultline/<app>/`, outside the app itself.
+Four steps, each writing a file the next one reads. Everything about an app goes in `.faultline/<app>/`, outside the app itself. On a repo you did not write, start with `faultline doctor` (below).
 
 ```bash
 ./faultline understand demo-app   # LLM maps the app        -> .faultline/demo-app/app-map.json
@@ -63,6 +63,22 @@ Four steps, each writing a file the next one reads. Everything about an app goes
 
   It shows the plan and asks `Approve? [y / n / edit / review]`: `edit` opens the file, `review` goes through the fault, each check and each rule, and you keep (Enter) or drop (`n`) each one. Nothing is written until you approve.
 
+## Onboard a repo you did not write: faultline doctor
+
+```bash
+./faultline doctor ../microservice-kafka --compose ../microservice-kafka/docker/docker-compose.yml
+```
+
+`doctor` is the first command on a new repo. It says whether Faultline can test it, and why not: Spring Boot on Java 17 or newer, `@KafkaListener` consumers (not Spring Cloud Stream or RabbitMQ), a Postgres database (not H2, MySQL or MongoDB), a Compose service that builds the app, and a complete checkout (on Windows, a clone silently leaves out paths that are too long: clone with `git -c core.longpaths=true`). Exit code 1 means out of scope.
+
+Then it boots the stack once and writes `.faultline/<repo>/environment.json`, which `understand`, `scan` and `plan` read:
+
+- **the app's services**: those that build a Spring Boot module of the repo (the Dockerfile's folder, or the build context), each judged by its configuration as it runs: the module's files, the profiles `SPRING_PROFILES_ACTIVE` switches on, and its Compose environment (`SPRING_DATASOURCE_URL` sets `spring.datasource.url`). Values Compose fills in from your shell or `.env` are not written down.
+- **how Faultline reaches Kafka and each database from this machine**: a port the Compose file publishes, else Faultline's own override (`.faultline/<repo>/compose.faultline.yml`) publishes the database on 127.0.0.1 and gives Kafka a listener for this machine (apache/kafka, confluentinc/cp-kafka, bitnami/kafka and wurstmeister/kafka). The app's files stay as they are.
+- **the live schema** of every database, as the app made it (migrations, Liquibase or Hibernate's `ddl-auto`), with the rows each table started with, and the topics and consumer groups.
+
+Before booting it checks every port the stack publishes, and names the container that holds a taken one instead of moving it elsewhere; it also stops when a Dockerfile copies a jar that is not built yet, with the build command. Then it removes the stack again (`--keep` leaves it up). Exit code 2 means it could not run.
+
 ## Onboard an app: faultline/hints.yaml
 
 What Faultline cannot read from the code goes in one file in the app's folder, `faultline/hints.yaml`, the only thing you add to the app. `plan` copies it into the plan:
@@ -72,6 +88,11 @@ auth:                       # sent on every request
   header: Authorization
   value: Bearer ${env:SHOP_TOKEN}   # read from the environment or .env when the run starts, never written to a plan
 seed: seed.sql              # SQL next to this file, loaded after every reset: test data the requests refer to
+kafka:
+  bootstrap: localhost:29092   # only for a broker doctor cannot give a listener of its own
+images:                     # a helper service's image that today's Docker cannot pull, run as another (exact version)
+  zookeeper: zookeeper:3.4.14
+skip: [notification-service]   # services of the app to leave out, such as one that does not start under the repo's Compose file
 ```
 
 The seed runs again after every reset, so write it to allow that (`insert ... on conflict do nothing`). If the app uses Spring Security and there is no `auth`, `plan` warns that its requests may be refused.
