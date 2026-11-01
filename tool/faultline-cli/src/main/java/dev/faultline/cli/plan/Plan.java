@@ -88,9 +88,19 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
 
     /**
      * Services of a Compose file, recreated for each run with its settings. Faultline waits until {@code url} answers and
-     * the Kafka group has {@code consumers} members.
+     * the Kafka group has {@code consumers} members. {@code override} (may be null) is Faultline's own Compose file from
+     * faultline doctor, read after the app's: published database ports and a Kafka listener for this machine.
      */
-    public record Compose(String file, String profile, List<String> services, Integer consumers) {}
+    public record Compose(String file, String profile, List<String> services, Integer consumers, String override) {
+        public Compose(String file, String profile, List<String> services, Integer consumers) {
+            this(file, profile, services, consumers, null);
+        }
+
+        /** The Compose files, in the order Compose reads them. */
+        public List<String> files() {
+            return override == null ? List.of(file) : List.of(file, override);
+        }
+    }
 
     /**
      * {@code reset} puts the database back to its starting state before each run. {@code seedFile} (may be null) is SQL
@@ -357,6 +367,9 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
             var c = target.compose();
             if (c != null) {
                 if (blank(c.file())) problems.add("target.compose.file is missing");
+                if (c.override() != null && !Files.isRegularFile(Path.of(c.override()))) {
+                    problems.add("target.compose.override: no file at " + c.override() + " (run ./faultline doctor again)");
+                }
                 if (c.services() == null || c.services().isEmpty()) problems.add("target.compose.services is empty");
                 if (c.consumers() != null && c.consumers() < 0) problems.add("target.compose.consumers cannot be negative");
             }

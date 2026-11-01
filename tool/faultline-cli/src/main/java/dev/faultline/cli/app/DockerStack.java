@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -140,20 +141,26 @@ public final class DockerStack implements AutoCloseable {
     }
 
     private String compose(List<String> args) throws IOException, InterruptedException {
-        var command = new ArrayList<>(List.of("compose", "-f", compose.file()));
+        var command = new ArrayList<>(List.of("compose"));
+        for (String file : compose.files()) command.addAll(List.of("-f", file));
         if (Files.exists(override)) command.addAll(List.of("-f", override.toAbsolutePath().toString()));
         if (compose.profile() != null) command.addAll(List.of("--profile", compose.profile()));
         command.addAll(args);
         return docker(command);
     }
 
-    static String docker(List<String> args) throws IOException, InterruptedException {
+    public static String docker(List<String> args) throws IOException, InterruptedException {
+        return docker(args, Duration.ofMinutes(COMMAND_TIMEOUT_MINUTES));
+    }
+
+    /** Runs the docker CLI and returns what it printed; throws with the last lines it printed when it fails. */
+    public static String docker(List<String> args, Duration timeout) throws IOException, InterruptedException {
         var command = new ArrayList<>(List.of("docker"));
         command.addAll(args);
         Process p = new ProcessBuilder(command).redirectErrorStream(true).start();
         p.getOutputStream().close();
         byte[] output = p.getInputStream().readAllBytes();
-        if (!p.waitFor(COMMAND_TIMEOUT_MINUTES, TimeUnit.MINUTES)) {
+        if (!p.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
             p.destroyForcibly();
             throw new IllegalStateException("docker " + String.join(" ", args) + " did not finish");
         }
