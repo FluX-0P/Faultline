@@ -61,4 +61,21 @@ public final class LlmCache {
         record Entry(String model, Instant at, List<Message> messages, String answer) {}
         Json.writePretty(dir.resolve(key + ".json"), new Entry(model, Instant.now(), messages, answer));
     }
+
+    /**
+     * Keeps a question whose answers stayed wrong, with every answer and what was wrong with it, in failed/: never read
+     * back as an answer, only for a person to see what the LLM was asked and said. Returns the file.
+     */
+    public Path putFailed(String key, String model, List<Message> messages, String lastAnswer) {
+        Path failed = dir.resolve("failed");
+        try {
+            Files.createDirectories(failed);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        record Entry(String model, Instant at, List<Message> messages, String answer) {}
+        Path file = failed.resolve(key + ".json");
+        Json.writePretty(file, new Entry(model, Instant.now(), messages, lastAnswer));
+        return file;
+    }
 }

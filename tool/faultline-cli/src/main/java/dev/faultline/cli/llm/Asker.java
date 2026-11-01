@@ -1,5 +1,6 @@
 package dev.faultline.cli.llm;
 
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -7,6 +8,7 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 
 import dev.faultline.cli.Json;
+import dev.faultline.cli.Out;
 import dev.faultline.cli.Workspace;
 import dev.faultline.cli.config.Settings;
 import dev.faultline.cli.llm.Llm.Message;
@@ -62,8 +64,9 @@ public final class Asker {
                 return new Answer<>(parsed.value, llm.model(), false, Duration.ofNanos(System.nanoTime() - start));
             }
             if (attempt == MAX_ATTEMPTS) {
+                Path kept = cache.putFailed(key, llm.model(), messages, reply);
                 throw new IllegalStateException("the LLM's answer was still wrong after " + MAX_ATTEMPTS + " tries: "
-                    + String.join("; ", parsed.problems));
+                    + String.join("; ", parsed.problems) + " (the question and its answers are in " + Out.path(kept) + ")");
             }
             log.accept("the answer had %d problem(s), asking again: %s".formatted(parsed.problems.size(), parsed.problems.getFirst()));
             messages.add(Message.assistant(reply));
