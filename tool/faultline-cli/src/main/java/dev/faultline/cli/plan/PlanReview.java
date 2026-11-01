@@ -81,7 +81,7 @@ final class PlanReview {
             .filter(c -> !noFault || !NEED_A_FAULT.contains(c)).toList();
         var rules = p.rules() == null ? null : p.rules().stream()
             .filter(r -> dropped.stream().noneMatch(i -> i.kind().equals("rule") && i.name().equals(r.id()))).toList();
-        return new Plan(p.app(), p.journey(), p.risk(), p.target(), p.database(), p.kafka(), p.relay(), p.toxiproxy(), p.stub(), p.traffic(),
+        return new Plan(p.app(), p.journey(), p.risk(), p.target(), p.database(), p.databases(), p.kafka(), p.relay(), p.toxiproxy(), p.stub(), p.traffic(),
             p.correlateBy(), p.downstream(), p.order(), noFault ? null : p.fault(), checks, rules == null || rules.isEmpty() ? null : rules,
             p.recoveryWithin(), p.confirm());
     }
