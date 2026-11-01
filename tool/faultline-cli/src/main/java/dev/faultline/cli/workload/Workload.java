@@ -2,6 +2,7 @@ package dev.faultline.cli.workload;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.Random;
 
 import dev.faultline.cli.Json;
@@ -26,7 +27,7 @@ public final class Workload {
         return requests;
     }
 
-    /** The value of {@code field} in a JSON request body. */
+    /** The value of {@code field} in a JSON request body; a.b is field b of object a. */
     public static String idOf(String body, String field) {
         JsonNode json;
         try {
@@ -34,8 +35,16 @@ public final class Workload {
         } catch (JacksonException e) {
             throw new IllegalArgumentException("the request body is not valid JSON: " + e.getOriginalMessage() + " in " + body);
         }
+        return field(json, field).orElseThrow(() -> new IllegalArgumentException("the request body has no field '" + field + "': " + body));
+    }
+
+    /** A value of a JSON document by name, a.b for field b of object a; empty if it has none, or it is no plain value. */
+    public static Optional<String> field(JsonNode json, String field) {
         JsonNode id = json.path(field);
-        if (!id.isValueNode() || id.isNull()) throw new IllegalArgumentException("the request body has no field '" + field + "': " + body);
-        return id.asString();
+        if (id.isMissingNode() && field.contains(".")) {
+            id = json;
+            for (String part : field.split("\\.")) id = id.path(part);
+        }
+        return !id.isValueNode() || id.isNull() ? Optional.empty() : Optional.of(id.asString());
     }
 }

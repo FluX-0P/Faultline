@@ -26,6 +26,7 @@ import dev.faultline.cli.Json;
 import dev.faultline.cli.Out;
 import dev.faultline.cli.app.AppProcess;
 import dev.faultline.cli.app.DockerStack;
+import dev.faultline.cli.app.KafkaConnect;
 import dev.faultline.cli.check.CheckResult;
 import dev.faultline.cli.check.Checker;
 import dev.faultline.cli.config.Settings;
@@ -90,25 +91,27 @@ final class Attempt {
         var request = traffic.request();
         var requests = Workload.generate(plan.template(), plan.correlateBy().requestField(), traffic.seed(), traffic.count());
         var effects = new EffectsTable(plan.correlateBy().table(), plan.correlateBy().column());
-        var db = plan.database();
         var fault = plan.fault();
         Duration maxWait = maxWait();
-        if (db.seedFile() != null && !Files.isRegularFile(Path.of(db.seedFile()))) throw new IllegalStateException("database.seed_file: no file at " + db.seedFile());
+        for (var db : plan.allDatabases()) {
+            if (db.seedFile() != null && !Files.isRegularFile(Path.of(db.seedFile()))) throw new IllegalStateException("database.seed_file: no file at " + db.seedFile());
+        }
 
-        try (var conn = DriverManager.getConnection(db.url(), db.user(), db.password());
-             var sender = new TrafficSender(URI.create(plan.target().url()), headers(plan));
+        try (var databases = Databases.open(plan);
+             var sender = new TrafficSender(URI.create(plan.target().url()), headers(plan), request.contentType(), plan.correlateBy().responseField());
              var lag = new KafkaLag(plan.kafka().bootstrap(), plan.kafka().group(), plan.kafka().topic());
              var toxiproxy = plan.toxiproxy() == null ? null : new Toxiproxy(plan.toxiproxy());
              var stub = plan.stub() == null ? null : new StubControl(plan.stub())) {
+            Connection conn = databases.of(plan.effectsDatabase());
             try {
                 prepare(sender, lag);
-                reset(conn);
+                reset(databases);
                 startApp(sender, lag, toxiproxy, stub);
-                seed(conn);
+                seed(databases);
                 if (toxiproxy != null) toxiproxy.reset();
                 if (stub != null) stub.reset();
                 startRelay();
-                warmUp(conn, sender, lag, effects);
+                warmUp(databases, sender, lag, effects);
                 arm(toxiproxy, stub);
                 if (fault != null && "traffic".equals(fault.layer())) requests = duplicateSome(requests, fault);
                 startWatching(effects);
@@ -139,11 +142,12 @@ final class Attempt {
                 Integer restarts = process != null ? Integer.valueOf(process.restarts()) : stack != null ? Integer.valueOf(stack.restarts()) : null;
                 closeApp();
 
-                Map<String, Instant> firstApplied = watcher == null ? Map.of() : watcher.stop();
-                Set<String> published = downstream == null ? Set.of() : downstream.requestIds();
+                var ids = Correlation.of(plan.correlateBy(), entries);
+                Map<String, Instant> firstApplied = watcher == null ? Map.of() : ids.firstApplied(watcher.stop());
+                Set<String> published = downstream == null ? Set.of() : ids.requests(downstream.requestIds());
                 Set<String> destroyed = relay == null ? Set.of() : relay.corrupted();
                 closeWatchers();
-                var checks = check(conn, effects, entries, requests, destroyed, published, firstApplied, faultEnded);
+                var checks = check(databases, effects, ids, entries, requests, destroyed, published, firstApplied, faultEnded);
                 Integer fired = null;
                 if (fault != null) {
                     fired = Faults.fired(dir);
@@ -188,17 +192,21 @@ final class Attempt {
         return new AttemptResult.Drain(effects.rows(conn), drained.backlog(), drained.settled(), drained.waited().toMillis());
     }
 
-    private List<CheckResult> check(Connection conn, EffectsTable effects, List<HistoryEntry> entries, List<Request> requests, Set<String> destroyed,
-                                    Set<String> published, Map<String, Instant> firstApplied, Instant faultEnded) throws Exception {
+    private List<CheckResult> check(Databases databases, EffectsTable effects, Correlation ids, List<HistoryEntry> entries, List<Request> requests,
+                                    Set<String> destroyed, Set<String> published, Map<String, Instant> firstApplied, Instant faultEnded) throws Exception {
         var checks = new ArrayList<CheckResult>();
-        var applied = effects.appliedCounts(conn);
+        Connection conn = databases.of(plan.effectsDatabase());
+        var applied = ids.applied(effects.appliedCounts(conn));
+        if (ids.unmatched() > 0) {
+            Out.line(out, "correlate %,d effect rows belong to requests that got no answer, so there is no ID to match them by", ids.unmatched());
+        }
         for (var c : Checker.check(entries, applied, destroyed)) {
             if (plan.checks().contains(c.name())) checks.add(c);
         }
         if (plan.checks().contains(Plan.PER_KEY_ORDER)) {
             var keyOf = new HashMap<String, String>();
             for (var r : requests) keyOf.putIfAbsent(r.id(), Workload.idOf(r.body(), plan.order().key()));
-            checks.add(Checker.perKeyOrder(entries, keyOf, effects.appliedOrder(conn, plan.order().by())));
+            checks.add(Checker.perKeyOrder(entries, keyOf, ids.order(effects.appliedOrder(conn, plan.order().by()))));
         }
         if (plan.checks().contains(Plan.NO_LOST_DOWNSTREAM)) checks.add(Checker.noLostDownstream(applied, published, plan.downstream().topic()));
         if (plan.checks().contains(Plan.RECOVERY_WITHIN)) {
@@ -206,7 +214,7 @@ final class Attempt {
         }
         for (var rule : plan.rules() == null ? List.<Plan.Rule>of() : plan.rules()) {
             try {
-                checks.add(Checker.rule(rule.id(), EffectsTable.rows(conn, rule.sql())));
+                checks.add(Checker.rule(rule.id(), EffectsTable.rows(databases.of(plan.databaseNamed(rule.database())), rule.sql())));
             } catch (SQLException e) {
                 // a person's rule that does not run is a broken plan; the LLM's is one more wrong rule, dropped like the rest
                 if (!rule.byLlm()) throw new IllegalStateException("rule " + rule.id() + " does not run: " + e.getMessage(), e);
@@ -240,10 +248,11 @@ final class Attempt {
      * Sends the warm-up requests (other IDs than the run's: the same template with another seed), waits until the app
      * has finished them, and resets the database again. Nothing fires meanwhile: the agent and the relay are not armed yet.
      */
-    private void warmUp(Connection conn, TrafficSender sender, KafkaLag lag, EffectsTable effects) throws Exception {
+    private void warmUp(Databases databases, TrafficSender sender, KafkaLag lag, EffectsTable effects) throws Exception {
         var traffic = plan.traffic();
         int n = traffic.warmupCount();
         if (n == 0) return;
+        Connection conn = databases.of(plan.effectsDatabase());
         var requests = Workload.generate(plan.template(), plan.correlateBy().requestField(), traffic.seed() + WARMUP_SEED_OFFSET, n);
         Out.line(out, "warm-up   %,d requests at %d/s, then the database is reset again", n, traffic.rate());
         try (var history = HistoryLog.create(dir.resolve("warmup.jsonl"))) {
@@ -256,8 +265,8 @@ final class Attempt {
         } finally {
             if (relayLag != null) relayLag.close();
         }
-        reset(conn);
-        seed(conn);
+        reset(databases);
+        seed(databases);
     }
 
     /**
@@ -293,7 +302,7 @@ final class Attempt {
             downstream.start();
         }
         if (plan.checks().contains(Plan.RECOVERY_WITHIN)) {
-            var db = plan.database();
+            var db = plan.effectsDatabase();
             watcher = new EffectsWatcher(DriverManager.getConnection(db.url(), db.user(), db.password()), effects);
             watcher.start();
         }
@@ -337,27 +346,39 @@ final class Attempt {
         }
     }
 
-    private void reset(Connection conn) throws Exception {
-        var reset = EffectsTable.reset(conn, plan.resetStatements());
-        if (!reset.skipped().isEmpty() && reset.ran() == 0) {
-            Out.line(out, "reset     fresh database: the app creates its tables when it starts");
-        } else {
-            Out.line(out, "reset     %d statements%s", reset.ran(),
-                reset.skipped().isEmpty() ? "" : " (%d skipped: table not created yet)".formatted(reset.skipped().size()));
+    /** Puts every database of the plan back to its starting state, each in one transaction. */
+    private void reset(Databases databases) throws Exception {
+        int ran = 0;
+        int skipped = 0;
+        for (var db : plan.allDatabases()) {
+            var reset = EffectsTable.reset(databases.of(db), db.resetStatements());
+            ran += reset.ran();
+            skipped += reset.skipped().size();
         }
+        String in = plan.allDatabases().size() > 1 ? " in %d databases".formatted(plan.allDatabases().size()) : "";
+        if (skipped > 0 && ran == 0) {
+            Out.line(out, "reset     fresh database%s: the app creates its tables when it starts", in.isEmpty() ? "" : "s");
+        } else {
+            Out.line(out, "reset     %d statements%s%s", ran, in, skipped == 0 ? "" : " (%d skipped: table not created yet)".formatted(skipped));
+        }
+        var flushed = plan.target().compose() == null ? List.<String>of() : plan.target().compose().flushed();
+        for (String service : flushed) stack.flush(service);
+        if (!flushed.isEmpty()) Out.line(out, "          and emptied %s, the cache the app keeps state in", String.join(", ", flushed));
     }
 
     /** Loads the plan's test data: after a reset, once the app has created its tables. */
-    private void seed(Connection conn) throws Exception {
-        String file = plan.database().seedFile();
-        if (file == null) return;
-        try (var st = conn.createStatement()) {
-            st.execute(Files.readString(Path.of(file), StandardCharsets.UTF_8));
-        } catch (SQLException e) {
-            throw new IllegalStateException("database.seed_file " + file + " failed: " + e.getMessage()
-                + " (it runs again after every reset, so write it like insert ... on conflict do nothing)", e);
+    private void seed(Databases databases) throws Exception {
+        for (var db : plan.allDatabases()) {
+            String file = db.seedFile();
+            if (file == null) continue;
+            try (var st = databases.of(db).createStatement()) {
+                st.execute(Files.readString(Path.of(file), StandardCharsets.UTF_8));
+            } catch (SQLException e) {
+                throw new IllegalStateException("database.seed_file " + file + " failed: " + e.getMessage()
+                    + " (it runs again after every reset, so write it like insert ... on conflict do nothing)", e);
+            }
+            Out.line(out, "seed      loaded %s", file);
         }
-        Out.line(out, "seed      loaded %s", file);
     }
 
     /** The auth header, with its ${env:NAME} read from the environment or .env. */
@@ -387,13 +408,19 @@ final class Attempt {
             }
             Out.line(out, "app       starting %s with Docker Compose%s ...", String.join(", ", target.compose().services()),
                 agent ? ", the fault agent on " + String.join(", ", agents.keySet()) : "");
-            long start = System.nanoTime();
             stack.up(plan.appSettings(), agents, agentJar);
+            // building the images is not starting up: an app whose Dockerfiles build its jars takes minutes to build
+            long start = System.nanoTime();
             int consumers = target.compose().consumers() == null ? 0 : target.compose().consumers();
-            while (!sender.isReachable() || consumers > 0 && lag.stableMembers() < consumers || !helpersReady(toxiproxy, stub)) {
-                waitOrGiveUp(start);
+            try (var connect = target.compose().connect() == null ? null : new KafkaConnect(target.compose().connect())) {
+                int connectors = 0;
+                while (!sender.isReachable() || consumers > 0 && lag.stableMembers() < consumers || !helpersReady(toxiproxy, stub)
+                    || connect != null && (connectors = connect.running()) == 0) {
+                    waitOrGiveUp(start);
+                }
+                Out.line(out, "          ready after %.1fs%s%s", (System.nanoTime() - start) / 1e9, consumers > 0 ? ", " + consumers + " consumers in the group" : "",
+                    connect == null ? "" : ", %d connectors running".formatted(connectors));
             }
-            Out.line(out, "          ready after %.1fs%s", (System.nanoTime() - start) / 1e9, consumers > 0 ? ", " + consumers + " consumers in the group" : "");
         } else if (target.jar() != null) {
             Path appJar = Path.of(target.jar());
             if (!Files.isRegularFile(appJar)) {
