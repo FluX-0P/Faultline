@@ -4,10 +4,12 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -15,6 +17,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
 import java.util.TreeMap;
@@ -44,8 +47,10 @@ import dev.faultline.cli.source.App;
 import dev.faultline.cli.source.Endpoint;
 import dev.faultline.cli.source.JavaSources;
 import dev.faultline.cli.source.JavaSources.Method;
+import dev.faultline.cli.source.JpaTables;
 import dev.faultline.cli.source.RequestShape;
 import dev.faultline.cli.source.RequestShapes;
+import dev.faultline.cli.source.SpringConfig;
 import dev.faultline.cli.workload.RequestTemplate;
 import dev.faultline.cli.understand.AppMap;
 import picocli.CommandLine.Command;
@@ -120,6 +125,7 @@ public final class PlanCommand implements Callable<Integer> {
     private static final Pattern TABLE_ALIAS = Pattern.compile(
         "(?i)\\b(?:from|join)\\s+([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)?)(?:\\s+(?:as\\s+)?([A-Za-z_][A-Za-z0-9_]*))?");
     private static final Pattern COLUMN_REF = Pattern.compile("(?i)\\b([A-Za-z_][A-Za-z0-9_]*)\\.([A-Za-z_][A-Za-z0-9_]*)\\b(?!\\s*\\()");
+    private static final Pattern RESET_TABLE = Pattern.compile("(?i)^\\s*(?:truncate(?:\\s+table)?|delete\\s+from|update)\\s+(?:only\\s+)?([A-Za-z_][A-Za-z0-9_.]*)");
     private static final Set<String> SQL_WORDS = Set.of("where", "join", "on", "group", "order", "left", "right", "inner", "outer", "full",
         "cross", "natural", "limit", "offset", "having", "union", "except", "intersect", "using", "window", "lateral");
 
@@ -143,17 +149,47 @@ public final class PlanCommand implements Callable<Integer> {
 
     /**
      * What Faultline reads from the app, its deployment and its hints rather than asking the LLM. {@code shapes}: each
-     * endpoint's request body; {@code auth} and {@code seedFile} (may be null) come from the hints.
+     * endpoint's request body; {@code auth} and {@code seedFile} (may be null) come from the hints. A repo of several
+     * Spring Boot apps has its {@code databases}, each with its tables, and the {@code urls} of its HTTP endpoints, by
+     * "METHOD /path": each answers on a service of its own module. An app of one module has neither, and its one database
+     * in {@code dbUrl}, {@code dbUser} and {@code dbPassword}.
      */
     record Facts(Deployment deployment, String jar, String dbUrl, String dbUser, String dbPassword, String bootstrap, String topic, String group,
-                 Map<String, RequestShape> shapes, Plan.Auth auth, String seedFile) {
+                 Map<String, RequestShape> shapes, Plan.Auth auth, String seedFile, List<Db> databases, Map<String, String> urls) {
+        Facts(Deployment deployment, String jar, String dbUrl, String dbUser, String dbPassword, String bootstrap, String topic, String group,
+              Map<String, RequestShape> shapes, Plan.Auth auth, String seedFile) {
+            this(deployment, jar, dbUrl, dbUser, dbPassword, bootstrap, topic, group, shapes, auth, seedFile, List.of(), Map.of());
+        }
+
         String url() {
             return deployment.url();
         }
+
+        /** Where the request goes: the service of the endpoint's own module, in a repo of several. */
+        String url(Plan.Request request) {
+            return urls.getOrDefault(request.method() + " " + request.path(), urls.getOrDefault("ANY " + request.path(), url()));
+        }
+
+        boolean severalDatabases() {
+            return !databases.isEmpty();
+        }
+
+        /** The database a table is in, by its name; empty when none or more than one has it. */
+        Optional<Db> databaseOf(String table) {
+            String t = table.toLowerCase(Locale.ROOT);
+            var found = databases.stream().filter(d -> d.schema().containsKey(t) || d.schema().containsKey("public." + t)).toList();
+            return found.size() == 1 ? Optional.of(found.getFirst()) : Optional.empty();
+        }
     }
 
-    /** Where a risk is tested from: the listener that receives the journey's messages, its topic, and the template's test. */
-    record Aim(Risk risk, Method listener, String topic, FaultTemplate.Test test) {}
+    /** A database of a repo of several Spring Boot apps: its name, how Faultline reaches it, its tables and their columns. */
+    record Db(String name, String url, String user, String password, Map<String, Set<String>> schema) {}
+
+    /**
+     * Where a risk is tested from: the listener that receives the journey's messages, its topic, the template's test, and
+     * the deployment as the journey sees it (the listener module's consumers, the fault on the risky module's service).
+     */
+    record Aim(Risk risk, Method listener, String topic, FaultTemplate.Test test, Deployment deployment) {}
 
     /** A plan drawn up for a risk, the model that drafted it, and what its fault does. */
     public record Drawn(Plan plan, String model, String does) {}
@@ -171,7 +207,7 @@ public final class PlanCommand implements Callable<Integer> {
         // the plan runs the app with the settings the scan judged it with
         var settings = risks.settings() == null ? Map.<String, String>of() : risks.settings();
         App app = App.read(appDir, Environment.read(dir).orElse(null)).withSettings(settings);
-        Deployment deployment = deployment(app);
+        Deployment deployment = deployment(app, Hints.read(appDir));
 
         Risk risk;
         if (riskId != null) {
@@ -204,17 +240,25 @@ public final class PlanCommand implements Callable<Integer> {
         return approve(out, drawn.plan(), file, header);
     }
 
-    private Deployment deployment(App app) throws Exception {
-        int port = Integer.parseInt(app.config().get("server.port").orElse("8080"));
+    private Deployment deployment(App app, Hints hints) throws Exception {
         if (compose == null) {
             if (profile != null) throw new IllegalArgumentException("--profile needs --compose");
-            return Deployment.jar("http://localhost:" + port);
+            if (app.multiModule()) {
+                throw new IllegalArgumentException(app.name() + " has " + app.modules().size() + " Spring Boot apps: run them as the services of its Compose file (plan --compose)");
+            }
+            return Deployment.jar("http://localhost:" + port(app.config()));
         }
         // doctor's override reaches Kafka and the databases from this machine, for the Compose file it booted
         String override = app.runtime().map(Environment::compose)
             .filter(c -> Path.of(c.file()).toAbsolutePath().normalize().equals(Path.of(compose).toAbsolutePath().normalize()))
             .map(Environment.Compose::override).orElse(null);
-        return Deployment.compose(compose, override, profile, appDir, port);
+        var modules = app.modules().stream().map(m -> new Deployment.Module(m.path(), port(m.config()),
+            app.code().kafkaListeners().stream().anyMatch(l -> m.path().equals(l.module())))).toList();
+        return Deployment.compose(compose, override, profile, appDir, modules, hints);
+    }
+
+    private static int port(SpringConfig config) {
+        return Integer.parseInt(config.get("server.port").orElse("8080").strip());
     }
 
     /**
@@ -227,14 +271,16 @@ public final class PlanCommand implements Callable<Integer> {
     public static Drawn draw(App app, AppMap map, Risk risk, Deployment deployment, Map<String, String> settings, Hints hints, Asker asker,
                              PrintWriter out) throws Exception {
         Aim aim = aim(app, map, risk, deployment);
-        Facts facts = facts(app, deployment, aim, hints);
+        Facts facts = facts(app, aim.deployment(), aim, hints);
         Out.line(out, "plan      %s %s at %s: %s", risk.id(), risk.pattern(), risk.location(), aim.test().does());
         if (hints.auth() == null && usesSpringSecurity(app)) {
             Out.line(out, "warning   the app uses Spring Security and %s has no auth: its requests may be refused (401). "
                 + "Add auth: {header: Authorization, value: \"Bearer ${env:NAME}\"}", Hints.FILE);
         }
         Out.line(out, "llm       asking %s to draft the traffic and the rules ...", asker.model());
-        var answer = asker.ask(SYSTEM, prompt(app, map, aim, deployment, facts), Schema.load("plan-draft"), PlanDraft.class,
+        // across services the app may make the ID itself, so the draft can name the field of its answer that carries it
+        var schema = Schema.load(app.multiModule() ? "plan-draft-services" : "plan-draft");
+        var answer = asker.ask(SYSTEM, prompt(app, map, aim, aim.deployment(), facts), schema, PlanDraft.class,
             draft -> problems(draft, app, map, aim, facts, settings));
         Out.line(out, answer.cached() ? "          cached answer, no call made" : "          answered in %.1fs".formatted(answer.took().toMillis() / 1000.0));
         Out.line(out, "          %s", answer.value().why());
@@ -255,7 +301,10 @@ public final class PlanCommand implements Callable<Integer> {
             .filter(e -> e.kind() == Endpoint.Kind.KAFKA && e.handler().equals(listener.handler())).findFirst().orElseThrow();
         if (endpoint.topics().isEmpty()) throw new IllegalStateException("cannot tell which topic " + listener.handler() + " listens to");
         String topic = endpoint.topics().getFirst();
-        return new Aim(risk, listener, topic, FaultTemplate.of(risk, app, deployment, listener, topic));
+        // the fault goes where the risk is; code outside every module runs in the listener's
+        String risky = app.code().method(risk.location()).map(Method::module).orElse(null);
+        var journey = deployment.forJourney(null, listener.module(), risky == null ? listener.module() : risky);
+        return new Aim(risk, listener, topic, FaultTemplate.of(risk, app, journey, listener, topic), journey);
     }
 
     private int approve(PrintWriter out, Plan plan, Path file, List<String> header) throws IOException, InterruptedException {
@@ -343,23 +392,90 @@ public final class PlanCommand implements Callable<Integer> {
         var args = new LinkedHashMap<>(settings);
         args.putAll(test.settings());
         var rules = new ArrayList<>(test.rules());
-        for (var r : d.rules()) rules.add(new Plan.Rule(r.id(), r.sql().strip().replaceAll(";+$", "").strip(), r.why(), true));
+        for (var r : d.rules()) {
+            String sql = r.sql().strip().replaceAll(";+$", "").strip();
+            String db = f.severalDatabases() ? databaseOfSql(f, sql).map(Db::name).orElse(null) : null;
+            rules.add(new Plan.Rule(r.id(), sql, r.why(), true, db));
+        }
         var t = test.traffic();
         var deployment = f.deployment();
+        var shape = shapeOf(f, d.request().method(), d.request().path());
+        String contentType = shape != null && shape.form() ? Plan.Request.FORM : null;
+        // the closing newline makes plan.yaml show the body as a | block, so its quotes need no escaping
+        var request = new Plan.Request(d.request().method(), d.request().path(), contentType, d.request().body().strip() + "\n");
+
+        Plan.Database database = null;
+        List<Plan.Database> databases = null;
+        String effectDatabase = null;
+        if (f.severalDatabases()) {
+            effectDatabase = f.databaseOf(d.effect().table()).map(Db::name).orElse(null);
+            databases = databases(f, reset, rules, effectDatabase);
+        } else {
+            database = new Plan.Database(f.dbUrl(), f.dbUser(), f.dbPassword(), reset, f.seedFile());
+        }
         return new Plan(appName, d.journey(), aim.risk(),
-            new Plan.Target(f.url(), deployment.compose() == null ? f.jar() : null, deployment.compose(),
+            new Plan.Target(f.url(request), deployment.compose() == null ? f.jar() : null, deployment.compose(),
                 args.entrySet().stream().map(e -> "--" + e.getKey() + "=" + e.getValue()).toList(), f.auth()),
-            new Plan.Database(f.dbUrl(), f.dbUser(), f.dbPassword(), reset, f.seedFile()),
+            database, databases,
             new Plan.Kafka(f.bootstrap(), f.topic(), f.group()),
             test.relay(), null, test.stub() ? deployment.stub() : null,
-            // the closing newline makes plan.yaml show the body as a | block, so its quotes need no escaping
-            new Plan.Traffic(t.count(), t.rate(), null, new Plan.Request(d.request().method(), d.request().path(), d.request().body().strip() + "\n"),
-                t.drainTimeout(), t.warmup()),
-            new Plan.CorrelateBy(d.correlateBy(), d.effect().table(), d.effect().column()),
+            new Plan.Traffic(t.count(), t.rate(), null, request, t.drainTimeout(), t.warmup()),
+            new Plan.CorrelateBy(d.correlateBy(), d.answerField(), effectDatabase, d.effect().table(), d.effect().column()),
             test.downstreamTopic() == null ? null : new Plan.Downstream(test.downstreamTopic(), d.correlateBy()),
             null,
             test.fault(), test.checks(), rules.isEmpty() ? null : rules, test.recoveryWithin(),
             CONFIRM);
+    }
+
+    /**
+     * The databases a plan through several services uses, each with the reset statements on its tables: every database
+     * the reset, the effects table or a rule names, in the order Faultline knows them. The seed file goes to the database
+     * whose table it inserts into first.
+     */
+    private static List<Plan.Database> databases(Facts f, List<String> reset, List<Plan.Rule> rules, String effectDatabase) {
+        var statements = new LinkedHashMap<String, List<String>>();
+        for (String sql : reset) {
+            resetTable(sql).flatMap(f::databaseOf).ifPresent(db -> statements.computeIfAbsent(db.name(), k -> new ArrayList<>()).add(sql));
+        }
+        String seedDatabase = null;
+        if (f.seedFile() != null) {
+            try {
+                var first = INSERT.matcher(Files.readString(Path.of(f.seedFile()), StandardCharsets.UTF_8));
+                if (first.find()) seedDatabase = f.databaseOf(first.group(1)).map(Db::name).orElse(null);
+            } catch (IOException e) {
+                throw new UncheckedIOException("cannot read " + f.seedFile(), e);
+            }
+        }
+        var used = new HashSet<>(statements.keySet());
+        if (effectDatabase != null) used.add(effectDatabase);
+        if (seedDatabase != null) used.add(seedDatabase);
+        rules.stream().map(Plan.Rule::database).filter(java.util.Objects::nonNull).forEach(used::add);
+        var databases = new ArrayList<Plan.Database>();
+        for (var db : f.databases()) {
+            if (!used.contains(db.name())) continue;
+            databases.add(new Plan.Database(db.name(), db.url(), db.user(), db.password(), statements.getOrDefault(db.name(), List.of()),
+                db.name().equals(seedDatabase) ? f.seedFile() : null));
+        }
+        return databases;
+    }
+
+    /** The table a reset statement works on: TRUNCATE a, DELETE FROM a, UPDATE a SET. */
+    static Optional<String> resetTable(String sql) {
+        var m = RESET_TABLE.matcher(sql);
+        return m.find() ? Optional.of(m.group(1).toLowerCase(Locale.ROOT)) : Optional.empty();
+    }
+
+    /** The one database every table a query reads is in; empty when they are in none, or in several. */
+    static Optional<Db> databaseOfSql(Facts f, String sql) {
+        var dbs = TABLE_REF.matcher(sql.toLowerCase(Locale.ROOT)).results().map(m -> f.databaseOf(m.group(1)))
+            .flatMap(Optional::stream).map(Db::name).distinct().toList();
+        return dbs.size() == 1 ? f.databases().stream().filter(d -> d.name().equals(dbs.getFirst())).findFirst() : Optional.empty();
+    }
+
+    /** The shape of an endpoint's request body, by its method and path. */
+    private static RequestShape shapeOf(Facts f, String method, String path) {
+        var shape = f.shapes().get(method + " " + path);
+        return shape != null ? shape : f.shapes().get("ANY " + path);
     }
 
     /** Checks the LLM's draft against the code and the app map, and the plan it makes against the plan's own rules. */
@@ -379,12 +495,26 @@ public final class PlanCommand implements Callable<Integer> {
             problems.add("%s %s is not an endpoint in the code (endpoints: %s)".formatted(d.request().method(), d.request().path(),
                 http.stream().map(Endpoint::name).collect(Collectors.joining(", "))));
         }
-        var shape = facts.shapes().get(d.request().method() + " " + d.request().path());
-        if (shape == null) shape = facts.shapes().get("ANY " + d.request().path());
+        var shape = shapeOf(facts, d.request().method(), d.request().path());
         if (shape != null && d.request().body() != null) problems.addAll(bodyProblems(d.request().body(), shape));
+        if (d.answerField() != null) {
+            var answer = RequestShapes.answers(app).get(d.request().method() + " " + d.request().path());
+            if (answer != null && !answer.contains(d.answerField())) {
+                problems.add("responseField '%s' is not a field of the app's answer to %s %s (its fields: %s)".formatted(d.answerField(),
+                    d.request().method(), d.request().path(), String.join(", ", answer)));
+            }
+        }
 
-        var types = journeyTypes(app, aim.listener());
+        var types = new ArrayList<>(journeyTypes(app, aim.listener()));
+        // across services, the entry's own writes are the journey's too
+        if (app.multiModule()) entry(app, map, d).ifPresent(h -> journeyTypes(app, h).stream().filter(t -> !types.contains(t)).forEach(types::add));
         Set<String> inserted = tables(app, types, INSERT);
+        // a seeded table the journey saves through JPA is one it changes, not one it fills
+        var saved = saved(app, types);
+        var changed = new TreeSet<>(saved);
+        changed.retainAll(seededTables(app));
+        saved.removeAll(changed);
+        inserted.addAll(saved);
         if (!inserted.isEmpty() && !inserted.contains(d.effect().table().toLowerCase(Locale.ROOT))) {
             problems.add("effect.table '%s' is not a table the journey's code inserts into (%s)".formatted(d.effect().table(), String.join(", ", inserted)));
         }
@@ -398,7 +528,9 @@ public final class PlanCommand implements Callable<Integer> {
                 problems.add("reset empties " + table + ", which the migrations fill: UPDATE its rows back to the migrations' values instead");
             }
         }
-        for (String table : tables(app, types, UPDATE)) {
+        var updated = tables(app, types, UPDATE);
+        updated.addAll(changed);
+        for (String table : updated) {
             if (inserted.contains(table)) continue;
             var setBack = Pattern.compile("(?is)^\\s*update\\s+" + Pattern.quote(table) + "\\b");
             if (d.reset().stream().noneMatch(s -> setBack.matcher(s).find() || clears(table).matcher(s).find())) {
@@ -406,8 +538,53 @@ public final class PlanCommand implements Callable<Integer> {
             }
         }
         problems.addAll(ruleProblems(d.rules(), schema(app, facts.deployment())));
+        if (facts.severalDatabases()) problems.addAll(databaseProblems(d, facts));
         problems.addAll(build(d, app.name(), aim, facts, settings).problems());
         return problems;
+    }
+
+    /** Across several databases, each table the draft names must be in exactly one of them, and each rule must stay in one. */
+    static List<String> databaseProblems(PlanDraft d, Facts f) {
+        var problems = new ArrayList<String>();
+        String where = f.databases().stream().map(db -> db.name() + " (" + String.join(", ", db.schema().keySet()) + ")").collect(Collectors.joining("; "));
+        if (f.databaseOf(d.effect().table()).isEmpty()) {
+            problems.add("effect.table '%s' must be a table of exactly one of the app's databases: %s".formatted(d.effect().table(), where));
+        }
+        for (String sql : d.reset()) {
+            var table = resetTable(sql);
+            if (table.isEmpty() || f.databaseOf(table.get()).isEmpty()) {
+                problems.add("reset '%s' must work on a table of exactly one of the app's databases: %s".formatted(sql, where));
+            } else if (sql.contains(",")) {
+                var tables = Arrays.stream(sql.replaceAll("(?is)^\\s*truncate(\\s+table)?", "").split("\\s*,\\s*"))
+                    .map(s -> s.strip().split("\\s+")[0]).toList();
+                if (tables.stream().map(f::databaseOf).flatMap(Optional::stream).map(Db::name).distinct().count() > 1) {
+                    problems.add("reset '%s' names tables of different databases: one statement per database".formatted(sql));
+                }
+            }
+        }
+        for (var rule : d.rules()) {
+            if (rule.sql() != null && databaseOfSql(f, rule.sql()).isEmpty()) {
+                problems.add("rule %s must read the tables of one database: each service has its own (%s)".formatted(rule.id(), where));
+            }
+        }
+        return problems;
+    }
+
+    /** The HTTP handler of the draft's request; between modules with the same path, one the journey goes through. */
+    static Optional<Method> entry(App app, AppMap map, PlanDraft d) {
+        var steps = map.journeys().stream().filter(j -> j.name().equals(d.journey())).flatMap(j -> j.steps().stream()).map(AppMap.Step::handler)
+            .collect(Collectors.toSet());
+        return httpEndpoints(app).stream()
+            .filter(e -> e.path().equals(d.request().path()) && (e.method().equals(d.request().method()) || e.method().equals("ANY")))
+            .sorted(Comparator.comparing(e -> !steps.contains(e.handler())))
+            .flatMap(e -> app.code().method(e.handler()).stream()).findFirst();
+    }
+
+    /** Tables the methods of these types write through JPA repositories. */
+    private static Set<String> saved(App app, List<TypeDeclaration<?>> types) {
+        var tables = new TreeSet<String>();
+        app.code().methods().stream().filter(m -> types.contains(m.owner())).forEach(m -> tables.addAll(JpaTables.saved(app.code(), m)));
+        return tables;
     }
 
     /**
@@ -631,13 +808,38 @@ public final class PlanCommand implements Callable<Integer> {
         var prompt = new Prompt()
             .line("Risk to test: %s %s \"%s\" at %s%s. %s".formatted(risk.id(), risk.pattern(), risk.title(), risk.location(),
                 risk.outcome() == null ? "" : ", where the outcome would be: " + risk.outcome(), risk.why()))
-            .line("The fault: Faultline will %s. The checks it already makes: %s.".formatted(test.does(), String.join(", ", made)))
-            .code("App map", "json", Json.MAPPER.writerWithDefaultPrettyPrinter()
+            .line("The fault: Faultline will %s. The checks it already makes: %s.".formatted(test.does(), String.join(", ", made)));
+        if (app.multiModule()) {
+            prompt.section("The repo's Spring Boot apps, each a service with its own database", app.describeModules())
+                .line("""
+                    The journey crosses services. Each has its own database: name tables as they are, and Faultline runs each reset \
+                    statement and each rule in the database that has its table, so a rule reads the tables of one database. A value \
+                    that refers to a row of any service, such as an account ID, must be one the test data or a seeded table has. When \
+                    the effect row holds an ID the app makes itself (a database sequence or a random UUID) rather than a field of the \
+                    request, set responseField to the field of the app's JSON answer that carries it; else leave it empty.""");
+        }
+        prompt.code("App map", "json", Json.MAPPER.writerWithDefaultPrettyPrinter()
                 .writeValueAsString(new MapView(map.summary(), map.entryPoints(), map.journeys(), map.dataStores())))
-            .section("HTTP endpoints that take a request body", http.stream().map(e -> "- " + e.name() + " -> " + e.handler()).collect(Collectors.joining("\n")))
+            .section("HTTP endpoints that take a request body", http.stream().map(e -> "- " + e.name() + " -> " + e.handler()
+                + (app.multiModule() ? app.code().method(e.handler()).flatMap(app::moduleOf).map(m -> " (" + m.name() + ")").orElse("") : ""))
+                .collect(Collectors.joining("\n")))
             .section("Their request bodies", http.stream().filter(e -> facts.shapes().containsKey(e.name()))
                 .map(e -> "### %s (from %s)\n\n%s".formatted(e.name(), facts.shapes().get(e.name()).source(), facts.shapes().get(e.name()).describe()))
-                .collect(Collectors.joining("\n\n")))
+                .collect(Collectors.joining("\n\n")));
+        if (app.multiModule()) {
+            var answers = RequestShapes.answers(app);
+            prompt.section("The fields of their JSON answers", http.stream().filter(e -> answers.containsKey(e.name()))
+                .map(e -> "- %s: %s".formatted(e.name(), String.join(", ", answers.get(e.name())))).collect(Collectors.joining("\n")));
+        }
+        if (http.stream().map(e -> facts.shapes().get(e.name())).anyMatch(s -> s != null && s.form())) {
+            prompt.line("""
+                An endpoint whose request body comes from form fields takes an HTML form. Write its body as JSON all the same, \
+                with nested objects and lists as its field list shows them, such as {"address": {"street": "x"}, "lines": [{"count": 1}]}: \
+                Faultline sends that as the form fields address.street=x and lines[0].count=1. A field read by one text value (such \
+                as a customer by its ID) is a JSON string holding a value that exists. Name a request field of a nested object as \
+                a.b, such as address.street.""");
+        }
+        prompt
             .code("Their handlers and request types", "java", handlerTypes.values().stream().map(app.code()::source).collect(Collectors.joining("\n\n")))
             .code("The listener " + aim.listener().handler() + ", the classes its work goes through, and the risky code", "java",
                 journeyTypes.values().stream().map(app.code()::source).collect(Collectors.joining("\n\n")))
@@ -665,9 +867,10 @@ public final class PlanCommand implements Callable<Integer> {
     static Facts facts(App app, Deployment deployment, Aim aim, Hints hints) throws Exception {
         var listener = app.code().endpoints().stream()
             .filter(e -> e.kind() == Endpoint.Kind.KAFKA && e.handler().equals(aim.listener().handler())).findFirst().orElseThrow();
-        var config = app.config();
+        var config = app.configOf(aim.listener());
         String group = listener.groupId() != null ? listener.groupId() : config.get("spring.kafka.consumer.group-id")
             .orElseThrow(() -> new IllegalStateException("cannot tell the consumer group of " + aim.listener().handler()));
+        if (app.multiModule()) return servicesFacts(app, deployment, aim, hints, config, group);
         String dbUrl = config.get("spring.datasource.url")
             .orElseThrow(() -> new IllegalStateException("the app's configuration has no spring.datasource.url"));
         String bootstrap = config.get("spring.kafka.bootstrap-servers").orElse("localhost:9092");
@@ -679,6 +882,38 @@ public final class PlanCommand implements Callable<Integer> {
         return new Facts(deployment, deployment.compose() == null ? jar(app) : null, dbUrl,
             config.get("spring.datasource.username").orElse(""), config.get("spring.datasource.password").orElse(""),
             bootstrap, aim.topic(), group, RequestShapes.of(app), hints.auth(), hints.seedFile(app.dir()));
+    }
+
+    /**
+     * The facts of a repo of several Spring Boot apps, from what doctor recorded: every database with its tables and its
+     * address on this machine, and where each HTTP endpoint answers, on a service of its own module.
+     */
+    private static Facts servicesFacts(App app, Deployment deployment, Aim aim, Hints hints, SpringConfig listenerConfig, String group) {
+        var env = app.environment();
+        if (env == null) {
+            throw new IllegalStateException(app.name() + " has " + app.modules().size() + " Spring Boot apps: run ./faultline doctor first, "
+                + "so Faultline knows each one's database and how to reach it");
+        }
+        String bootstrap = env.hostBootstrap(listenerConfig.get("spring.kafka.bootstrap-servers").orElse("localhost:9092"));
+        var names = env.databases().stream().collect(Collectors.groupingBy(Environment.Database::name, Collectors.counting()));
+        var databases = new ArrayList<Db>();
+        for (var d : env.databases()) {
+            var schema = new TreeMap<String, Set<String>>();
+            d.tables().forEach(t -> schema.put(t.name().toLowerCase(Locale.ROOT),
+                t.columns().stream().map(c -> c.name().toLowerCase(Locale.ROOT)).collect(Collectors.toCollection(TreeSet::new))));
+            // a password Compose fills in from the shell is not recorded: the configuration of a module that uses it has it
+            String password = d.password() != null ? d.password() : env.services().stream().filter(s -> d.usedBy().contains(s.name()))
+                .flatMap(s -> app.module(s.module()).stream()).map(m -> m.config().get("spring.datasource.password").orElse(null))
+                .filter(java.util.Objects::nonNull).findFirst().orElse("");
+            String name = names.get(d.name()) > 1 ? d.service() + "-" + d.name() : d.name();
+            databases.add(new Db(name, d.hostUrl(), d.user(), password, schema));
+        }
+        var urls = new LinkedHashMap<String, String>();
+        for (var e : httpEndpoints(app)) {
+            app.code().method(e.handler()).map(Method::module).flatMap(deployment::urlOf).ifPresent(url -> urls.put(e.name(), url));
+        }
+        return new Facts(deployment, null, null, null, null, bootstrap, aim.topic(), group, RequestShapes.of(app), hints.auth(),
+            hints.seedFile(app.dir()), List.copyOf(databases), urls);
     }
 
     /** The jar in target/, or the name Maven will give it once built. */
