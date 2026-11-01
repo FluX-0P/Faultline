@@ -4,9 +4,11 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
 import dev.faultline.cli.app.DockerStack;
@@ -67,6 +69,38 @@ final class Ports {
             }
         }
         return found;
+    }
+
+    private static final Pattern RANGE = Pattern.compile("(?m)^\\s*(\\d+)\\s+(\\d+)\\b");
+
+    /**
+     * The range of ports Windows keeps for itself that the port is in, such as 52432-52531: Hyper-V and WinNAT reserve
+     * some at boot, and nothing can publish a port in them. Empty elsewhere, or when the port is in none.
+     */
+    static Optional<String> reservedByWindows(int port) {
+        if (!System.getProperty("os.name", "").startsWith("Windows")) return Optional.empty();
+        try {
+            var process = new ProcessBuilder("netsh", "interface", "ipv4", "show", "excludedportrange", "protocol=tcp").redirectErrorStream(true).start();
+            String ranges = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            process.waitFor(5, TimeUnit.SECONDS);
+            return reservedIn(ranges, port);
+        } catch (IOException e) {
+            return Optional.empty();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return Optional.empty();
+        }
+    }
+
+    /** The range of {@code netsh interface ipv4 show excludedportrange} output that holds the port. */
+    static Optional<String> reservedIn(String ranges, int port) {
+        var m = RANGE.matcher(ranges);
+        while (m.find()) {
+            int start = Integer.parseInt(m.group(1));
+            int end = Integer.parseInt(m.group(2));
+            if (start <= port && port <= end) return Optional.of(start + "-" + end);
+        }
+        return Optional.empty();
     }
 
     static Optional<Container> holder(int port, List<Container> containers) {

@@ -7,6 +7,7 @@ import static net.bytebuddy.matcher.ElementMatchers.nameEndsWith;
 import static net.bytebuddy.matcher.ElementMatchers.nameStartsWith;
 import static net.bytebuddy.matcher.ElementMatchers.named;
 import static net.bytebuddy.matcher.ElementMatchers.not;
+import static net.bytebuddy.matcher.ElementMatchers.takesArguments;
 import static net.bytebuddy.matcher.ElementMatchers.takesNoArguments;
 
 import java.lang.instrument.Instrumentation;
@@ -29,6 +30,7 @@ public final class FaultAgent {
     /** Just before Spring Kafka commits the offset: after the app's own DB commit, which is bug B1's window. */
     static final String BEFORE_ACK = "before-ack";
     static final String ACKNOWLEDGMENT = "org.springframework.kafka.support.Acknowledgment";
+    static final String PRODUCER = "org.apache.kafka.clients.producer.KafkaProducer";
 
     private FaultAgent() {}
 
@@ -40,22 +42,36 @@ public final class FaultAgent {
         }
 
         FaultPlan plan;
-        int remaining;
         try {
             plan = FaultPlan.load(Path.of(planFile));
-            remaining = plan.action().equals("signal") ? 1 : plan.remaining();
         } catch (Exception e) {
             log("could not read plan " + planFile + " (" + e + "), doing nothing");
-            return;
-        }
-        if (remaining <= 0) {
-            log("every planned fault already fired (" + plan.times() + " of " + plan.times() + "), doing nothing");
             return;
         }
 
         // keeps ByteBuddy off sun.misc.Unsafe, which newer JDKs warn about. Shading renames this property along with
         // the package, so it only affects our copy of ByteBuddy, never the app's own.
         System.setProperty("net.bytebuddy.safe", "true");
+
+        // the relay's topic stays renamed for as long as the app runs, also once every fault has fired
+        if (!plan.renames().isEmpty()) {
+            Rename.topics(plan.renames());
+            install(inst, not(named(PRODUCER)), named(PRODUCER), named("send").and(takesArguments(2)), RenameAdvice.class);
+            plan.renames().forEach((from, to) -> log("will send what the app sends to %s to %s, where Faultline's relay reads it".formatted(from, to)));
+        }
+        if (plan.action().equals(FaultPlan.RENAME)) return;
+
+        int remaining;
+        try {
+            remaining = plan.action().equals("signal") ? 1 : plan.remaining();
+        } catch (Exception e) {
+            log("could not read the fault log " + plan.log() + " (" + e + "), doing nothing");
+            return;
+        }
+        if (remaining <= 0) {
+            log("every planned fault already fired (" + plan.times() + " of " + plan.times() + "), doing nothing");
+            return;
+        }
 
         try {
             if (plan.action().equals("signal")) {

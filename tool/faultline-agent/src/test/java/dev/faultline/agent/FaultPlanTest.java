@@ -63,6 +63,23 @@ class FaultPlanTest {
     }
 
     @Test
+    void readsARenameOnItsOwnOrWithAFault(@TempDir Path dir) throws Exception {
+        Path log = dir.resolve("faults.jsonl");
+        var renameOnly = FaultPlan.load(writePlan(dir, Map.of("action", "rename", "rename", "orders>orders.faultline", "log", log.toString())));
+        assertThat(renameOnly.action()).isEqualTo("rename");
+        assertThat(renameOnly.renames()).isEqualTo(Map.of("orders", "orders.faultline"));
+
+        var withFault = FaultPlan.load(writePlan(dir, Map.of("point", "before-ack", "nth_hit", "300", "times", "3", "log", log.toString(),
+            "rename", "a>a.faultline, b>b.faultline")));
+        assertThat(withFault.renames()).isEqualTo(Map.of("a", "a.faultline", "b", "b.faultline"));
+        assertThat(withFault.action()).isEqualTo("crash");
+
+        assertThatThrownBy(() -> FaultPlan.load(writePlan(dir, Map.of("action", "rename", "log", log.toString())))).hasMessageContaining("rename=from>to");
+        assertThatThrownBy(() -> FaultPlan.load(writePlan(dir, Map.of("action", "rename", "rename", "orders", "log", log.toString()))))
+            .hasMessageContaining("from>to");
+    }
+
+    @Test
     void rejectsAMissingOrBadSetting(@TempDir Path dir) throws Exception {
         assertThatThrownBy(() -> FaultPlan.load(writePlan(dir, Map.of("point", "before-ack", "times", "3", "log", "f"))))
             .hasMessageContaining("nth_hit");

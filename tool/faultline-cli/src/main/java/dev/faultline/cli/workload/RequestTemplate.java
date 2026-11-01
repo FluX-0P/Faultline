@@ -11,21 +11,26 @@ import java.util.regex.Pattern;
  *   ${seq}          the request's number in the run: 0, 1, 2 ...
  *   ${seed}         the run's seed
  *   ${int:MIN:MAX}  a random whole number from MIN to MAX, both included
+ *   ${seq:N}        the same, with zeros in front to N digits, such as ${seq:12}; ${seed:N} likewise
  * </pre>
  * Random numbers come from one java.util.Random(seed), drawn left to right, so the same seed gives the same requests.
+ * Zeros in front make a value of a fixed length, such as a UUID the app parses and the database prints back the same:
+ * 00000000-0000-0000-${seq:4}-${seed:12} (a run's seed has up to 6 digits).
  */
 public final class RequestTemplate {
     public static final String SYNTAX = "${seq}, ${seed} and ${int:MIN:MAX}";
     private static final Pattern PLACEHOLDER = Pattern.compile("\\$\\{([^}]*)}");
     private static final Pattern INT = Pattern.compile("int:(-?\\d+):(-?\\d+)");
+    private static final Pattern PADDED = Pattern.compile("(seq|seed):(\\d{1,2})");
 
     private sealed interface Part permits Text, Seq, Seed, IntRange {}
 
     private record Text(String text) implements Part {}
 
-    private record Seq() implements Part {}
+    /** {@code width}: the digits it is padded to with zeros, 0 for none. */
+    private record Seq(int width) implements Part {}
 
-    private record Seed() implements Part {}
+    private record Seed(int width) implements Part {}
 
     private record IntRange(int min, int max) implements Part {}
 
@@ -52,8 +57,14 @@ public final class RequestTemplate {
     }
 
     private static Part placeholder(String name) {
-        if (name.equals("seq")) return new Seq();
-        if (name.equals("seed")) return new Seed();
+        if (name.equals("seq")) return new Seq(0);
+        if (name.equals("seed")) return new Seed(0);
+        var padded = PADDED.matcher(name);
+        if (padded.matches()) {
+            int width = Integer.parseInt(padded.group(2));
+            if (width < 1) throw new IllegalArgumentException("${" + name + "}: the digits to pad to must be at least 1");
+            return padded.group(1).equals("seq") ? new Seq(width) : new Seed(width);
+        }
         var m = INT.matcher(name);
         if (m.matches()) {
             long min = Long.parseLong(m.group(1));
@@ -72,12 +83,18 @@ public final class RequestTemplate {
         for (Part part : parts) {
             switch (part) {
                 case Text t -> sb.append(t.text());
-                case Seq _ -> sb.append(seq);
-                case Seed _ -> sb.append(seed);
+                case Seq s -> sb.append(padded(seq, s.width()));
+                case Seed s -> sb.append(padded(seed, s.width()));
                 case IntRange r -> sb.append(r.min() + random.nextInt(r.max() - r.min() + 1));
             }
         }
         return sb.toString();
+    }
+
+    /** 42 as 0042 for a width of 4; as it is for 0, or when it has more digits than that. */
+    private static String padded(long n, int width) {
+        String digits = Long.toString(n);
+        return width == 0 || digits.length() >= width || n < 0 ? digits : "0".repeat(width - digits.length()) + digits;
     }
 
     public String source() {

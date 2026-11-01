@@ -75,8 +75,12 @@ public final class DoctorCommand implements Callable<Integer> {
     @Parameters(paramLabel = "REPO", description = "The app's repo, for example ../microservice-kafka")
     Path repoDir;
 
-    @Option(names = "--compose", required = true, paramLabel = "FILE", description = "The Compose file that runs the app, such as docker/docker-compose.yml")
-    String compose;
+    @Option(names = "--compose", required = true, split = ",", paramLabel = "FILE",
+        description = "The Compose file that runs the app, such as docker/docker-compose.yml; several, comma-separated or repeated, are read in order")
+    List<String> composeFiles;
+
+    /** The Compose files as plans name them: comma-separated, in the order Compose reads them. */
+    private String compose;
 
     @Option(names = "--profile", description = "The Compose profile the app's services are in")
     String profile;
@@ -106,10 +110,23 @@ public final class DoctorCommand implements Callable<Integer> {
         for (String note : verdict.notes()) Out.line(out, "note      %s", note);
         if (!verdict.out().isEmpty()) return outOfScope(out, repo, verdict.out());
 
-        if (!Files.isRegularFile(Path.of(compose))) throw new IllegalArgumentException("no Compose file at " + compose);
+        compose = String.join(",", composeFiles);
+        for (String f : composeFiles) {
+            if (!Files.isRegularFile(Path.of(f))) throw new IllegalArgumentException("no Compose file at " + f);
+        }
         var hints = Hints.read(repo);
-        var config = ComposeConfig.read(List.of(compose), profile, true);
-        var stack = AppStack.read(repo, config, ComposeConfig.read(List.of(compose), profile, false), hints.skipped());
+        // a service the hints build from a Dockerfile of the repo is the app's, as if its Compose file built it
+        var builds = hints.dockerfiles(repo);
+        var moved = hints.movedPorts();
+        var config = ComposeConfig.read(composeFiles, profile, true);
+        for (String s : builds.keySet()) {
+            if (!config.services().containsKey(s)) throw new IllegalArgumentException(Hints.FILE + ": builds names " + s + ", which is no service of " + compose);
+        }
+        for (String s : moved.keySet()) {
+            if (!config.services().containsKey(s)) throw new IllegalArgumentException(Hints.FILE + ": ports names " + s + ", which is no service of " + compose);
+        }
+        config = config.withBuilds(builds).withPorts(moved);
+        var stack = AppStack.read(repo, config, ComposeConfig.read(composeFiles, profile, false).withBuilds(builds).withPorts(moved), hints.skipped());
         if (stack.app.isEmpty()) {
             return outOfScope(out, repo, List.of("no service of " + compose + " builds the app from " + Out.path(repoDir)
                 + ": they run prebuilt images, so the code Faultline reads may not be the code that runs"));
@@ -118,6 +135,8 @@ public final class DoctorCommand implements Callable<Integer> {
         checkImages(images, config, stack);
         config = config.withImages(images);
         for (var e : images.entrySet()) Out.line(out, "image     %s runs %s instead of %s (%s)", e.getKey(), e.getValue(), stack.config.services().get(e.getKey()).image(), Hints.FILE);
+        for (var e : builds.entrySet()) Out.line(out, "build     %s from %s (%s)", e.getKey(), Out.path(repo.relativize(e.getValue())), Hints.FILE);
+        for (var e : moved.entrySet()) Out.line(out, "ports     %s is published on %s instead of its own ports (%s)", e.getKey(), String.join(", ", e.getValue()), Hints.FILE);
         Out.line(out, "compose   %s, project %s; the app: %s", compose, config.project(), stack.app.stream()
             .map(s -> s.name() + (s.modulePath().isEmpty() ? "" : " (" + s.modulePath() + ")")).collect(joining(", ")));
         for (String s : stack.skipped) Out.line(out, "skip      %s is left out (%s)", s, Hints.FILE);
@@ -134,6 +153,8 @@ public final class DoctorCommand implements Callable<Integer> {
         }));
         var reach = new Reach(port -> !stackPorts.contains(port) && Ports.isFree(port));
         images.forEach(reach::replaceImage);
+        builds.forEach(reach::build);
+        moved.forEach(reach::movePorts);
         var kafka = reach.kafka(config.services().get(stack.kafka.name())).orElse(null);
         if (kafka == null) {
             var hint = hints.kafka();
@@ -149,18 +170,19 @@ public final class DoctorCommand implements Callable<Integer> {
         for (var d : stack.databases) {
             var address = reach.database(d.service(), d.port());
             hosts.put(d, address);
-            Out.line(out, "          %s at %s: %s, %s", d.name(), d.address(), address.host(), address.how());
+            Out.line(out, "          %s at %s: %s, %s", d.name(), d.address(), address.host(),
+                moved.containsKey(d.service().name()) ? "published where " + Hints.FILE + " moves it" : address.how());
         }
 
         Path workspace = Workspace.forApp(repoDir);
         Files.createDirectories(workspace);
         Path overrideFile = workspace.resolve(OVERRIDE);
-        files.add(compose);
+        files.addAll(composeFiles);
         if (reach.override().isEmpty()) {
             Files.deleteIfExists(overrideFile);
         } else {
             Files.writeString(overrideFile, "# written by faultline doctor: how Faultline reaches the app's Kafka and databases from this machine,"
-                + " and the images " + Hints.FILE + " replaces\n" + YAML.writeValueAsString(reach.override()), StandardCharsets.UTF_8);
+                + " and the images " + Hints.FILE + " replaces\n" + Reach.yaml(YAML.writeValueAsString(reach.override())), StandardCharsets.UTF_8);
             files.add(Out.path(overrideFile));
             Out.line(out, "override  %s", Out.path(overrideFile));
         }
@@ -169,6 +191,8 @@ public final class DoctorCommand implements Callable<Integer> {
         var named = new ArrayList<>(stack.app.stream().map(AppStack.AppService::name).toList());
         named.add(stack.kafka.name());
         stack.databases.forEach(d -> named.add(d.service().name()));
+        named.addAll(stack.reached);
+        if (!stack.reached.isEmpty()) Out.line(out, "reach     the app's settings name %s too, so they boot with it", String.join(", ", stack.reached));
         var boot = config.withDependencies(named);
         checkSkipped(stack.skipped, boot, config);
         if (!portsFree(out, config, boot, reach.publishedPorts())) return Faultline.ERROR;
@@ -207,9 +231,10 @@ public final class DoctorCommand implements Callable<Integer> {
         }
         Out.line(out, "result    IN SCOPE: %s boots, and Faultline reaches its Kafka and %d database%s", repo.getFileName(), stack.databases.size(),
             stack.databases.size() == 1 ? "" : "s");
-        if (files.size() > 1) {
+        if (files.size() > composeFiles.size()) {
             var infra = new TreeSet<String>(List.of(stack.kafka.name()));
             stack.databases.forEach(d -> infra.add(d.service().name()));
+            infra.addAll(stack.reached);
             Out.line(out, "note      a run needs them up with Faultline's override: docker compose %s up -d %s",
                 files.stream().map(f -> "-f " + f).collect(joining(" ")), String.join(" ", infra));
         }
@@ -281,6 +306,11 @@ public final class DoctorCommand implements Callable<Integer> {
                 var h = holder.get();
                 Out.line(out, "ports     %d (%s) is taken by container %s: stop it with docker stop %s%s", port, e.getValue(), h.name(), h.name(),
                     h.project().isEmpty() ? "" : ", or its whole stack with docker compose -p " + h.project() + " stop");
+            } else if (Ports.reservedByWindows(port).isPresent()) {
+                int target = config.services().containsKey(e.getValue()) ? config.services().get(e.getValue()).ports().stream()
+                    .filter(p -> Integer.valueOf(port).equals(p.published())).map(ComposeConfig.Port::target).findFirst().orElse(port) : port;
+                Out.line(out, "ports     %d (%s) is in a range Windows keeps for itself (%s, see netsh interface ipv4 show excludedportrange protocol=tcp): "
+                    + "publish it elsewhere with ports: {%s: [\"OTHER:%d\"]} in %s", port, e.getValue(), Ports.reservedByWindows(port).get(), e.getValue(), target, Hints.FILE);
             } else {
                 Out.line(out, "ports     %d (%s) is taken by a program on this machine, not a container: stop it first", port, e.getValue());
             }
@@ -435,7 +465,7 @@ public final class DoctorCommand implements Callable<Integer> {
 
         var services = stack.app.stream().map(s -> new Environment.Service(s.name(), s.modulePath(), s.recordedEnvironment(), s.unrecorded(), s.consumer())).toList();
         return new Environment(repo.getFileName().toString(),
-            new Environment.Compose(compose, profile, config.project(), files.size() > 1 ? files.get(1) : null), services,
+            new Environment.Compose(compose, profile, config.project(), files.size() > composeFiles.size() ? files.getLast() : null), services,
             new Environment.Kafka(stack.kafka.name(), List.copyOf(stack.kafkaAddresses), kafka.host(), kafka.how()), databases,
             partitions.entrySet().stream().map(t -> new Environment.Topic(t.getKey(), t.getValue())).toList(), groups, Instant.now().toString());
     }

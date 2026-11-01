@@ -59,6 +59,11 @@ final class AppStack {
     final List<String> notes = new ArrayList<>();
     /** Services of the app the hints leave out. */
     final List<String> skipped = new ArrayList<>();
+    /**
+     * Other services the app's settings name by host, such as a schema registry or a load balancer in front of another
+     * of its services: they must run for the app to work, though no depends_on says so.
+     */
+    final Set<String> reached = new TreeSet<>();
     ComposeConfig.Service kafka;
 
     private AppStack(ComposeConfig config) {
@@ -73,7 +78,10 @@ final class AppStack {
         return read(repo, config, raw, List.of());
     }
 
-    /** @param skip services of the app to leave out, from the hints */
+    /**
+     * @param skip services to leave out, from the hints: of the app, or a helper off the journeys Faultline tests, such
+     *             as a Kafka Connect whose connector a script registers by hand
+     */
     static AppStack read(Path repo, ComposeConfig config, ComposeConfig raw, List<String> skip) throws IOException {
         var stack = new AppStack(config);
         var modules = new TreeMap<String, Path>();
@@ -87,7 +95,9 @@ final class AppStack {
             if (!modules.containsKey(s.name()) && images.containsKey(s.image())) modules.put(s.name(), images.get(s.image()));
         }
         for (String name : skip) {
-            if (modules.remove(name) == null) throw new IllegalArgumentException(Hints.FILE + ": skip names " + name + ", which is no service of the app");
+            if (modules.remove(name) == null && !config.services().containsKey(name)) {
+                throw new IllegalArgumentException(Hints.FILE + ": skip names " + name + ", which is no service of the Compose file");
+            }
             stack.skipped.add(name);
         }
 
@@ -118,7 +128,25 @@ final class AppStack {
                 List.copyOf(unrecorded), consumer, groups, port));
         }
         for (var s : stack.app) stack.reaches(s);
+        var own = new TreeSet<String>(stack.app.stream().map(AppService::name).toList());
+        if (stack.kafka != null) own.add(stack.kafka.name());
+        stack.databases.forEach(d -> own.add(d.service().name()));
+        for (var s : stack.app) {
+            // resolved, since a URL is often built from other settings: http://${product-service.name}:80
+            for (String host : hostsIn(s.config().asResolvedText())) {
+                config.reachedAt(host).map(ComposeConfig.Service::name).filter(n -> !own.contains(n) && !stack.skipped.contains(n)).ifPresent(stack.reached::add);
+            }
+        }
         return stack;
+    }
+
+    private static final Pattern HOST = Pattern.compile("(?:^|[=/@,\\s])([A-Za-z][A-Za-z0-9_.-]*):(\\d{2,5})\\b");
+
+    /** The host names a configuration names with a port, such as schema-registry in http://schema-registry:8081. */
+    static Set<String> hostsIn(String config) {
+        var hosts = new TreeSet<String>();
+        HOST.matcher(config).results().forEach(m -> hosts.add(m.group(1)));
+        return hosts;
     }
 
     /** The Spring Boot module a service builds, if it builds one of the repo's. */

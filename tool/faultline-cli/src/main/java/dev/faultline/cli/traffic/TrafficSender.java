@@ -83,10 +83,13 @@ public final class TrafficSender implements AutoCloseable {
         if (!isReachable()) throw new IllegalStateException("nothing is answering at " + target + " (is the app running?)");
     }
 
-    /** Sends every request at {@code ratePerSecond}, records each outcome, and returns once all have finished. */
+    /**
+     * Sends every request at {@code ratePerSecond}, records each outcome, and returns once all have finished. A path
+     * with {name} in it, such as /cart/{userId}/checkout, takes each request's value from its body's field of that name.
+     */
     public Duration send(List<Request> requests, String method, String path, int ratePerSecond, HistoryLog history)
             throws InterruptedException {
-        URI endpoint = target.resolve(path);
+        URI endpoint = Workload.pathVariables(path).isEmpty() ? target.resolve(path) : null;
         long intervalNanos = 1_000_000_000L / ratePerSecond;
         long start = System.nanoTime();
         try (var inFlight = Executors.newVirtualThreadPerTaskExecutor()) {
@@ -97,7 +100,8 @@ public final class TrafficSender implements AutoCloseable {
                     TimeUnit.NANOSECONDS.sleep(wait);
                 }
                 Request r = requests.get(i);
-                inFlight.submit(() -> history.append(sendOne(endpoint, method, r)));
+                URI to = endpoint != null ? endpoint : target.resolve(Workload.pathOf(path, r.body()));
+                inFlight.submit(() -> history.append(sendOne(to, method, r)));
             }
         } // closing the executor waits for every in-flight request
         return Duration.ofNanos(System.nanoTime() - start);

@@ -92,7 +92,7 @@ final class FaultTemplate {
                     new Plan.Fault("service", null, null, "outage", null, null, "6s", null, "5s"),
                     checks(Plan.RECOVERY_WITHIN), new Traffic(2000, 100, null, "60s"), null, Map.of(), null, "30s", List.of(), true);
             }
-            case "P7" -> p7(risk, app, listener, topic);
+            case "P7" -> p7(risk, app, d, listener, topic);
             case "P8" -> p8(risk, app, d, on);
             default -> throw new IllegalStateException("there is no fault template for pattern " + risk.pattern() + " yet");
         };
@@ -117,12 +117,31 @@ final class FaultTemplate {
             checks(), new Traffic(100, 5, 30, null), null, Map.of(), null, null, List.of(), false);
     }
 
-    /** The relay sits between the topic the app sends to and the one its listener reads, and corrupts one message. */
-    private static Test p7(Risk risk, App app, Method listener, String topic) {
-        String key = app.code().topicSetting(topic).orElseThrow(() -> new IllegalStateException(
-            "cannot test %s at %s: the app sends to %s under a fixed name, so Faultline cannot put its relay in front of %s"
-                .formatted(risk.pattern(), risk.location(), topic, listener.handler())));
+    /**
+     * The relay sits between the topic the app sends to and the one its listener reads, and corrupts one message. A
+     * setting of the app moves its sends to the relay; when the code names the topic, the agent in each service that
+     * sends to it renames the topic instead.
+     */
+    private static Test p7(Risk risk, App app, Deployment d, Method listener, String topic) {
         String from = topic + RELAY_SUFFIX;
+        var key = app.code().topicSetting(topic);
+        if (key.isEmpty()) {
+            var senders = app.code().methods().stream().filter(m -> app.code().sentTopics(m).contains(topic)).map(Method::module).distinct()
+                .flatMap(module -> d.servicesOf(module).stream()).distinct().toList();
+            if (d.compose() == null || senders.isEmpty()) {
+                throw new IllegalStateException(("cannot test %s at %s: the app sends to %s under a fixed name, so only the agent in the service that sends it "
+                    + "could move it to Faultline's relay, and %s").formatted(risk.pattern(), risk.location(), topic,
+                    d.compose() == null ? "that takes the app run with Docker Compose (plan --compose)" : "no service of the deployment sends to it"));
+            }
+            return new Test("send what %s sends to %s through Faultline's relay (the agent renames the topic to %s) and corrupt the 300th, once"
+                    .formatted(String.join(", ", senders), topic, from),
+                new Plan.Fault("messaging", null, null, "corrupt", 300L, 1, null, null, null),
+                checks(), new Traffic(2000, 100, null, "30s"), new Plan.Relay(from, topic, senders), Map.of(), null, null, List.of(), false);
+        }
+        return p7(risk, app, listener, topic, key.get(), from);
+    }
+
+    private static Test p7(Risk risk, App app, Method listener, String topic, String key, String from) {
         // the setting must move the sender only: if the listener read it too, the relay would forward to a topic nobody reads
         var moved = app.withSettings(Map.of(key, from)).code().endpoints().stream()
             .filter(e -> e.kind() == Endpoint.Kind.KAFKA && e.handler().equals(listener.handler())).findFirst();
@@ -136,13 +155,27 @@ final class FaultTemplate {
             checks(), new Traffic(2000, 100, null, "30s"), new Plan.Relay(from, topic), Map.of(key, from), null, null, List.of(), false);
     }
 
-    /** A crash just before the method that sends the event. */
+    /**
+     * A crash just before the method that sends the event; for a listener whose @SendTo publishes what it returns, the
+     * moment it returns, before Spring Kafka sends the reply.
+     */
     private static Test p8(Risk risk, App app, Deployment d, String on) {
         Method m = method(app, risk);
         var own = app.code().withOwnCallees(m);
         // the method that makes the send, deepest first: a crash before the risky method itself could come before the save
         Method sender = own.stream().skip(1).filter(x -> !app.code().sends(x).isEmpty()).findFirst()
             .orElse(app.code().sends(m).isEmpty() ? null : m);
+        if (sender == null && app.code().replies(m)) {
+            var replyTo = app.code().replyTopics(m);
+            if (replyTo.isEmpty()) {
+                throw new IllegalStateException("cannot test %s at %s: its @SendTo names no topic, so each message's reply-topic header decides where the reply goes"
+                    .formatted(risk.pattern(), risk.location()));
+            }
+            return new Test("crash %s the moment %s returns, before Spring Kafka sends its reply to %s, on every %dth message, %d times"
+                    .formatted(on, m.handler(), replyTo.getFirst(), 100, CRASHES),
+                new Plan.Fault(null, m.handler(), "after", "crash", 100L, CRASHES, null, d.faultTarget(), null),
+                checks(Plan.NO_LOST_DOWNSTREAM), new Traffic(3000, 100, null, null), null, Map.of(), replyTo.getFirst(), null, List.of(), false);
+        }
         if (sender == null) throw new IllegalStateException("cannot test %s at %s: it publishes nothing Faultline can see".formatted(risk.pattern(), risk.location()));
         var topics = app.code().sentTopics(sender);
         if (topics.isEmpty()) throw new IllegalStateException("cannot tell which topic %s publishes to".formatted(sender.handler()));

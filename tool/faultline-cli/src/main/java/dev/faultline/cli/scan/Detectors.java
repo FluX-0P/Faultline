@@ -80,23 +80,32 @@ final class Detectors {
         var found = new ArrayList<Candidate>();
         for (var listener : code.kafkaListeners()) {
             boolean autoCommit = config.apply(listener).get("spring.kafka.consumer.enable-auto-commit").map("true"::equals).orElse(false);
-            var handOffs = calls(listener).stream().filter(c -> HAND_OFF.contains(c.getNameAsString()))
+            // in the listener or in a method of its own class it calls, such as a batch listener's method for one record
+            var handOffs = code.withOwnCallees(listener).stream().flatMap(m -> calls(m).stream()).filter(c -> HAND_OFF.contains(c.getNameAsString()))
                 .map(c -> c.getScope().map(s -> s + ".").orElse("") + c.getNameAsString() + "(...)").distinct().toList();
             if (!handOffs.isEmpty()) {
-                found.add(new Candidate("P2", listener, "a Kafka listener that hands work to " + String.join(", ", handOffs)));
+                found.add(new Candidate("P2", listener, listenerKind(listener) + " that hands work to " + String.join(", ", handOffs)));
             } else if (autoCommit) {
-                found.add(new Candidate("P2", listener, "a Kafka listener, with spring.kafka.consumer.enable-auto-commit=true"));
+                found.add(new Candidate("P2", listener, listenerKind(listener) + ", with spring.kafka.consumer.enable-auto-commit=true"));
             }
         }
         return found;
     }
 
+    /**
+     * "a Kafka listener", or for one that takes a whole poll "a batch Kafka listener (the container commits the whole
+     * batch once it returns)".
+     */
+    private String listenerKind(Method listener) {
+        return code.isBatchListener(listener) ? "a batch Kafka listener (the container commits the whole batch once it returns)" : "a Kafka listener";
+    }
+
     List<Candidate> p3() {
         var found = new LinkedHashMap<String, Candidate>();
         for (var listener : code.kafkaListeners()) {
-            var work = code.calledMethods(listener);
+            var work = code.workOf(listener);
             if (work.isEmpty()) {
-                found.putIfAbsent(listener.handler(), new Candidate("P3", listener, "a Kafka listener that does its work itself"));
+                found.putIfAbsent(listener.handler(), new Candidate("P3", listener, listenerKind(listener) + " that does its work itself"));
             }
             for (var m : work) {
                 found.putIfAbsent(m.handler(), new Candidate("P3", m, "the method the Kafka listener " + listener.handler() + " calls to do its work", listener));
@@ -172,7 +181,7 @@ final class Detectors {
         found.forEach(c -> configured.add(c.method().module()));
         for (var listener : code.kafkaListeners()) {
             if (!configured.contains(listener.module()) && !configured.contains(null)) {
-                found.add(new Candidate("P7", listener, "a Kafka listener, and the app configures no error handling of its own"));
+                found.add(new Candidate("P7", listener, listenerKind(listener) + ", and the app configures no error handling of its own"));
             }
         }
         return found;
@@ -181,7 +190,13 @@ final class Detectors {
     List<Candidate> p8() {
         var found = new ArrayList<Candidate>();
         for (var m : code.methods()) {
-            if (!publishes(m)) continue;
+            if (!publishes(m)) {
+                // a @SendTo reply: Spring Kafka publishes what the listener returns, after its work, often done in another class
+                var writes = code.replies(m) ? writes(m, 2) : Optional.<String>empty();
+                writes.ifPresent(w -> found.add(new Candidate("P8", m, "a Kafka listener that writes %s and returns a reply, which @SendTo%s publishes once it has returned"
+                    .formatted(w, code.replyTopics(m).isEmpty() ? "" : "(" + String.join(", ", code.replyTopics(m)) + ")"))));
+                continue;
+            }
             var d = m.declaration();
             if (d.getAnnotationByName("TransactionalEventListener").isPresent() || d.getAnnotationByName("EventListener").isPresent()) {
                 found.add(new Candidate("P8", m, "an event listener that publishes once the code that raised the event has run" + via(m)));
@@ -197,9 +212,26 @@ final class Detectors {
         return found;
     }
 
-    /** The app's methods that send through a Kafka producer: where its messages, and their IDs, come from. */
+    /**
+     * What the method writes, itself, through the methods of its own class it calls, or through the app's methods it
+     * calls up to {@code depth} calls deep: the tables its SQL writes, or "to a repository" for a save call.
+     */
+    private Optional<String> writes(Method m, int depth) {
+        var own = code.withOwnCallees(m);
+        var written = SqlTables.written(own.stream().flatMap(x -> JavaSources.strings(x).stream()).toList());
+        if (!written.isEmpty()) return Optional.of(String.join(", ", written));
+        if (own.stream().flatMap(x -> calls(x).stream()).anyMatch(c -> c.getNameAsString().startsWith("save"))) return Optional.of("to a repository");
+        if (depth == 0) return Optional.empty();
+        for (var callee : code.workOf(m)) {
+            var w = writes(callee, depth - 1);
+            if (w.isPresent()) return w;
+        }
+        return Optional.empty();
+    }
+
+    /** The app's methods that send through a Kafka producer or reply with @SendTo: where its messages, and their IDs, come from. */
     List<Method> publishers() {
-        return code.methods().stream().filter(m -> !code.sends(m).isEmpty()).toList();
+        return code.methods().stream().filter(m -> !code.sends(m).isEmpty() || code.replies(m)).toList();
     }
 
     /** Whether the method, or a method of its own class it calls, sends through a Kafka producer. */

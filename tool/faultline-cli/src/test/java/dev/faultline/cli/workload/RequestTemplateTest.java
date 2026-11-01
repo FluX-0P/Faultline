@@ -44,6 +44,16 @@ class RequestTemplateTest {
     }
 
     @Test
+    void seqAndSeedCanBePaddedWithZerosToAFixedLength() {
+        var uuid = RequestTemplate.parse("00000000-0000-0000-${seq:4}-${seed:12}");
+
+        assertThat(uuid.render(319008, 17, new Random(1))).isEqualTo("00000000-0000-0000-0017-000000319008");
+        // more digits than the width: as they are
+        assertThat(RequestTemplate.parse("${seq:2}").render(42, 1234, new Random(1))).isEqualTo("1234");
+        assertThatThrownBy(() -> RequestTemplate.parse("${seq:0}")).hasMessageContaining("at least 1");
+    }
+
+    @Test
     void theIdMustBeInTheBody() {
         assertThatThrownBy(() -> Workload.generate(RequestTemplate.parse("{\"a\":1}"), "paymentId", 1, 1))
             .hasMessageContaining("no field 'paymentId'");

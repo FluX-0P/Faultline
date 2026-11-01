@@ -52,6 +52,7 @@ import dev.faultline.cli.source.RequestShape;
 import dev.faultline.cli.source.RequestShapes;
 import dev.faultline.cli.source.SpringConfig;
 import dev.faultline.cli.workload.RequestTemplate;
+import dev.faultline.cli.workload.Workload;
 import dev.faultline.cli.understand.AppMap;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Model.CommandSpec;
@@ -59,6 +60,7 @@ import picocli.CommandLine.Option;
 import picocli.CommandLine.Parameters;
 import picocli.CommandLine.Spec;
 import tools.jackson.core.JacksonException;
+import tools.jackson.databind.node.ObjectNode;
 
 @Command(name = "plan", mixinStandardHelpOptions = true,
     description = {"Turn the app map and a risk into a test plan, show it, and ask you to approve it: .faultline/<app>/plan.yaml.",
@@ -138,7 +140,8 @@ public final class PlanCommand implements Callable<Integer> {
     @Option(names = "--risk", paramLabel = "ID", description = "Plan for this risk from risks.json (default: the highest-ranked one Faultline can test)")
     String riskId;
 
-    @Option(names = "--compose", paramLabel = "FILE", description = "Run the app as the services of this Compose file, such as deploy/docker-compose.yml (default: from its jar)")
+    @Option(names = "--compose", paramLabel = "FILE", description = "Run the app as the services of this Compose file, such as deploy/docker-compose.yml, "
+        + "or of several, comma-separated, read in that order (default: from its jar)")
     String compose;
 
     @Option(names = "--profile", description = "The Compose profile the app's services are in, such as demo")
@@ -250,11 +253,16 @@ public final class PlanCommand implements Callable<Integer> {
         }
         // doctor's override reaches Kafka and the databases from this machine, for the Compose file it booted
         String override = app.runtime().map(Environment::compose)
-            .filter(c -> Path.of(c.file()).toAbsolutePath().normalize().equals(Path.of(compose).toAbsolutePath().normalize()))
+            .filter(c -> absolute(c.file()).equals(absolute(compose)))
             .map(Environment.Compose::override).orElse(null);
         var modules = app.modules().stream().map(m -> new Deployment.Module(m.path(), port(m.config()),
             app.code().kafkaListeners().stream().anyMatch(l -> m.path().equals(l.module())))).toList();
         return Deployment.compose(compose, override, profile, appDir, modules, hints);
+    }
+
+    /** Compose files, one or several comma-separated, as absolute paths: the same files however they are written. */
+    private static List<Path> absolute(String files) {
+        return Plan.Compose.appFiles(files).stream().map(f -> Path.of(f).toAbsolutePath().normalize()).toList();
     }
 
     private static int port(SpringConfig config) {
@@ -411,6 +419,7 @@ public final class PlanCommand implements Callable<Integer> {
             effectDatabase = f.databaseOf(d.effect().table()).map(Db::name).orElse(null);
             databases = databases(f, reset, rules, effectDatabase);
         } else {
+            if (Plan.files(f.seedFile()).size() > 1) throw new IllegalArgumentException("the app has one database, so " + Hints.FILE + " names one seed file");
             database = new Plan.Database(f.dbUrl(), f.dbUser(), f.dbPassword(), reset, f.seedFile());
         }
         return new Plan(appName, d.journey(), aim.risk(),
@@ -437,27 +446,47 @@ public final class PlanCommand implements Callable<Integer> {
         for (String sql : reset) {
             resetTable(sql).flatMap(f::databaseOf).ifPresent(db -> statements.computeIfAbsent(db.name(), k -> new ArrayList<>()).add(sql));
         }
-        String seedDatabase = null;
-        if (f.seedFile() != null) {
+        // each seed file goes to the database it writes to first, such as the products of one service and the carts of another
+        var seeds = new LinkedHashMap<String, String>();
+        for (String seed : Plan.files(f.seedFile())) {
             try {
-                var first = INSERT.matcher(Files.readString(Path.of(f.seedFile()), StandardCharsets.UTF_8));
-                if (first.find()) seedDatabase = f.databaseOf(first.group(1)).map(Db::name).orElse(null);
+                var first = SEEDED.matcher(Files.readString(Path.of(seed), StandardCharsets.UTF_8));
+                var db = first.find() ? f.databaseOf(first.group(1)).map(Db::name).orElse(null) : null;
+                if (db == null) continue;
+                String other = seeds.putIfAbsent(db, seed);
+                if (other != null) throw new IllegalArgumentException("the seed files " + other + " and " + seed + " both load into " + db + ": make them one file");
             } catch (IOException e) {
-                throw new UncheckedIOException("cannot read " + f.seedFile(), e);
+                throw new UncheckedIOException("cannot read " + seed, e);
             }
         }
         var used = new HashSet<>(statements.keySet());
         if (effectDatabase != null) used.add(effectDatabase);
-        if (seedDatabase != null) used.add(seedDatabase);
+        used.addAll(seeds.keySet());
         rules.stream().map(Plan.Rule::database).filter(java.util.Objects::nonNull).forEach(used::add);
         var databases = new ArrayList<Plan.Database>();
         for (var db : f.databases()) {
             if (!used.contains(db.name())) continue;
             databases.add(new Plan.Database(db.name(), db.url(), db.user(), db.password(), statements.getOrDefault(db.name(), List.of()),
-                db.name().equals(seedDatabase) ? f.seedFile() : null));
+                seeds.get(db.name())));
         }
         return databases;
     }
+
+    /** The tables the seed files insert into, lower case. */
+    private static Set<String> seedTables(Facts f) {
+        var tables = new TreeSet<String>();
+        for (String seed : Plan.files(f.seedFile())) {
+            try {
+                INSERT.matcher(Files.readString(Path.of(seed), StandardCharsets.UTF_8)).results().forEach(m -> tables.add(m.group(1).toLowerCase(Locale.ROOT)));
+            } catch (IOException e) {
+                throw new UncheckedIOException("cannot read " + seed, e);
+            }
+        }
+        return tables;
+    }
+
+    /** The table a seed file writes to first: INSERT INTO a, or UPDATE a, such as giving seeded rows IDs of a known form. */
+    private static final Pattern SEEDED = Pattern.compile("(?i)\\b(?:insert\\s+into|update)\\s+([A-Za-z_][A-Za-z0-9_.]*)");
 
     /** The table a reset statement works on: TRUNCATE a, DELETE FROM a, UPDATE a SET. */
     static Optional<String> resetTable(String sql) {
@@ -492,11 +521,18 @@ public final class PlanCommand implements Callable<Integer> {
         boolean known = http.stream().anyMatch(e -> e.path().equals(d.request().path())
             && (e.method().equals(d.request().method()) || e.method().equals("ANY")));
         if (!known) {
-            problems.add("%s %s is not an endpoint in the code (endpoints: %s)".formatted(d.request().method(), d.request().path(),
-                http.stream().map(Endpoint::name).collect(Collectors.joining(", "))));
+            // a path with its IDs written in, such as /cart/0000-${seq}/checkout for /cart/{userId}/checkout
+            var meant = http.stream().filter(e -> e.method().equals(d.request().method()) && withIdsIn(e.path(), d.request().path())).findFirst();
+            if (meant.isPresent()) {
+                problems.add("%s %s writes the IDs into the path: write it as the endpoint is, %s, and put %s in the body as fields of those names; Faultline fills the path from them"
+                    .formatted(d.request().method(), d.request().path(), meant.get().path(), String.join(" and ", Workload.pathVariables(meant.get().path()))));
+            } else {
+                problems.add("%s %s is not an endpoint in the code (endpoints: %s)".formatted(d.request().method(), d.request().path(),
+                    http.stream().map(Endpoint::name).collect(Collectors.joining(", "))));
+            }
         }
         var shape = shapeOf(facts, d.request().method(), d.request().path());
-        if (shape != null && d.request().body() != null) problems.addAll(bodyProblems(d.request().body(), shape));
+        if (shape != null && d.request().body() != null) problems.addAll(bodyProblems(d.request().body(), shape, Workload.pathVariables(d.request().path())));
         if (d.answerField() != null) {
             var answer = RequestShapes.answers(app).get(d.request().method() + " " + d.request().path());
             if (answer != null && !answer.contains(d.answerField())) {
@@ -518,9 +554,11 @@ public final class PlanCommand implements Callable<Integer> {
         if (!inserted.isEmpty() && !inserted.contains(d.effect().table().toLowerCase(Locale.ROOT))) {
             problems.add("effect.table '%s' is not a table the journey's code inserts into (%s)".formatted(d.effect().table(), String.join(", ", inserted)));
         }
+        var seeded = seedTables(facts);
         for (String table : inserted) {
             if (d.reset().stream().noneMatch(s -> clears(table).matcher(s).find())) {
-                problems.add("reset does not empty " + table + ", which the journey's code inserts into: rows left by one run would break the next");
+                problems.add("reset does not empty " + table + ", which the journey's code inserts into: rows left by one run would break the next"
+                    + (seeded.contains(table) ? "; empty it too: the seed file loads its test data back after every reset" : ""));
             }
         }
         for (String table : seededTables(app)) {
@@ -574,10 +612,17 @@ public final class PlanCommand implements Callable<Integer> {
     static Optional<Method> entry(App app, AppMap map, PlanDraft d) {
         var steps = map.journeys().stream().filter(j -> j.name().equals(d.journey())).flatMap(j -> j.steps().stream()).map(AppMap.Step::handler)
             .collect(Collectors.toSet());
+        // a path with the IDs written in still names its endpoint, so a first answer gets all its problems at once
         return httpEndpoints(app).stream()
-            .filter(e -> e.path().equals(d.request().path()) && (e.method().equals(d.request().method()) || e.method().equals("ANY")))
+            .filter(e -> (e.path().equals(d.request().path()) || withIdsIn(e.path(), d.request().path()))
+                && (e.method().equals(d.request().method()) || e.method().equals("ANY")))
             .sorted(Comparator.comparing(e -> !steps.contains(e.handler())))
             .flatMap(e -> app.code().method(e.handler()).stream()).findFirst();
+    }
+
+    /** Whether {@code path} is the endpoint's {@code template} with values written in for its {name}s. */
+    static boolean withIdsIn(String template, String path) {
+        return !Workload.pathVariables(template).isEmpty() && path.matches(Pattern.quote(template).replaceAll("\\{[^}/]+}", "\\\\E[^/]+\\\\Q"));
     }
 
     /** Tables the methods of these types write through JPA repositories. */
@@ -592,6 +637,11 @@ public final class PlanCommand implements Callable<Integer> {
      * tried too. A template that does not even parse is left to Plan#problems, which says why.
      */
     static List<String> bodyProblems(String body, RequestShape shape) {
+        return bodyProblems(body, shape, List.of());
+    }
+
+    /** The same, for a path whose {name}s the body's fields of those names fill: they are not part of the body's shape. */
+    static List<String> bodyProblems(String body, RequestShape shape, List<String> pathFields) {
         RequestTemplate template;
         try {
             template = RequestTemplate.parse(body);
@@ -603,7 +653,9 @@ public final class PlanCommand implements Callable<Integer> {
         for (int seq = 0; seq < BODY_SAMPLES && problems.size() < 10; seq++) {
             String rendered = template.render(42, seq, random);
             try {
-                problems.addAll(shape.problems(Json.MAPPER.readTree(rendered)));
+                var json = Json.MAPPER.readTree(rendered);
+                if (json instanceof ObjectNode o) pathFields.forEach(o::remove);
+                problems.addAll(shape.problems(json));
             } catch (JacksonException e) {
                 return List.of();   // not JSON: Plan#problems says so
             }
@@ -839,14 +891,22 @@ public final class PlanCommand implements Callable<Integer> {
                 as a customer by its ID) is a JSON string holding a value that exists. Name a request field of a nested object as \
                 a.b, such as address.street.""");
         }
+        if (http.stream().anyMatch(e -> !Workload.pathVariables(e.path()).isEmpty())) {
+            prompt.line("""
+                Write a path with {name} in it as it is, such as /cart/{userId}/checkout: Faultline fills each {name} from the \
+                body's field of that name, so the body has that field, also for an endpoint that takes no body of its own. \
+                ${seq:N} and ${seed:N} pad with zeros to N digits, for an ID of a fixed form the test data must also have, \
+                such as the UUID 00000000-0000-0000-${seq:4}-${seed:12} (a run's seed has up to 6 digits). A test data \
+                file may use ${seed} too: Faultline fills in the run's seed before it loads it.""");
+        }
         prompt
             .code("Their handlers and request types", "java", handlerTypes.values().stream().map(app.code()::source).collect(Collectors.joining("\n\n")))
             .code("The listener " + aim.listener().handler() + ", the classes its work goes through, and the risky code", "java",
                 journeyTypes.values().stream().map(app.code()::source).collect(Collectors.joining("\n\n")))
             .files("Database migrations", app.files().migrations(), "sql")
             .code(Environment.SCHEMA_TITLE, "sql", app.liveSchema());
-        if (facts.seedFile() != null) {
-            prompt.code("Test data Faultline loads after every reset (" + facts.seedFile() + ")", "sql", Files.readString(Path.of(facts.seedFile()), StandardCharsets.UTF_8));
+        for (String seed : Plan.files(facts.seedFile())) {
+            prompt.code("Test data Faultline loads after every reset (" + seed + ")", "sql", Files.readString(Path.of(seed), StandardCharsets.UTF_8));
         }
         if (deployment.stub() != null) {
             prompt.code("The fake payment provider's ledger: one row per charge it made, in the same database", "sql", STUB_LEDGER);

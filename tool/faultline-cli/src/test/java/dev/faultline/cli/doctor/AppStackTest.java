@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import dev.faultline.cli.Out;
 import dev.faultline.cli.app.ComposeConfig;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -27,6 +28,37 @@ class AppStackTest {
         assertThat(byName.get("shipping").consumer()).isTrue();
         assertThat(byName.get("shipping").groups()).containsExactly("shipping");
         assertThat(byName.get("order").serverPort()).isEqualTo(8080);
+    }
+
+    @Test
+    void aServiceThatRunsAPrebuiltImageIsTheAppsOnceTheHintsBuildIt(@TempDir Path dir) throws Exception {
+        Path repo = TestStacks.shop(dir).toAbsolutePath().normalize();
+        String built = "\"shipping\": {\"build\": {\"context\": \"" + repo.resolve("shop/shipping").toString().replace("\\", "\\\\") + "\", \"dockerfile\": \"Dockerfile\"}";
+        var prebuilt = ComposeConfig.parse(TestStacks.config(dir, true).replace(built, "\"shipping\": {\"image\": \"shipping:local\""));
+        assertThat(AppStack.read(repo, prebuilt, prebuilt).app).extracting(AppStack.AppService::name).containsExactly("order");
+
+        var dockerfile = repo.resolve("shop/shipping/Dockerfile.svc");
+        var withBuild = prebuilt.withBuilds(Map.of("shipping", dockerfile));
+        var stack = AppStack.read(repo, withBuild, withBuild);
+
+        assertThat(stack.app).extracting(AppStack.AppService::name, AppStack.AppService::modulePath)
+            .containsExactly(tuple("order", "shop/order"), tuple("shipping", "shop/shipping"));
+        var reach = new Reach(port -> true);
+        reach.build("shipping", dockerfile);
+        assertThat(reach.override()).isEqualTo(Map.of("services", Map.of("shipping",
+            Map.of("build", Map.of("context", Out.path(repo.resolve("shop/shipping")), "dockerfile", "Dockerfile.svc")))));
+    }
+
+    @Test
+    void aServiceTheSettingsNameByHostAndPortIsOneTheAppReaches() {
+        var config = """
+            product-service-endpoint.url=http://traefik.local:80
+            spring.kafka.properties.schema.registry.url=http://schema-registry.local:18081
+            spring.datasource.url=jdbc:postgresql://cart-db:5432/app
+            server.port=8080
+            spring.application.name=cart""";
+
+        assertThat(AppStack.hostsIn(config)).containsExactly("cart-db", "schema-registry.local", "traefik.local");
     }
 
     @Test
@@ -114,7 +146,9 @@ class AppStackTest {
         assertThatThrownBy(() -> DoctorCommand.checkSkipped(List.of("order"), Set.of("apache", "shipping"), stack.config))
             .hasMessageContaining("cannot skip order: apache depends on it");
         DoctorCommand.checkSkipped(List.of("order"), Set.of("kafka", "postgres", "shipping", "zookeeper"), stack.config);
-        assertThatThrownBy(() -> AppStack.read(repo, stack.config, stack.config, List.of("kafka"))).hasMessageContaining("skip names kafka, which is no service of the app");
+        assertThatThrownBy(() -> AppStack.read(repo, stack.config, stack.config, List.of("mailer"))).hasMessageContaining("skip names mailer, which is no service of the Compose file");
+        // a helper off the journey may be left out too
+        assertThat(AppStack.read(repo, stack.config, stack.config, List.of("apache")).skipped).containsExactly("apache");
     }
 
     @Test

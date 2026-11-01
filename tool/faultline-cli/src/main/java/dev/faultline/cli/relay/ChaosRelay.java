@@ -3,6 +3,8 @@ package dev.faultline.cli.relay;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -15,17 +17,21 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
-import org.apache.kafka.common.serialization.StringDeserializer;
-import org.apache.kafka.common.serialization.StringSerializer;
+import org.apache.kafka.common.header.internals.RecordHeader;
+import org.apache.kafka.common.serialization.ByteArrayDeserializer;
+import org.apache.kafka.common.serialization.ByteArraySerializer;
 
+import dev.faultline.cli.check.Destroyed;
 import dev.faultline.cli.fault.Faults;
+import dev.faultline.cli.kafka.IdsInBytes;
 import dev.faultline.cli.kafka.Topics;
 import dev.faultline.cli.plan.Plan;
 
 /**
  * Sits between two topics during a run: reads what the app publishes to {@code from} and forwards it to {@code to},
- * keeping each message's key, and fires the plan's messaging fault on the way. Without a fault it just forwards, so
- * baseline runs see the same path. Each run uses a new consumer group that starts at the end of the topic.
+ * bytes as they are, with each message's key and headers, and fires the plan's messaging fault on the way. Without a
+ * fault it just forwards, so baseline runs see the same path. Each run uses a new consumer group that starts at the end
+ * of the topic. JSON, Avro or Protobuf: the relay never decodes a message, except to read a JSON one's request ID.
  */
 public final class ChaosRelay implements AutoCloseable {
     private static final Duration POLL = Duration.ofMillis(100);
@@ -35,8 +41,8 @@ public final class ChaosRelay implements AutoCloseable {
     private final Plan.Relay relay;
     private final String group = "faultline-relay-" + UUID.randomUUID();
     private final Chaos chaos;
-    private final KafkaConsumer<String, String> consumer;
-    private final KafkaProducer<String, String> producer;
+    private final KafkaConsumer<byte[], byte[]> consumer;
+    private final KafkaProducer<byte[], byte[]> producer;
     private final Consumer<String> print;
     private volatile boolean running = true;
     private volatile Exception failure;
@@ -60,12 +66,12 @@ public final class ChaosRelay implements AutoCloseable {
             ConsumerConfig.GROUP_ID_CONFIG, group,
             ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest",
             ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false),
-            new StringDeserializer(), new StringDeserializer());
+            new ByteArrayDeserializer(), new ByteArrayDeserializer());
         this.producer = new KafkaProducer<>(Map.of(
             ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap,
             ProducerConfig.ACKS_CONFIG, "all",
             ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true),
-            new StringSerializer(), new StringSerializer());
+            new ByteArraySerializer(), new ByteArraySerializer());
     }
 
     /** The relay's consumer group, for reading its lag. */
@@ -100,9 +106,17 @@ public final class ChaosRelay implements AutoCloseable {
             while (running) {
                 var records = consumer.poll(POLL);
                 var out = new ArrayList<Chaos.Message>();
-                for (var r : records) out.addAll(chaos.accept(new Chaos.Message(r.key(), r.value())));
+                for (var r : records) {
+                    var headers = new ArrayList<Chaos.Header>();
+                    r.headers().forEach(h -> headers.add(new Chaos.Header(h.key(), h.value())));
+                    out.addAll(chaos.accept(new Chaos.Message(r.key(), r.value(), headers, r.partition() + "@" + r.offset())));
+                }
                 if (records.isEmpty()) out.addAll(chaos.flush());
-                for (var m : out) producer.send(new ProducerRecord<>(relay.to(), m.key(), m.value())).get();
+                for (var m : out) {
+                    var record = new ProducerRecord<>(relay.to(), m.key(), m.value());
+                    m.headers().forEach(h -> record.headers().add(new RecordHeader(h.key(), h.value())));
+                    producer.send(record).get();
+                }
                 if (!records.isEmpty()) consumer.commitSync();
             }
         } catch (Exception e) {
@@ -118,9 +132,28 @@ public final class ChaosRelay implements AutoCloseable {
         chaos.armed(armed);
     }
 
-    /** Request IDs whose message the relay corrupted on purpose. */
+    /** Request IDs whose message the relay corrupted on purpose, when they are JSON. */
     public Set<String> corrupted() {
         return chaos.corrupted();
+    }
+
+    /**
+     * What the relay destroyed on purpose: the requests of the messages it corrupted. A binary message's request is
+     * found by the run's IDs in its key or value; one that names none of them is only counted.
+     *
+     * @param ids every ID of the run that a message may carry: the requests', and the ones the app answered with
+     */
+    public Destroyed destroyed(Collection<String> ids) {
+        var found = new LinkedHashSet<>(chaos.corrupted());
+        int unreadable = 0;
+        var search = new IdsInBytes(ids);
+        for (var m : chaos.unreadable()) {
+            var named = new LinkedHashSet<>(search.in(m.value()));
+            named.addAll(search.in(m.key()));
+            if (named.isEmpty()) unreadable++;
+            found.addAll(named);
+        }
+        return new Destroyed(found, unreadable);
     }
 
     /** Throws if the relay stopped forwarding. */
