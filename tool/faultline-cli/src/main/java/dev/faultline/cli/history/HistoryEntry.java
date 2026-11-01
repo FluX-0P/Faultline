@@ -15,7 +15,12 @@ public record HistoryEntry(
     Integer http,       // HTTP status code, null if no response came back
     String error,       // why there was no response, null otherwise
     Instant sentAt,
-    Instant doneAt) {
+    Instant doneAt,
+    String effect) {    // the ID the app's answer carries (correlate_by.response_field), null otherwise
+
+    public HistoryEntry(int index, String id, Status status, Integer http, String error, Instant sentAt, Instant doneAt) {
+        this(index, id, status, http, error, sentAt, doneAt, null);
+    }
 
     public enum Status {
         /** The app accepted it: the request definitely entered the system. */
@@ -27,7 +32,11 @@ public record HistoryEntry(
     }
 
     public static HistoryEntry response(Request r, Status status, int http, Instant sentAt, Instant doneAt) {
-        return new HistoryEntry(r.index(), r.id(), status, http, null, sentAt, doneAt);
+        return response(r, status, http, sentAt, doneAt, null);
+    }
+
+    public static HistoryEntry response(Request r, Status status, int http, Instant sentAt, Instant doneAt, String effect) {
+        return new HistoryEntry(r.index(), r.id(), status, http, null, sentAt, doneAt, effect);
     }
 
     public static HistoryEntry noResponse(Request r, Status status, String error, Instant sentAt, Instant doneAt) {

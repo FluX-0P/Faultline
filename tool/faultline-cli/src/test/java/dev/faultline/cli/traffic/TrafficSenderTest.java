@@ -36,4 +36,28 @@ class TrafficSenderTest {
             server.stop(0);
         }
     }
+
+    @Test
+    void aFormGetsItsJsonAsFieldsAndTheAnswerGivesTheIdTheAppMade() throws Exception {
+        var seen = new CopyOnWriteArrayList<String>();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/orders", exchange -> {
+            seen.add(exchange.getRequestHeaders().getFirst("Content-Type") + " " + new String(exchange.getRequestBody().readAllBytes()));
+            byte[] answer = "{\"order\": {\"id\": 42}}".getBytes();
+            exchange.sendResponseHeaders(201, answer.length);
+            exchange.getResponseBody().write(answer);
+            exchange.close();
+        });
+        server.start();
+        String base = "http://127.0.0.1:" + server.getAddress().getPort();
+        try (var sender = new TrafficSender(URI.create(base), Map.of(), TrafficSender.FORM, "order.id")) {
+            var entry = sender.sendOne(URI.create(base + "/orders"), "POST",
+                new Request(0, "Main St 1", "{\"customer\": \"1\", \"shippingAddress\": {\"street\": \"Main St 1\"}, \"orderLine\": [{\"count\": 2}]}"));
+
+            assertThat(seen).containsExactly(TrafficSender.FORM + " customer=1&shippingAddress.street=Main+St+1&orderLine%5B0%5D.count=2");
+            assertThat(entry.effect()).isEqualTo("42");
+        } finally {
+            server.stop(0);
+        }
+    }
 }

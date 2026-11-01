@@ -1,12 +1,14 @@
 package dev.faultline.cli.scan;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import com.github.javaparser.ast.expr.BooleanLiteralExpr;
@@ -17,6 +19,7 @@ import com.github.javaparser.ast.stmt.ForStmt;
 import com.github.javaparser.ast.stmt.Statement;
 import com.github.javaparser.ast.stmt.TryStmt;
 import com.github.javaparser.ast.stmt.WhileStmt;
+import dev.faultline.cli.source.App;
 import dev.faultline.cli.source.JavaSources;
 import dev.faultline.cli.source.JavaSources.Method;
 import dev.faultline.cli.source.SpringConfig;
@@ -42,11 +45,21 @@ final class Detectors {
     private static final Set<String> ERROR_HANDLERS = Set.of("DefaultErrorHandler", "SeekToCurrentErrorHandler", "CommonLoggingErrorHandler");
 
     private final JavaSources code;
-    private final SpringConfig config;
+    /** The configuration a method runs with: its module's. */
+    private final Function<Method, SpringConfig> config;
 
     Detectors(JavaSources code, SpringConfig config) {
+        this(code, m -> config);
+    }
+
+    private Detectors(JavaSources code, Function<Method, SpringConfig> config) {
         this.code = code;
         this.config = config;
+    }
+
+    /** The detectors for every module of the app, each judged by its own configuration. */
+    static Detectors of(App app) {
+        return new Detectors(app.code(), app::configOf);
     }
 
     /** Every candidate for every pattern, at most one per pattern and method. */
@@ -65,8 +78,8 @@ final class Detectors {
 
     List<Candidate> p2() {
         var found = new ArrayList<Candidate>();
-        boolean autoCommit = config.get("spring.kafka.consumer.enable-auto-commit").map("true"::equals).orElse(false);
         for (var listener : code.kafkaListeners()) {
+            boolean autoCommit = config.apply(listener).get("spring.kafka.consumer.enable-auto-commit").map("true"::equals).orElse(false);
             var handOffs = calls(listener).stream().filter(c -> HAND_OFF.contains(c.getNameAsString()))
                 .map(c -> c.getScope().map(s -> s + ".").orElse("") + c.getNameAsString() + "(...)").distinct().toList();
             if (!handOffs.isEmpty()) {
@@ -154,8 +167,11 @@ final class Detectors {
                 found.add(new Candidate("P7", m, "configures the Kafka listeners' error handling (" + (handlers.isEmpty() ? "setCommonErrorHandler" : String.join(", ", handlers)) + ")"));
             }
         }
-        if (found.isEmpty()) {
-            for (var listener : code.kafkaListeners()) {
+        // error handling set up in a module covers its own listeners; set up in the repo's shared code, it covers all
+        var configured = new HashSet<String>();
+        found.forEach(c -> configured.add(c.method().module()));
+        for (var listener : code.kafkaListeners()) {
+            if (!configured.contains(listener.module()) && !configured.contains(null)) {
                 found.add(new Candidate("P7", listener, "a Kafka listener, and the app configures no error handling of its own"));
             }
         }

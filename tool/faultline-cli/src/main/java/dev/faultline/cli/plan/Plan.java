@@ -8,6 +8,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -30,12 +31,21 @@ import tools.jackson.dataformat.yaml.YAMLWriteFeature;
  * the app, its database and Kafka, the traffic to send, how a request is matched to its effect, the fault, and the
  * checks, and how many runs it takes to confirm a bug. {@code risk}, {@code fault} and {@code confirm} are optional, so a
  * hand-written plan can be a plain fault-free run. {@code toxiproxy} and {@code stub} are the addresses Faultline drives
- * network faults and the fake payment provider through.
+ * network faults and the fake payment provider through. An app with one database has it under {@code database}; one
+ * whose journey goes through several services has each of their databases, by name, under {@code databases}.
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
-public record Plan(String app, String journey, Risk risk, Target target, Database database, Kafka kafka, Relay relay,
-                   String toxiproxy, String stub, Traffic traffic, CorrelateBy correlateBy, Downstream downstream, Order order,
+public record Plan(String app, String journey, Risk risk, Target target, Database database, List<Database> databases, Kafka kafka,
+                   Relay relay, String toxiproxy, String stub, Traffic traffic, CorrelateBy correlateBy, Downstream downstream, Order order,
                    Fault fault, List<String> checks, List<Rule> rules, String recoveryWithin, Confirm confirm) {
+
+    /** A plan with one database. */
+    public Plan(String app, String journey, Risk risk, Target target, Database database, Kafka kafka, Relay relay,
+                String toxiproxy, String stub, Traffic traffic, CorrelateBy correlateBy, Downstream downstream, Order order,
+                Fault fault, List<String> checks, List<Rule> rules, String recoveryWithin, Confirm confirm) {
+        this(app, journey, risk, target, database, null, kafka, relay, toxiproxy, stub, traffic, correlateBy, downstream, order, fault,
+            checks, rules, recoveryWithin, confirm);
+    }
 
     public static final List<String> DATA_CHECKS = List.of("no-lost", "no-duplicates", "no-unexpected");
     public static final String FAULTS_FIRED = "faults-fired";
@@ -88,18 +98,51 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
 
     /**
      * Services of a Compose file, recreated for each run with its settings. Faultline waits until {@code url} answers and
-     * the Kafka group has {@code consumers} members.
+     * the Kafka group has {@code consumers} members. {@code override} (may be null) is Faultline's own Compose file from
+     * faultline doctor, read after the app's: published database ports and a Kafka listener for this machine.
+     * {@code connect} (may be null) is the REST API of a Kafka Connect service among them, such as Debezium carrying an
+     * outbox to Kafka: Faultline also waits until each of its connectors runs. {@code flush} names Redis services the app
+     * keeps state in, such as the answers it gave per idempotency key: each reset empties them too, or a run would get the
+     * last run's answers.
      */
-    public record Compose(String file, String profile, List<String> services, Integer consumers) {}
+    public record Compose(String file, String profile, List<String> services, Integer consumers, String override, String connect,
+                          List<String> flush) {
+        public Compose(String file, String profile, List<String> services, Integer consumers) {
+            this(file, profile, services, consumers, null, null, null);
+        }
+
+        public Compose(String file, String profile, List<String> services, Integer consumers, String override) {
+            this(file, profile, services, consumers, override, null, null);
+        }
+
+        /** The Redis services Faultline empties at every reset; empty when there are none. */
+        public List<String> flushed() {
+            return flush == null ? List.of() : flush;
+        }
+
+        /** The Compose files, in the order Compose reads them. */
+        public List<String> files() {
+            return override == null ? List.of(file) : List.of(file, override);
+        }
+    }
 
     /**
      * {@code reset} puts the database back to its starting state before each run. {@code seedFile} (may be null) is SQL
      * that loads test data after every reset, once the app has created its tables; it must be able to run again, such as
-     * insert ... on conflict do nothing.
+     * insert ... on conflict do nothing. {@code name} tells the databases of a plan with several apart; the one database
+     * of a plan has none.
      */
-    public record Database(String url, String user, String password, List<String> reset, String seedFile) {
+    public record Database(String name, String url, String user, String password, List<String> reset, String seedFile) {
+        public Database(String url, String user, String password, List<String> reset, String seedFile) {
+            this(null, url, user, password, reset, seedFile);
+        }
+
         public Database(String url, String user, String password, List<String> reset) {
-            this(url, user, password, reset, null);
+            this(null, url, user, password, reset, null);
+        }
+
+        public List<String> resetStatements() {
+            return reset == null ? List.of() : reset;
         }
     }
 
@@ -142,11 +185,16 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
     /**
      * An app rule: SQL that must return no rows once the run is over. Each row it returns is an offender. A {@code drafted}
      * rule is the LLM's: it counts only once a baseline run without the fault has passed it, and one that fails there is
-     * dropped, since the rule is wrong, not the app. Take {@code drafted} out to vouch for a rule yourself.
+     * dropped, since the rule is wrong, not the app. Take {@code drafted} out to vouch for a rule yourself. {@code database}
+     * names the database it runs in, in a plan with several (null: the first).
      */
-    public record Rule(String id, String sql, String why, Boolean drafted) {
+    public record Rule(String id, String sql, String why, Boolean drafted, String database) {
+        public Rule(String id, String sql, String why, Boolean drafted) {
+            this(id, sql, why, drafted, null);
+        }
+
         public Rule(String id, String sql) {
-            this(id, sql, null, null);
+            this(id, sql, null, null, null);
         }
 
         // not isDrafted(): Jackson would take that for the drafted property and write drafted: false on every rule
@@ -155,10 +203,32 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
         }
     }
 
-    public record Request(String method, String path, String body) {}
+    /**
+     * The request that starts the journey. {@code body} is a JSON template; with {@code contentType}
+     * application/x-www-form-urlencoded Faultline sends it as form fields instead, nested as a.b and a[0] (null: JSON).
+     */
+    public record Request(String method, String path, String contentType, String body) {
+        public static final String FORM = "application/x-www-form-urlencoded";
 
-    /** A request's {@code requestField} value appears in {@code table}.{@code column} once the app has processed it. */
-    public record CorrelateBy(String requestField, String table, String column) {}
+        public Request(String method, String path, String body) {
+            this(method, path, null, body);
+        }
+
+        public boolean form() {
+            return FORM.equals(contentType);
+        }
+    }
+
+    /**
+     * A request's {@code requestField} value appears in {@code table}.{@code column} once the app has processed it. When
+     * the app makes the ID itself, {@code responseField} names where its JSON answer to the request carries it, and the
+     * column holds that ID instead. {@code database} names the table's database in a plan with several (null: the first).
+     */
+    public record CorrelateBy(String requestField, String responseField, String database, String table, String column) {
+        public CorrelateBy(String requestField, String table, String column) {
+            this(requestField, null, null, table, column);
+        }
+    }
 
     /**
      * A fault in the code ({@code layer: code}, the default) fires from the agent: {@code action} crash, delay, throw or
@@ -241,7 +311,7 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
             int r = runs != null ? runs : c.runs();
             c = new Confirm(r, baselines != null ? baselines : c.baselines(), Math.min(c.minFailing(), r));
         }
-        return new Plan(app, journey, risk, t, database, kafka, relay, toxiproxy, stub, tr, correlateBy, downstream, order, fault,
+        return new Plan(app, journey, risk, t, database, databases, kafka, relay, toxiproxy, stub, tr, correlateBy, downstream, order, fault,
             checks, rules, recoveryWithin, c);
     }
 
@@ -251,8 +321,27 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
      */
     public Plan withoutFault() {
         var c = checks.stream().filter(check -> !check.equals(FAULTS_FIRED) && !check.equals(RECOVERY_WITHIN)).toList();
-        return new Plan(app, journey, risk, target, database, kafka, relay, toxiproxy, stub, traffic, correlateBy, downstream, order,
+        return new Plan(app, journey, risk, target, database, databases, kafka, relay, toxiproxy, stub, traffic, correlateBy, downstream, order,
             null, c, rules, recoveryWithin, confirm);
+    }
+
+    /** The plan's databases: those under {@code databases}, or the one under {@code database}. */
+    public List<Database> allDatabases() {
+        if (databases != null) return databases;
+        return database == null ? List.of() : List.of(database);
+    }
+
+    /** The database a part of the plan names; null is the first, the only one in a plan with one database. */
+    public Database databaseNamed(String name) {
+        var all = allDatabases();
+        if (name == null) return all.isEmpty() ? null : all.getFirst();
+        return all.stream().filter(d -> name.equals(d.name())).findFirst()
+            .orElseThrow(() -> new IllegalArgumentException("no database named " + name + " in the plan"));
+    }
+
+    /** The database the effects table is in. */
+    public Database effectsDatabase() {
+        return databaseNamed(correlateBy == null ? null : correlateBy.database());
     }
 
     /** The plan's own confirm settings, or a single run without a baseline for plans that have none. */
@@ -286,8 +375,10 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
         return RequestTemplate.parse(traffic.request().body());
     }
 
+    /** The reset statements of the plan's first database. */
     public List<String> resetStatements() {
-        return database.reset() == null ? List.of() : database.reset();
+        var db = databaseNamed(null);
+        return db == null ? List.of() : db.resetStatements();
     }
 
     /** Everything wrong with the plan, in words a person editing it can act on. Empty if it can run. */
@@ -307,17 +398,28 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
             }
         }
 
-        if (database == null || blank(database.url())) {
-            problems.add("database.url is missing");
-        } else {
-            if (!database.url().startsWith("jdbc:postgresql:")) problems.add("database.url must be a jdbc:postgresql: URL (only Postgres for now)");
-            if (database.user() == null) problems.add("database.user is missing");
-            if (database.seedFile() != null && !database.seedFile().endsWith(".sql")) problems.add("database.seed_file must be a .sql file");
-            for (String sql : resetStatements()) {
-                if (!RESET_STATEMENT.matcher(sql.strip().replaceAll(";$", "")).matches()) {
-                    problems.add("database.reset: only single TRUNCATE, DELETE FROM and UPDATE statements are allowed, not: " + sql);
+        if (database != null && databases != null) {
+            problems.add("use database (one) or databases (several), not both");
+        } else if (databases != null) {
+            if (databases.isEmpty()) problems.add("databases is empty");
+            var names = new LinkedHashSet<String>();
+            for (var db : databases) {
+                if (blank(db.name()) || !names.add(db.name())) problems.add("every database of databases needs its own name");
+                problems.addAll(databaseProblems(db, "databases." + db.name()));
+            }
+            if (correlateBy != null && correlateBy.database() != null && !names.contains(correlateBy.database())) {
+                problems.add("correlate_by.database must name one of databases: " + String.join(", ", names));
+            }
+            for (Rule rule : rules == null ? List.<Rule>of() : rules) {
+                if (rule.database() != null && !names.contains(rule.database())) {
+                    problems.add("rule " + rule.id() + ": database must name one of databases: " + String.join(", ", names));
                 }
             }
+        } else if (database == null || blank(database.url())) {
+            problems.add("database.url is missing");
+        } else {
+            problems.addAll(databaseProblems(database, "database"));
+            if (correlateBy != null && correlateBy.database() != null) problems.add("correlate_by.database is only for a plan with databases");
         }
 
         if (kafka == null || blank(kafka.bootstrap()) || blank(kafka.topic()) || blank(kafka.group())) {
@@ -329,6 +431,7 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
         } else {
             if (!EffectsTable.isIdentifier(correlateBy.table())) problems.add("correlate_by.table is not a table name: " + correlateBy.table());
             if (!EffectsTable.isIdentifier(correlateBy.column())) problems.add("correlate_by.column is not a column name: " + correlateBy.column());
+            if (correlateBy.responseField() != null && blank(correlateBy.responseField())) problems.add("correlate_by.response_field is empty");
         }
 
         if (traffic == null || traffic.request() == null) {
@@ -340,6 +443,9 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
             var r = traffic.request();
             if (r.method() == null || !BODY_METHODS.contains(r.method())) problems.add("traffic.request.method must be POST, PUT or PATCH");
             if (r.path() == null || !r.path().startsWith("/")) problems.add("traffic.request.path must start with /");
+            if (r.contentType() != null && !r.form() && !r.contentType().equals("application/json")) {
+                problems.add("traffic.request.content_type must be application/json or " + Request.FORM);
+            }
             if (correlateBy != null && !blank(correlateBy.requestField())) problems.addAll(bodyProblems(r.body(), correlateBy.requestField()));
         }
 
@@ -357,8 +463,14 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
             var c = target.compose();
             if (c != null) {
                 if (blank(c.file())) problems.add("target.compose.file is missing");
+                if (c.override() != null && !Files.isRegularFile(Path.of(c.override()))) {
+                    problems.add("target.compose.override: no file at " + c.override() + " (run ./faultline doctor again)");
+                }
                 if (c.services() == null || c.services().isEmpty()) problems.add("target.compose.services is empty");
                 if (c.consumers() != null && c.consumers() < 0) problems.add("target.compose.consumers cannot be negative");
+                if (c.connect() != null && !c.connect().matches("https?://[^/]+/?")) {
+                    problems.add("target.compose.connect must be the address of Kafka Connect's REST API, such as http://localhost:8083");
+                }
             }
         }
 
@@ -479,6 +591,24 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
             if (relay == null) problems.add("a messaging fault needs a relay: from and to topics");
         } else {
             problems.add("fault.layer must be code, process, network, service, traffic or messaging");
+        }
+        return problems;
+    }
+
+    /** @param where how the plan names it, such as database or databases.shipping */
+    private static List<String> databaseProblems(Database db, String where) {
+        var problems = new ArrayList<String>();
+        if (blank(db.url())) {
+            problems.add(where + ".url is missing");
+            return problems;
+        }
+        if (!db.url().startsWith("jdbc:postgresql:")) problems.add(where + ".url must be a jdbc:postgresql: URL (only Postgres for now)");
+        if (db.user() == null) problems.add(where + ".user is missing");
+        if (db.seedFile() != null && !db.seedFile().endsWith(".sql")) problems.add(where + ".seed_file must be a .sql file");
+        for (String sql : db.resetStatements()) {
+            if (!RESET_STATEMENT.matcher(sql.strip().replaceAll(";$", "")).matches()) {
+                problems.add(where + ".reset: only single TRUNCATE, DELETE FROM and UPDATE statements are allowed, not: " + sql);
+            }
         }
         return problems;
     }

@@ -55,6 +55,8 @@ class RequestShapesTest {
             - shipTo: object
               - city: string, required
             - lines: array, of object
+              - sku: string
+              - weight: number, required
             - customer: string (uuid)
             - gift: boolean, required""");
         assertThat(shape.fields().get(5).items().fields()).extracting(RequestShape.Field::name).containsExactly("sku", "weight");

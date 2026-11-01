@@ -228,7 +228,7 @@ public final class BenchmarkCommand implements Callable<Integer> {
         var settings = bench.settings(bug);
         App app = App.read(Path.of(bench.appDir())).withSettings(settings);
         int port = Integer.parseInt(app.config().get("server.port").orElse("8080"));
-        Deployment deployment = Deployment.compose(bench.compose().file(), bench.compose().profile(), Path.of(bench.appDir()), port);
+        Deployment deployment = Deployment.compose(bench.compose().file(), null, bench.compose().profile(), Path.of(bench.appDir()), port);
         try {
             var drawn = PlanCommand.draw(app, map, risk.get(), deployment, Map.of(), Hints.read(Path.of(bench.appDir())), asker, out);
             Path planFile = dir.resolve("plan-" + bug.id() + ".yaml");

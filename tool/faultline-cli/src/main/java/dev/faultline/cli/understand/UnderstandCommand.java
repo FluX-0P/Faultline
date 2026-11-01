@@ -11,6 +11,7 @@ import dev.faultline.cli.Faultline;
 import dev.faultline.cli.Json;
 import dev.faultline.cli.Out;
 import dev.faultline.cli.Workspace;
+import dev.faultline.cli.app.Environment;
 import dev.faultline.cli.llm.Asker;
 import dev.faultline.cli.llm.Prompt;
 import dev.faultline.cli.llm.Schema;
@@ -49,7 +50,8 @@ public final class UnderstandCommand implements Callable<Integer> {
     @Override
     public Integer call() throws Exception {
         PrintWriter out = spec.commandLine().getOut();
-        App app = App.read(appDir);
+        App app = App.read(appDir, Environment.read(Workspace.forApp(appDir)).orElse(null));
+        if (app.environment() != null) Out.line(out, "doctor    judging %s as it runs, from %s", app.name(), Environment.FILE);
         for (String problem : app.code().problems()) Out.line(out, "warning   skipped %s", problem);
         List<Endpoint> endpoints = app.code().endpoints();
         Out.line(out, "read      %d Java files, %d endpoints, %d migrations, %d docs, %d build and compose files",
@@ -83,12 +85,19 @@ public final class UnderstandCommand implements Callable<Integer> {
         String endpointList = endpoints.stream()
             .map(e -> "- " + e.name() + (e.groupId() != null ? " (group " + e.groupId() + ")" : "") + " -> " + e.handler())
             .collect(Collectors.joining("\n"));
+        String modules = app.describeModules();
+        if (modules != null) {
+            modules += "\n\nA journey may cross them, such as an HTTP request to one whose work goes on in a Kafka listener of another. "
+                + "A class whose name two modules share is written module:Class in the outline; write its handlers the same way, as module:Class#method.";
+        }
         return new Prompt()
             .line("App folder: " + app.name())
+            .section("The repo's Spring Boot apps, each a service of its own", modules)
             .code("Code outline: every type, field, constructor and method, with annotations", "text", app.code().outline())
             .section("Endpoints found in the code", endpointList)
-            .code("Spring configuration (application.yml, flattened)", "properties", app.config().asText())
+            .codes(app.configSections("Spring configuration (application.yml, flattened)", app.modules()), "properties")
             .files("Database migrations", app.files().migrations(), "sql")
+            .code(Environment.SCHEMA_TITLE, "sql", app.liveSchema())
             .files("Build files", app.files().buildFiles(), "xml")
             .files("Compose files", app.files().composeFiles(), "yaml")
             .files("Docs", app.files().docs(), "markdown")

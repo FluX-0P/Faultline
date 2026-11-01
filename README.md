@@ -33,7 +33,7 @@ Faultline talks to any OpenAI-compatible LLM API; Google Gemini is the default. 
 
 ## Point Faultline at an app
 
-Four steps, each writing a file the next one reads. Everything about an app goes in `.faultline/<app>/`, outside the app itself.
+Four steps, each writing a file the next one reads. Everything about an app goes in `.faultline/<app>/`, outside the app itself. On a repo you did not write, start with `faultline doctor` (below).
 
 ```bash
 ./faultline understand demo-app   # LLM maps the app        -> .faultline/demo-app/app-map.json
@@ -62,6 +62,43 @@ Four steps, each writing a file the next one reads. Everything about an app goes
   `--compose deploy/docker-compose.yml --profile demo` runs the app as its Compose services: Faultline reads which of them consume from Kafka, where the API answers, and its helpers (P4 needs two workers, P5 and P6 the fake provider).
 
   It shows the plan and asks `Approve? [y / n / edit / review]`: `edit` opens the file, `review` goes through the fault, each check and each rule, and you keep (Enter) or drop (`n`) each one. Nothing is written until you approve.
+- **run** starts the app with the fault agent, sends the traffic, restarts the app after each planned crash, waits for Kafka lag 0, checks every request's effect and writes `report.html`. A plan says how often: by default 2 runs with the fault and 1 baseline run without it.
+
+LLM answers are cached in `.faultline/cache/`, so running a step again on an unchanged app costs no call. When an answer stays wrong after a retry, the question and both answers are kept in `.faultline/cache/failed/`.
+
+## Onboard a repo you did not write: faultline doctor
+
+```bash
+./faultline doctor ../microservice-kafka --compose ../microservice-kafka/docker/docker-compose.yml
+```
+
+`doctor` is the first command on a new repo. It says whether Faultline can test it, and why not: Spring Boot on Java 17 or newer, `@KafkaListener` consumers (not Spring Cloud Stream or RabbitMQ), a Postgres database (not H2, MySQL or MongoDB), a Compose service that builds the app, and a complete checkout (on Windows, a clone silently leaves out paths that are too long: clone with `git -c core.longpaths=true`). Exit code 1 means out of scope.
+
+Then it boots the stack once and writes `.faultline/<repo>/environment.json`, which `understand`, `scan` and `plan` read:
+
+- **the app's services**: those that build a Spring Boot module of the repo (the Dockerfile's folder, or the build context), each judged by its configuration as it runs: the module's files, the profiles `SPRING_PROFILES_ACTIVE` switches on, and its Compose environment (`SPRING_DATASOURCE_URL` sets `spring.datasource.url`). Values Compose fills in from your shell or `.env` are not written down.
+- **how Faultline reaches Kafka and each database from this machine**: a port the Compose file publishes, else Faultline's own override (`.faultline/<repo>/compose.faultline.yml`) publishes the database on 127.0.0.1 and gives Kafka a listener for this machine (apache/kafka, confluentinc/cp-kafka, bitnami/kafka and wurstmeister/kafka). The app's files stay as they are.
+- **the live schema** of every database, as the app made it (migrations, Liquibase or Hibernate's `ddl-auto`), with the rows each table started with and the first keys of those that have some (so requests refer to rows that exist), and the topics and consumer groups.
+
+Before booting it checks every port the stack publishes, and names the container that holds a taken one instead of moving it elsewhere; it also stops when a Dockerfile copies a jar that is not built yet, with the build command. Then it removes the stack again (`--keep` leaves it up). Exit code 2 means it could not run.
+
+## A repo of several services
+
+A repo that holds several Spring Boot apps (each a folder with a build file and an `@SpringBootApplication` class in `src/main/java`) is one app to Faultline, with a module per Spring Boot app. Run `doctor` first: `plan` needs it to know each service's database and how to reach it.
+
+```bash
+./faultline doctor ../microservice-kafka --compose ../microservice-kafka/docker/docker-compose.yml
+./faultline understand ../microservice-kafka
+./faultline scan ../microservice-kafka
+./faultline plan ../microservice-kafka --compose ../microservice-kafka/docker/docker-compose.yml
+```
+
+- **Each module is judged by its own configuration** and its calls resolve within it. A class whose name two modules share carries its module, `shipping:OrderKafkaListener#order`; every other handler stays `Class#method`.
+- **Journeys cross services**: an HTTP request to one, a Kafka listener in another. The scan's consumer-side review also sees the senders in other modules.
+- **Which service runs which module**, in this order: its build context is the module's folder, its Dockerfile is in the module's folder, its Dockerfile copies the module's jar, or `services:` in the hints says so.
+- **The plan points each part at its service**: the requests at the service of the endpoint's module, the Kafka group of the listener's module, a code fault on a service of the risky module. `databases:` has one database per service, and Faultline runs each reset statement, rule and effect check in the database that has its table (a rule reads the tables of one database). When the app makes the ID itself, `correlate_by.response_field` reads it from the app's JSON answer to each request.
+- **HTML forms**: a handler that binds a form (`post(Order order)`, no `@RequestBody`) gets `content_type: application/x-www-form-urlencoded`. The body template stays JSON and goes out as form fields: `{"address": {"street": "x"}, "lines": [{"count": 1}]}` is `address.street=x&lines[0].count=1`. A field a `Formatter` reads (a customer by its ID) is one text value.
+- **What else the journey goes through**: a Kafka Connect service (Debezium carrying an outbox to Kafka) is recreated with the app, and a run waits until each connector runs. A Redis the app's services point at is emptied at every reset, since it holds state a run leaves behind, such as answers by idempotency key.
 
 ## Onboard an app: faultline/hints.yaml
 
@@ -72,12 +109,16 @@ auth:                       # sent on every request
   header: Authorization
   value: Bearer ${env:SHOP_TOKEN}   # read from the environment or .env when the run starts, never written to a plan
 seed: seed.sql              # SQL next to this file, loaded after every reset: test data the requests refer to
+kafka:
+  bootstrap: localhost:29092   # only for a broker doctor cannot give a listener of its own
+images:                     # a helper service's image that today's Docker cannot pull, run as another (exact version)
+  zookeeper: zookeeper:3.4.14
+skip: [notification-service]   # services of the app to leave out, such as one that does not start under the repo's Compose file
+services:                   # the module a service runs, when its build does not say (its folder in the repo)
+  billing: services/invoicing
 ```
 
-The seed runs again after every reset, so write it to allow that (`insert ... on conflict do nothing`). If the app uses Spring Security and there is no `auth`, `plan` warns that its requests may be refused.
-- **run** starts the app with the fault agent, sends the traffic, restarts the app after each planned crash, waits for Kafka lag 0, checks every request's effect and writes `report.html`. A plan says how often: by default 2 runs with the fault and 1 baseline run without it.
-
-LLM answers are cached in `.faultline/cache/`, so running a step again on an unchanged app costs no call.
+The seed runs again after every reset, so write it to allow that (`insert ... on conflict do nothing`, or `do update` to put changed rows back). In a repo of several services it runs in the database of the table it first inserts into. If the app uses Spring Security and there is no `auth`, `plan` warns that its requests may be refused.
 
 ## Read the result
 

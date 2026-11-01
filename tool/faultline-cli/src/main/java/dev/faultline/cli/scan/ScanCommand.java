@@ -6,6 +6,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
@@ -17,6 +18,7 @@ import dev.faultline.cli.Faultline;
 import dev.faultline.cli.Json;
 import dev.faultline.cli.Out;
 import dev.faultline.cli.Workspace;
+import dev.faultline.cli.app.Environment;
 import dev.faultline.cli.llm.Asker;
 import dev.faultline.cli.llm.Prompt;
 import dev.faultline.cli.llm.Schema;
@@ -79,7 +81,7 @@ public final class ScanCommand implements Callable<Integer> {
         Path dir = Workspace.forApp(appDir);
         Path mapFile = dir.resolve(Workspace.APP_MAP);
         String appMap = Files.isRegularFile(mapFile) ? Files.readString(mapFile) : null;
-        App app = App.read(appDir).withSettings(settings);
+        App app = App.read(appDir, Environment.read(dir).orElse(null)).withSettings(settings);
 
         Risks result = scan(app, settings, patterns, appMap, () -> Asker.fromSettings(message -> Out.line(out, "          %s", message)), out);
 
@@ -97,7 +99,7 @@ public final class ScanCommand implements Callable<Integer> {
      * candidates in one call, and ranks the risky ones. The LLM is only set up if there is something to ask.
      */
     public static Risks scan(App app, Map<String, String> settings, List<String> patterns, String appMap, Supplier<Asker> askers, PrintWriter out) {
-        var byPattern = Detectors.byPattern(new Detectors(app.code(), app.config()).all());
+        var byPattern = Detectors.byPattern(Detectors.of(app).all());
         byPattern.keySet().removeIf(p -> !patterns.isEmpty() && !patterns.contains(p));
         Out.line(out, "scan      %d candidate(s): %s%s", byPattern.values().stream().mapToInt(List::size).sum(),
             byPattern.isEmpty() ? "none" : byPattern.entrySet().stream().map(e -> e.getKey() + " " + e.getValue().size()).collect(Collectors.joining(", ")),
@@ -179,19 +181,27 @@ public final class ScanCommand implements Callable<Integer> {
             }
             near.forEach(t -> types.putIfAbsent(t.getNameAsString(), t));
         });
-        // whether a message can come twice with different IDs depends on how its sender makes them
+        // the modules whose configuration decides it: the candidates', and for a consumer-side pattern the senders'
+        var modules = new LinkedHashSet<App.Module>();
+        candidates.forEach(c -> app.moduleOf(c.method()).ifPresent(modules::add));
+        // whether a message can come twice with different IDs depends on how its sender makes them, in any module
         if (CONSUMER_SIDE.contains(pattern.id())) {
-            new Detectors(code, app.config()).publishers().forEach(p -> types.putIfAbsent(p.owner().getNameAsString(), p.owner()));
+            for (var p : Detectors.of(app).publishers()) {
+                types.putIfAbsent(p.owner().getNameAsString(), p.owner());
+                app.moduleOf(p).ifPresent(modules::add);
+            }
         }
         return new Prompt()
             .line("Pattern %s: %s. Candidates:".formatted(pattern.id(), pattern.title()))
             .line(lines.toString().strip())
+            .section("The repo's Spring Boot apps, each a service of its own, with its own configuration", app.describeModules())
             .code("Code (the candidates' classes, the classes they call and the classes that reach them"
                     + (CONSUMER_SIDE.contains(pattern.id()) ? ", and the classes that send the app's messages)" : ")"), "java",
                 types.values().stream().map(code::source).collect(Collectors.joining("\n\n")))
             .code("Outline of the whole app", "text", code.outline())
-            .code("Spring configuration (flattened)", "properties", app.config().asText())
+            .codes(app.configSections("Spring configuration (flattened)", modules), "properties")
             .files("Database schema (migrations)", app.files().migrations(), "sql")
+            .code(Environment.SCHEMA_TITLE, "sql", app.liveSchema())
             .code("App map (from faultline understand)", "json", appMap)
             .toString();
     }

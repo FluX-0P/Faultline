@@ -42,6 +42,14 @@ class HintsTest {
     }
 
     @Test
+    void readsWhereFaultlineReachesKafkaFromHere(@TempDir Path dir) throws Exception {
+        Files.createDirectories(dir.resolve("faultline"));
+        Files.writeString(dir.resolve("faultline/hints.yaml"), "kafka:\n  bootstrap: localhost:29092\n");
+
+        assertThat(Hints.read(dir).kafka()).isEqualTo(new Hints.Kafka("localhost:29092"));
+    }
+
+    @Test
     void aMissingSeedFileOrAnUnknownKeyIsAnError(@TempDir Path dir) throws Exception {
         Files.createDirectories(dir.resolve("faultline"));
         Files.writeString(dir.resolve("faultline/hints.yaml"), "seed: missing.sql\n");

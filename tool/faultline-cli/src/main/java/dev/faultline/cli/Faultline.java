@@ -3,6 +3,7 @@ package dev.faultline.cli;
 import java.util.TimeZone;
 
 import dev.faultline.cli.benchmark.BenchmarkCommand;
+import dev.faultline.cli.doctor.DoctorCommand;
 import dev.faultline.cli.plan.PlanCommand;
 import dev.faultline.cli.report.ReportCommand;
 import dev.faultline.cli.run.RunCommand;
@@ -14,8 +15,9 @@ import picocli.CommandLine.Command;
 
 @Command(name = "faultline", mixinStandardHelpOptions = true, version = "faultline 0.1.0",
     description = {"Crash-test lab for Spring Boot + Kafka apps.",
-        "understand -> scan -> plan -> run: map the app, find risky code, plan a fault for it, then prove the bug."},
-    subcommands = {UnderstandCommand.class, ScanCommand.class, PlanCommand.class, RunCommand.class, ReportCommand.class,
+        "doctor -> understand -> scan -> plan -> run: check the app boots and Faultline reaches it, map it, find risky code,",
+        "plan a fault for it, then prove the bug."},
+    subcommands = {DoctorCommand.class, UnderstandCommand.class, ScanCommand.class, PlanCommand.class, RunCommand.class, ReportCommand.class,
         BenchmarkCommand.class, StubCommand.class})
 public final class Faultline {
     /** Exit codes: every check passed, a check failed, or the tool itself could not run. */

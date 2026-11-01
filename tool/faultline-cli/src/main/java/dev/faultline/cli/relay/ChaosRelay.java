@@ -19,6 +19,7 @@ import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 
 import dev.faultline.cli.fault.Faults;
+import dev.faultline.cli.kafka.Topics;
 import dev.faultline.cli.plan.Plan;
 
 /**
@@ -30,6 +31,7 @@ public final class ChaosRelay implements AutoCloseable {
     private static final Duration POLL = Duration.ofMillis(100);
     private static final Duration ASSIGN_TIMEOUT = Duration.ofSeconds(30);
 
+    private final String bootstrap;
     private final Plan.Relay relay;
     private final String group = "faultline-relay-" + UUID.randomUUID();
     private final Chaos chaos;
@@ -41,6 +43,7 @@ public final class ChaosRelay implements AutoCloseable {
     private Thread thread;
 
     public ChaosRelay(String bootstrap, Plan.Relay relay, Plan.Fault fault, String idField, Path runDir, Consumer<String> print) {
+        this.bootstrap = bootstrap;
         this.relay = relay;
         this.print = print;
         boolean messaging = fault != null && "messaging".equals(fault.layer());
@@ -70,8 +73,15 @@ public final class ChaosRelay implements AutoCloseable {
         return group;
     }
 
-    /** Joins the topic at its end, then forwards in the background. Call it before the traffic starts. */
-    public void start() {
+    /**
+     * Joins the topic at its end, then forwards in the background. Call it before the traffic starts. A {@code from} topic
+     * that does not exist yet is made like the {@code to} topic, since a broker may not create topics on use.
+     */
+    public void start() throws Exception {
+        try (var topics = new Topics(bootstrap)) {
+            int partitions = topics.createLike(relay.from(), relay.to());
+            if (partitions > 0) print.accept("relay     made topic %s with %d partitions, like %s".formatted(relay.from(), partitions, relay.to()));
+        }
         consumer.subscribe(List.of(relay.from()));
         long deadline = System.nanoTime() + ASSIGN_TIMEOUT.toNanos();
         while (consumer.assignment().isEmpty()) {
