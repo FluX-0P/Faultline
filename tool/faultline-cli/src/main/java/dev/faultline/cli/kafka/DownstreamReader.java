@@ -24,8 +24,8 @@ import dev.faultline.cli.workload.Workload;
 /**
  * Reads what the app publishes to its downstream topic during a run, from where the topic ended when the run began,
  * and keeps the request ID each event names. It joins no consumer group, so the app's own consumers never notice it.
- * A JSON event names its request in the plan's field. Any other, such as Avro, is kept as bytes, and the IDs of the
- * run are looked for in it once they are all known.
+ * A JSON event names its request in the plan's field. Any other, such as Avro or a JSON event without that field, is kept
+ * as bytes, and the IDs of the run are looked for in it once they are all known.
  */
 public final class DownstreamReader implements AutoCloseable {
     private static final Duration POLL = Duration.ofMillis(200);
@@ -80,7 +80,8 @@ public final class DownstreamReader implements AutoCloseable {
                     try {
                         ids.add(Workload.idOf(new String(r.value(), StandardCharsets.UTF_8), downstream.requestField()));
                     } catch (IllegalArgumentException e) {
-                        // not an event this check understands; it names no request
+                        // JSON without the field, such as a Debezium event with the row in an escaped payload: its IDs are searched for too
+                        binary.add(new byte[][] {r.key(), r.value()});
                     }
                 }
             }
