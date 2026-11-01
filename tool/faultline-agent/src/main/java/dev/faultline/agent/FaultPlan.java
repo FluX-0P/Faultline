@@ -4,6 +4,8 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 
@@ -23,39 +25,53 @@ import java.util.Set;
  * listen=7071                    (barrier: the UDP port partners signal to; 0 = only threads of this app count)
  * signal_to=worker-1:7071        (signal: where to send a datagram each time point returns)
  * arm_file=/path/to/run/armed    (calls count only once this file exists, such as after a warm-up; absent: from the start)
+ * rename=orders>orders.faultline (what the app sends to orders goes to orders.faultline, where Faultline's relay reads it;
+ *                                 with action=rename that is all the agent does, and point, nth_hit and times are not needed)
  * </pre>
  */
 public record FaultPlan(String point, String when, String action, long nthHit, int times, long delayMs, Path log,
-                        String until, int listen, String signalTo, Path armFile) {
+                        String until, int listen, String signalTo, Path armFile, Map<String, String> renames) {
     static final String ENV = "FAULTLINE_PLAN";
-    static final Set<String> ACTIONS = Set.of("crash", "delay", "throw", "barrier", "signal");
+    static final String RENAME = "rename";
+    static final Set<String> ACTIONS = Set.of("crash", "delay", "throw", "barrier", "signal", RENAME);
     private static final String METHOD = "[\\w.$]+#\\w+";
+    private static final String TOPIC = "[\\w.-]+";
 
     public FaultPlan {
-        if (!point.equals(FaultAgent.BEFORE_ACK) && !point.matches(METHOD)) {
-            throw new IllegalArgumentException("point must be before-ack or Class#method, not '" + point + "'");
-        }
-        if (!when.equals("before") && !when.equals("after")) throw new IllegalArgumentException("when must be before or after");
-        if (!ACTIONS.contains(action)) throw new IllegalArgumentException("unsupported action '" + action + "'");
-        if (nthHit < 1) throw new IllegalArgumentException("nth_hit must be at least 1");
-        if (times < 1) throw new IllegalArgumentException("times must be at least 1");
-        if (action.equals("delay") && delayMs < 1) throw new IllegalArgumentException("a delay needs delay_ms");
-        if (action.equals("barrier")) {
-            if (until == null || !until.matches(METHOD)) throw new IllegalArgumentException("a barrier needs until=Class#method");
-            if (delayMs < 1) throw new IllegalArgumentException("a barrier needs delay_ms, the longest it holds");
-        }
-        if (action.equals("signal") && (signalTo == null || !signalTo.matches("[\\w.-]+:\\d+"))) {
-            throw new IllegalArgumentException("signal needs signal_to=host:port");
+        renames = renames == null ? Map.of() : Map.copyOf(renames);
+        if (action.equals(RENAME)) {
+            if (renames.isEmpty()) throw new IllegalArgumentException("action=rename needs rename=from>to");
+        } else {
+            if (point == null || !point.equals(FaultAgent.BEFORE_ACK) && !point.matches(METHOD)) {
+                throw new IllegalArgumentException("point must be before-ack or Class#method, not '" + point + "'");
+            }
+            if (!when.equals("before") && !when.equals("after")) throw new IllegalArgumentException("when must be before or after");
+            if (!ACTIONS.contains(action)) throw new IllegalArgumentException("unsupported action '" + action + "'");
+            if (nthHit < 1) throw new IllegalArgumentException("nth_hit must be at least 1");
+            if (times < 1) throw new IllegalArgumentException("times must be at least 1");
+            if (action.equals("delay") && delayMs < 1) throw new IllegalArgumentException("a delay needs delay_ms");
+            if (action.equals("barrier")) {
+                if (until == null || !until.matches(METHOD)) throw new IllegalArgumentException("a barrier needs until=Class#method");
+                if (delayMs < 1) throw new IllegalArgumentException("a barrier needs delay_ms, the longest it holds");
+            }
+            if (action.equals("signal") && (signalTo == null || !signalTo.matches("[\\w.-]+:\\d+"))) {
+                throw new IllegalArgumentException("signal needs signal_to=host:port");
+            }
         }
     }
 
     public FaultPlan(String point, String when, String action, long nthHit, int times, long delayMs, Path log) {
-        this(point, when, action, nthHit, times, delayMs, log, null, 0, null, null);
+        this(point, when, action, nthHit, times, delayMs, log, null, 0, null, null, Map.of());
     }
 
     public FaultPlan(String point, String when, String action, long nthHit, int times, long delayMs, Path log,
                      String until, int listen, String signalTo) {
-        this(point, when, action, nthHit, times, delayMs, log, until, listen, signalTo, null);
+        this(point, when, action, nthHit, times, delayMs, log, until, listen, signalTo, null, Map.of());
+    }
+
+    public FaultPlan(String point, String when, String action, long nthHit, int times, long delayMs, Path log,
+                     String until, int listen, String signalTo, Path armFile) {
+        this(point, when, action, nthHit, times, delayMs, log, until, listen, signalTo, armFile, Map.of());
     }
 
     static FaultPlan load(Path file) throws IOException {
@@ -63,11 +79,28 @@ public record FaultPlan(String point, String when, String action, long nthHit, i
         try (var in = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
             p.load(in);
         }
-        return new FaultPlan(required(p, "point"), p.getProperty("when", "before").trim(), p.getProperty("action", "crash").trim(),
+        String action = p.getProperty("action", "crash").trim();
+        var renames = renames(optional(p, RENAME));
+        if (action.equals(RENAME)) return new FaultPlan(null, "before", action, 1, 1, 0, Path.of(required(p, "log")), null, 0, null, null, renames);
+        return new FaultPlan(required(p, "point"), p.getProperty("when", "before").trim(), action,
             Long.parseLong(required(p, "nth_hit")), Integer.parseInt(required(p, "times")),
             Long.parseLong(p.getProperty("delay_ms", "0").trim()), Path.of(required(p, "log")),
             optional(p, "until"), Integer.parseInt(p.getProperty("listen", "0").trim()), optional(p, "signal_to"),
-            optional(p, "arm_file") == null ? null : Path.of(optional(p, "arm_file")));
+            optional(p, "arm_file") == null ? null : Path.of(optional(p, "arm_file")), renames);
+    }
+
+    /** a>b,c>d: the topic each send to a goes to instead. */
+    static Map<String, String> renames(String text) {
+        var renames = new LinkedHashMap<String, String>();
+        if (text == null) return renames;
+        for (String pair : text.split(",")) {
+            String[] parts = pair.strip().split(">");
+            if (parts.length != 2 || !parts[0].strip().matches(TOPIC) || !parts[1].strip().matches(TOPIC)) {
+                throw new IllegalArgumentException("rename must be from>to topics, not '" + pair.strip() + "'");
+            }
+            renames.put(parts[0].strip(), parts[1].strip());
+        }
+        return renames;
     }
 
     /** OrderService or dev.example.OrderService, from Class#method. */
