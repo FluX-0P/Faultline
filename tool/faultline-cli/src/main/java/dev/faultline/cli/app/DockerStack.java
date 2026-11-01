@@ -10,6 +10,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 
 import dev.faultline.cli.Json;
 import dev.faultline.cli.Out;
@@ -25,6 +26,7 @@ import tools.jackson.dataformat.yaml.YAMLWriteFeature;
 public final class DockerStack implements AutoCloseable {
     public static final String RUN_DIR_IN_CONTAINER = "/faultline/run";
     static final String AGENT_IN_CONTAINER = "/faultline/agent.jar";
+    private static final Pattern CONTAINER_ID = Pattern.compile("[0-9a-f]{12,64}");
     static final String OVERRIDE_FILE = "compose.override.yml";
     private static final long COMMAND_TIMEOUT_MINUTES = 5;
     private static final YAMLMapper YAML = YAMLMapper.builder().disable(YAMLWriteFeature.WRITE_DOC_START_MARKER).build();
@@ -46,7 +48,13 @@ public final class DockerStack implements AutoCloseable {
      * Each service in {@code agents} also gets the agent with that environment, the agent jar and the run folder mounted.
      */
     public void up(Map<String, String> settings, Map<String, Map<String, String>> agents, Path agentJar) throws IOException, InterruptedException {
-        writeOverride(settings, agents, agentJar);
+        // a service the agent may crash comes back by itself, like Kubernetes would restart it, unless its own file says how
+        var restart = new ArrayList<String>();
+        if (!agents.isEmpty()) {
+            var config = ComposeConfig.jsonOf(compose(List.of("config", "--format", "json"))).path("services");
+            agents.keySet().stream().filter(s -> config.path(s).path("restart").asString("").isEmpty()).forEach(restart::add);
+        }
+        writeOverride(settings, agents, agentJar, restart);
         Runtime.getRuntime().addShutdownHook(shutdownHook);
         up = true;
         var args = new ArrayList<>(List.of("up", "-d", "--build", "--force-recreate", "--no-deps"));
@@ -55,6 +63,11 @@ public final class DockerStack implements AutoCloseable {
     }
 
     void writeOverride(Map<String, String> settings, Map<String, Map<String, String>> agents, Path agentJar) throws IOException {
+        writeOverride(settings, agents, agentJar, List.of());
+    }
+
+    /** @param restart services that get restart: on-failure */
+    void writeOverride(Map<String, String> settings, Map<String, Map<String, String>> agents, Path agentJar, List<String> restart) throws IOException {
         var services = new LinkedHashMap<String, Object>();
         String json = Json.MAPPER.writeValueAsString(settings);
         for (String name : compose.services()) {
@@ -69,6 +82,7 @@ public final class DockerStack implements AutoCloseable {
                     Map.of("type", "bind", "source", Out.path(runDir.toAbsolutePath()), "target", RUN_DIR_IN_CONTAINER)));
             }
             service.put("environment", env);
+            if (restart.contains(name)) service.put("restart", "on-failure");
             services.put(name, service);
         }
         Files.writeString(override, "# written by faultline run for this run only\n" + YAML.writeValueAsString(Map.of("services", services)));
@@ -90,6 +104,11 @@ public final class DockerStack implements AutoCloseable {
         compose(List.of("unpause", service));
     }
 
+    /** Empties a Redis service: what a reset does to a cache the app keeps state in. */
+    public void flush(String service) throws IOException, InterruptedException {
+        compose(List.of("exec", "-T", service, "redis-cli", "FLUSHALL"));
+    }
+
     public void restart(String service) throws IOException, InterruptedException {
         compose(List.of("restart", service));
     }
@@ -98,11 +117,16 @@ public final class DockerStack implements AutoCloseable {
     public int restarts() throws IOException, InterruptedException {
         int total = 0;
         for (String service : compose.services()) {
-            String id = compose(List.of("ps", "-a", "-q", service)).strip();
+            var id = containerIds(compose(List.of("ps", "-a", "-q", service))).stream().findFirst();
             if (id.isEmpty()) continue;
-            total += Integer.parseInt(docker(List.of("inspect", "-f", "{{.RestartCount}}", id.lines().findFirst().orElseThrow())).strip());
+            total += Integer.parseInt(docker(List.of("inspect", "-f", "{{.RestartCount}}", id.get())).strip());
         }
         return total;
+    }
+
+    /** The container IDs in what {@code docker compose ps -q} printed, without the warnings Compose printed with them. */
+    public static List<String> containerIds(String output) {
+        return output.lines().map(String::strip).filter(l -> CONTAINER_ID.matcher(l).matches()).toList();
     }
 
     /** Saves every service's output to app.log, then stops and removes the services. */

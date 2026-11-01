@@ -54,11 +54,16 @@ public record ComposeConfig(String project, Map<String, Service> services) {
         return parse(DockerStack.docker(args));
     }
 
+    /** The JSON of {@code docker compose config --format json}, after any warnings Compose printed first, such as time="..." level=warning. */
+    static JsonNode jsonOf(String output) {
+        int start = output.startsWith("{") ? 0 : output.indexOf("\n{");
+        if (start < 0) throw new IllegalStateException("docker compose config printed no JSON: " + output.strip());
+        return Json.MAPPER.readTree(output.substring(start));
+    }
+
     /** @param json the output of {@code docker compose config --format json}, after any warnings Compose printed first */
     public static ComposeConfig parse(String json) {
-        int start = json.startsWith("{") ? 0 : json.indexOf("\n{");
-        if (start < 0) throw new IllegalStateException("docker compose config printed no JSON: " + json.strip());
-        JsonNode root = Json.MAPPER.readTree(json.substring(start));
+        JsonNode root = jsonOf(json);
         var aliases = new TreeMap<String, Set<String>>();
         for (var e : root.path("services").properties()) {
             for (JsonNode link : e.getValue().path("links")) {

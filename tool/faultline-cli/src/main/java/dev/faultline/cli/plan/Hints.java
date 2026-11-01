@@ -21,11 +21,12 @@ import tools.jackson.dataformat.yaml.YAMLMapper;
  * {@code images} gives a helper service of the stack (never one of the app's) another image, by service name, in
  * Faultline's Compose override: for an image today's Docker can no longer pull, such as one with an old v1 manifest.
  * {@code skip} names services of the app Faultline leaves out, such as one that does not start under the repo's own
- * Compose file, so it can test the rest; doctor says so every time.
+ * Compose file, so it can test the rest; doctor says so every time. {@code services} names the module a service runs,
+ * by its folder in the repo, when Faultline cannot tell from its build, such as {@code {account: services/account}}.
  */
-public record Hints(Plan.Auth auth, String seed, Kafka kafka, Map<String, String> images, List<String> skip) {
+public record Hints(Plan.Auth auth, String seed, Kafka kafka, Map<String, String> images, List<String> skip, Map<String, String> services) {
     public static final String FILE = "faultline/hints.yaml";
-    public static final Hints NONE = new Hints(null, null, null, null, null);
+    public static final Hints NONE = new Hints(null, null, null, null, null, null);
 
     /** Where Faultline reaches the app's broker from this machine, such as localhost:29092. */
     public record Kafka(String bootstrap) {}
@@ -59,6 +60,11 @@ public record Hints(Plan.Auth auth, String seed, Kafka kafka, Map<String, String
     /** The services of the app to leave out; empty when there are none. */
     public List<String> skipped() {
         return skip == null ? List.of() : skip;
+    }
+
+    /** The module each named service runs, by its folder from the repo's; empty when there are none. */
+    public Map<String, String> serviceModules() {
+        return services == null ? Map.of() : services;
     }
 
     /** The seed file as the plan names it: its path from the folder Faultline runs in. */
