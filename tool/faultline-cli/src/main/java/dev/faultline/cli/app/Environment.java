@@ -63,8 +63,18 @@ public record Environment(String app, Compose compose, List<Service> services, K
         }
     }
 
-    /** A table (schema-qualified unless it is in public), its columns in order, and the rows it had after the app started. */
-    public record Table(String name, List<Column> columns, long rows) {}
+    /**
+     * A table (schema-qualified unless it is in public), its columns in order, and the rows it had after the app started.
+     * For a table with rows and a primary key of one column, {@code key} names it and {@code keys} has its first values,
+     * so a request can refer to rows that exist (null when there are none).
+     */
+    public record Table(String name, List<Column> columns, long rows, String key, List<String> keys) {
+        public static final int KEYS = 20;
+
+        public Table(String name, List<Column> columns, long rows) {
+            this(name, columns, rows, null, null);
+        }
+    }
 
     public record Column(String name, String type) {}
 
@@ -149,10 +159,16 @@ public record Environment(String app, Compose compose, List<Service> services, K
     public String describeSchemaOf(String module) {
         return databasesOf(module).stream().map(d -> "-- database %s on %s (used by %s)\n%s".formatted(d.name(), d.service(),
                 String.join(", ", d.usedBy()), d.tables().stream()
-                    .map(t -> "table %s (%s) -- %d rows after the app started".formatted(t.name(),
-                        t.columns().stream().map(c -> c.name() + " " + c.type()).collect(Collectors.joining(", ")), t.rows()))
+                    .map(t -> "table %s (%s) -- %d rows after the app started%s".formatted(t.name(),
+                        t.columns().stream().map(c -> c.name() + " " + c.type()).collect(Collectors.joining(", ")), t.rows(), keysOf(t)))
                     .collect(Collectors.joining("\n"))))
             .collect(Collectors.joining("\n\n"));
+    }
+
+    /** ", customer_id 1, 2", or the first of them when there are more; empty without keys. */
+    private static String keysOf(Table t) {
+        if (t.key() == null || t.keys() == null || t.keys().isEmpty()) return "";
+        return ", %s %s%s".formatted(t.key(), String.join(", ", t.keys()), t.rows() > t.keys().size() ? " ... (the first " + t.keys().size() + ")" : "");
     }
 
     static String withPort(String address, int port) {
