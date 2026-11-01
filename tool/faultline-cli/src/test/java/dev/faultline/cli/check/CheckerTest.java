@@ -29,6 +29,20 @@ class CheckerTest {
     }
 
     @Test
+    void asManyMissingRequestsAsTheFaultCorruptedUnreadableMessagesAreExcused() {
+        var sent = List.of(entry(0, OK), entry(1, OK), entry(2, OK));
+
+        var one = result(Checker.check(sent, Map.of("p0", 1, "p1", 1), new Destroyed(Set.of(), 1)), "no-lost");
+        var two = result(Checker.check(sent, Map.of("p0", 1), new Destroyed(Set.of(), 1)), "no-lost");
+
+        assertThat(one.passed()).isTrue();
+        assertThat(one.note()).startsWith("1 request(s) not applied, as many as the messages the fault corrupted");
+        // two missing for one unreadable message: which one the fault took cannot be told, so both count
+        assertThat(two.offenders()).containsExactly("p1", "p2");
+        assertThat(two.note()).startsWith("up to 1 of these");
+    }
+
+    @Test
     void missingInfoRequestIsNotLost() {
         assertThat(Checker.check(List.of(entry(0, INFO)), Map.of())).allMatch(CheckResult::passed);
     }

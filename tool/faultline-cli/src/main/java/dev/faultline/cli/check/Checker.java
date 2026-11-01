@@ -35,6 +35,10 @@ public final class Checker {
      * @param destroyed IDs whose message a fault corrupted on purpose
      */
     public static List<CheckResult> check(List<HistoryEntry> history, Map<String, Integer> applied, Set<String> destroyed) {
+        return check(history, applied, new Destroyed(destroyed, 0));
+    }
+
+    public static List<CheckResult> check(List<HistoryEntry> history, Map<String, Integer> applied, Destroyed destroyed) {
         var sent = byId(history);
         return List.of(
             noLost(sent, applied, destroyed),
@@ -43,16 +47,26 @@ public final class Checker {
     }
 
     public static List<CheckResult> check(List<HistoryEntry> history, Map<String, Integer> applied) {
-        return check(history, applied, Set.of());
+        return check(history, applied, Destroyed.NONE);
     }
 
-    /** Every request the app accepted was applied. info requests are allowed to be missing. */
-    static CheckResult noLost(Map<String, HistoryEntry.Status> sent, Map<String, Integer> applied, Set<String> destroyed) {
+    /**
+     * Every request the app accepted was applied. info requests are allowed to be missing, and so are the requests a
+     * fault destroyed: by ID, and as many as it destroyed without a readable ID.
+     */
+    static CheckResult noLost(Map<String, HistoryEntry.Status> sent, Map<String, Integer> applied, Destroyed destroyed) {
         var lost = sent.entrySet().stream()
-            .filter(e -> e.getValue() == OK && times(applied, e.getKey()) == 0 && !destroyed.contains(e.getKey()))
+            .filter(e -> e.getValue() == OK && times(applied, e.getKey()) == 0 && !destroyed.ids().contains(e.getKey()))
             .map(Map.Entry::getKey)
             .toList();
-        return CheckResult.of("no-lost", lost);
+        if (destroyed.unreadable() == 0 || lost.isEmpty()) return CheckResult.of("no-lost", lost);
+        // which request an unreadable message was cannot be told, only how many there were
+        if (lost.size() <= destroyed.unreadable()) {
+            return CheckResult.of("no-lost", List.of(), "%d request(s) not applied, as many as the messages the fault corrupted that name no request Faultline can read"
+                .formatted(lost.size()));
+        }
+        return CheckResult.of("no-lost", lost, "up to %d of these are the messages the fault corrupted that name no request Faultline can read"
+            .formatted(destroyed.unreadable()));
     }
 
     /** No request was applied more than once, whatever its status. */
