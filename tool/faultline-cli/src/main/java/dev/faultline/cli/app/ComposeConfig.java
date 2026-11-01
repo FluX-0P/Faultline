@@ -116,6 +116,33 @@ public record ComposeConfig(String project, Map<String, Service> services) {
         return new ComposeConfig(project, changed);
     }
 
+    /**
+     * This config with some services published on other host ports, as Faultline's override publishes them: HOST:CONTAINER
+     * or ADDRESS:HOST:CONTAINER each, in place of the service's own.
+     */
+    public ComposeConfig withPorts(Map<String, List<String>> ports) {
+        if (ports.isEmpty()) return this;
+        var changed = new TreeMap<>(services);
+        ports.forEach((name, list) -> changed.computeIfPresent(name, (n, s) -> new Service(n, s.image(), s.build(), s.dockerfile(),
+            list.stream().map(ComposeConfig::port).toList(), s.environment(), s.names(), s.dependsOn(), s.containerName())));
+        return new ComposeConfig(project, changed);
+    }
+
+    /** 15432:5432 or 127.0.0.1:15432:5432. */
+    private static Port port(String spec) {
+        String[] parts = spec.split(":");
+        return new Port(Integer.parseInt(parts[parts.length - 1]), Integer.valueOf(parts[parts.length - 2]));
+    }
+
+    /** This config with some services built from these Dockerfiles, in each one's folder, as Faultline's override builds them. */
+    public ComposeConfig withBuilds(Map<String, Path> dockerfiles) {
+        if (dockerfiles.isEmpty()) return this;
+        var changed = new TreeMap<>(services);
+        dockerfiles.forEach((name, dockerfile) -> changed.computeIfPresent(name, (n, s) -> new Service(n, s.image(), dockerfile.getParent(), dockerfile,
+            s.ports(), s.environment(), s.names(), s.dependsOn(), s.containerName())));
+        return new ComposeConfig(project, changed);
+    }
+
     /** The service other containers reach at this host name. */
     public Optional<Service> reachedAt(String host) {
         return services.values().stream().filter(s -> s.names().contains(host)).findFirst();

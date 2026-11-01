@@ -1,5 +1,6 @@
 package dev.faultline.cli.doctor;
 
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -11,6 +12,7 @@ import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.function.IntPredicate;
 
+import dev.faultline.cli.Out;
 import dev.faultline.cli.app.ComposeConfig;
 
 /**
@@ -112,6 +114,28 @@ final class Reach {
     /** The override also runs a helper service with another image, from the hints: one today's Docker can pull. */
     void replaceImage(String service, String image) {
         override.computeIfAbsent(service, k -> new LinkedHashMap<>()).put("image", image);
+    }
+
+    /**
+     * The key Faultline's override replaces a service's published ports under: written out as {@code ports: !override},
+     * since Compose otherwise adds an override's ports to the file's own.
+     */
+    static final String MOVED_PORTS = "ports-moved-by-faultline";
+
+    /** The override also publishes a service on other host ports than its Compose file does, from the hints. */
+    void movePorts(String service, List<String> ports) {
+        override.computeIfAbsent(service, k -> new LinkedHashMap<>()).put(MOVED_PORTS, List.copyOf(ports));
+    }
+
+    /** The override as YAML for Compose, with moved ports tagged so they replace the service's own. */
+    static String yaml(String written) {
+        return written.replace(MOVED_PORTS + ":", "ports: !override");
+    }
+
+    /** The override also builds a service of the app from a Dockerfile of the repo, in the Dockerfile's folder, from the hints. */
+    void build(String service, Path dockerfile) {
+        override.computeIfAbsent(service, k -> new LinkedHashMap<>())
+            .put("build", Map.of("context", Out.path(dockerfile.getParent()), "dockerfile", dockerfile.getFileName().toString()));
     }
 
     /** Faultline's Compose override: the services it changes, or empty when it needs none. */

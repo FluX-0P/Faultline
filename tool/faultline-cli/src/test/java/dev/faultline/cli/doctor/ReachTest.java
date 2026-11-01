@@ -105,6 +105,38 @@ class ReachTest {
     }
 
     @SuppressWarnings("unchecked")
+    @Test
+    void portsTheHintsMoveReplaceTheServicesOwnInTheOverride() {
+        var reach = new Reach(port -> true);
+        reach.movePorts("cart-db", List.of("15432:5432"));
+
+        String yaml = Reach.yaml("services:\n  cart-db:\n    " + Reach.MOVED_PORTS + ":\n    - \"15432:5432\"\n");
+
+        assertThat(yaml).isEqualTo("services:\n  cart-db:\n    ports: !override\n    - \"15432:5432\"\n");
+        var config = new ComposeConfig("shop", Map.of("cart-db", new ComposeConfig.Service("cart-db", "postgres:15", null, null,
+            List.of(new ComposeConfig.Port(5432, 52432)), Map.of(), Set.of("cart-db"), Set.of(), null)));
+        assertThat(config.withPorts(Map.of("cart-db", List.of("127.0.0.1:15432:5432"))).services().get("cart-db").published(5432)).hasValue(15432);
+    }
+
+    @Test
+    void aPortWindowsKeepsForItselfIsInOneOfItsExcludedRanges() {
+        String netsh = """
+
+            Protocol tcp Port Exclusion Ranges
+
+            Start Port    End Port
+            ----------    --------
+                 50000       50059     *
+                 52432       52531
+
+            * - Administered port exclusions.
+            """;
+
+        assertThat(Ports.reservedIn(netsh, 52432)).hasValue("52432-52531");
+        assertThat(Ports.reservedIn(netsh, 50059)).hasValue("50000-50059");
+        assertThat(Ports.reservedIn(netsh, 53432)).isEmpty();
+    }
+
     private static List<String> ports(Reach reach, String service) {
         var services = (Map<String, Map<String, Object>>) reach.override().get("services");
         return (List<String>) services.get(service).get("ports");
