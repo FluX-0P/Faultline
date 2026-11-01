@@ -16,11 +16,13 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import dev.faultline.cli.Json;
 import dev.faultline.cli.Out;
@@ -29,6 +31,7 @@ import dev.faultline.cli.app.DockerStack;
 import dev.faultline.cli.app.KafkaConnect;
 import dev.faultline.cli.check.CheckResult;
 import dev.faultline.cli.check.Checker;
+import dev.faultline.cli.check.Destroyed;
 import dev.faultline.cli.config.Settings;
 import dev.faultline.cli.drain.Drainer;
 import dev.faultline.cli.fault.Faults;
@@ -144,8 +147,17 @@ final class Attempt {
 
                 var ids = Correlation.of(plan.correlateBy(), entries);
                 Map<String, Instant> firstApplied = watcher == null ? Map.of() : ids.firstApplied(watcher.stop());
-                Set<String> published = downstream == null ? Set.of() : ids.requests(downstream.requestIds());
-                Set<String> destroyed = relay == null ? Set.of() : relay.corrupted();
+                // what a binary message may carry: a request's ID, or the one the app answered it with
+                var known = new HashSet<String>();
+                for (var e : entries) {
+                    known.add(e.id());
+                    if (e.effect() != null) known.add(e.effect());
+                }
+                Set<String> published = downstream == null ? Set.of() : ids.requests(downstream.requestIds(known));
+                Destroyed destroyed = relay == null ? Destroyed.NONE : relay.destroyed(known);
+                if (destroyed.unreadable() > 0) {
+                    Out.line(out, "relay     %d corrupted message(s) name no request of this run that Faultline can find in their bytes", destroyed.unreadable());
+                }
                 closeWatchers();
                 var checks = check(databases, effects, ids, entries, requests, destroyed, published, firstApplied, faultEnded);
                 Integer fired = null;
@@ -193,7 +205,7 @@ final class Attempt {
     }
 
     private List<CheckResult> check(Databases databases, EffectsTable effects, Correlation ids, List<HistoryEntry> entries, List<Request> requests,
-                                    Set<String> destroyed, Set<String> published, Map<String, Instant> firstApplied, Instant faultEnded) throws Exception {
+                                    Destroyed destroyed, Set<String> published, Map<String, Instant> firstApplied, Instant faultEnded) throws Exception {
         var checks = new ArrayList<CheckResult>();
         Connection conn = databases.of(plan.effectsDatabase());
         var applied = ids.applied(effects.appliedCounts(conn));
@@ -372,13 +384,28 @@ final class Attempt {
             String file = db.seedFile();
             if (file == null) continue;
             try (var st = databases.of(db).createStatement()) {
-                st.execute(Files.readString(Path.of(file), StandardCharsets.UTF_8));
+                st.execute(withSeed(Files.readString(Path.of(file), StandardCharsets.UTF_8), plan.traffic().seed()));
             } catch (SQLException e) {
                 throw new IllegalStateException("database.seed_file " + file + " failed: " + e.getMessage()
                     + " (it runs again after every reset, so write it like insert ... on conflict do nothing)", e);
             }
             Out.line(out, "seed      loaded %s", file);
         }
+    }
+
+    private static final Pattern SEED = Pattern.compile("\\$\\{seed(?::(\\d{1,2}))?}");
+
+    /**
+     * A seed file with ${seed} as the run's seed, and ${seed:N} padded with zeros to N digits as a request template pads it:
+     * test data for the IDs the requests use, such as a cart for each user 00000000-0000-0000-${seq:4}-${seed:12} makes.
+     */
+    static String withSeed(String sql, Long seed) {
+        if (seed == null) return sql;
+        return SEED.matcher(sql).replaceAll(m -> {
+            String digits = Long.toString(seed);
+            int width = m.group(1) == null ? 0 : Integer.parseInt(m.group(1));
+            return digits.length() >= width ? digits : "0".repeat(width - digits.length()) + digits;
+        });
     }
 
     /** The auth header, with its ${env:NAME} read from the environment or .env. */
@@ -396,18 +423,27 @@ final class Attempt {
         var fault = plan.fault();
         boolean agent = fault != null && fault.inCode();
         boolean armLater = plan.traffic().warmupCount() > 0;
-        if (agent && !Files.isRegularFile(agentJar)) {
+        // the services whose sends to the relayed topic the agent renames, when the code names the topic
+        var senders = plan.relay() == null ? List.<String>of() : plan.relay().senderServices();
+        String rename = plan.relay() == null ? null : plan.relay().rename();
+        if ((agent || !senders.isEmpty()) && !Files.isRegularFile(agentJar)) {
             throw new IllegalStateException("fault agent not found at " + agentJar + ": build it with (cd tool && ./mvnw -q package -DskipTests)");
         }
 
         if (target.compose() != null) {
             var agents = new LinkedHashMap<String, Map<String, String>>();
             if (agent) {
-                agents.put(fault.target(), Faults.writeAgentPlan(fault, dir, DockerStack.RUN_DIR_IN_CONTAINER, armLater));
+                agents.put(fault.target(), Faults.writeAgentPlan(fault, dir, DockerStack.RUN_DIR_IN_CONTAINER, armLater,
+                    senders.contains(fault.target()) ? rename : null));
                 for (String partner : fault.partnerServices()) agents.put(partner, Faults.writePartnerPlan(fault, dir, DockerStack.RUN_DIR_IN_CONTAINER));
             }
-            Out.line(out, "app       starting %s with Docker Compose%s ...", String.join(", ", target.compose().services()),
-                agent ? ", the fault agent on " + String.join(", ", agents.keySet()) : "");
+            String faulted = String.join(", ", agents.keySet());
+            for (String s : senders) {
+                if (!agents.containsKey(s)) agents.put(s, Faults.writeRenamePlan(rename, dir, DockerStack.RUN_DIR_IN_CONTAINER));
+            }
+            Out.line(out, "app       starting %s with Docker Compose%s%s ...", String.join(", ", target.compose().services()),
+                agent ? ", the fault agent on " + faulted : "",
+                senders.isEmpty() ? "" : ", the agent in %s sending to %s instead of %s".formatted(String.join(", ", senders), plan.relay().from(), plan.relay().to()));
             stack.up(plan.appSettings(), agents, agentJar);
             // building the images is not starting up: an app whose Dockerfiles build its jars takes minutes to build
             long start = System.nanoTime();

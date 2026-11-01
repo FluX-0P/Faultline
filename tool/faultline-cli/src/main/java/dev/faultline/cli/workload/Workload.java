@@ -1,9 +1,13 @@
 package dev.faultline.cli.workload;
 
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.Random;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import dev.faultline.cli.Json;
 import tools.jackson.core.JacksonException;
@@ -36,6 +40,38 @@ public final class Workload {
             throw new IllegalArgumentException("the request body is not valid JSON: " + e.getOriginalMessage() + " in " + body);
         }
         return field(json, field).orElseThrow(() -> new IllegalArgumentException("the request body has no field '" + field + "': " + body));
+    }
+
+    /** {userId}, not a template's ${seq}. */
+    private static final Pattern PATH_VARIABLE = Pattern.compile("(?<!\\$)\\{([^}/]+)}");
+
+    /** The names of a path's variables, userId in /cart/{userId}/checkout. */
+    public static List<String> pathVariables(String path) {
+        var names = new ArrayList<String>();
+        if (path == null) return names;
+        var m = PATH_VARIABLE.matcher(path);
+        while (m.find()) names.add(m.group(1));
+        return names;
+    }
+
+    /**
+     * The path with each {name} filled in from the body's field of that name (a.b for a nested one), as one path
+     * segment. One the body has no value for stays in, encoded, so the app answers 404 and the request counts as failed.
+     */
+    public static String pathOf(String path, String body) {
+        JsonNode parsed;
+        try {
+            parsed = Json.MAPPER.readTree(body);
+        } catch (JacksonException e) {
+            parsed = Json.MAPPER.createObjectNode();
+        }
+        JsonNode json = parsed;
+        return PATH_VARIABLE.matcher(path).replaceAll(m -> Matcher.quoteReplacement(field(json, m.group(1)).map(Workload::segment).orElse(segment(m.group()))));
+    }
+
+    /** A value as one path segment: percent-encoded, a space as %20. */
+    private static String segment(String value) {
+        return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20");
     }
 
     /** A value of a JSON document by name, a.b for field b of object a; empty if it has none, or it is no plain value. */

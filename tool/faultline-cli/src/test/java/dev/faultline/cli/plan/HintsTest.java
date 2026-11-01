@@ -60,6 +60,27 @@ class HintsTest {
     }
 
     @Test
+    void readsTheDockerfileThatBuildsAServiceOfThePrebuiltImages(@TempDir Path dir) throws Exception {
+        Files.createDirectories(dir.resolve("faultline"));
+        Files.createDirectories(dir.resolve("order-service"));
+        Files.writeString(dir.resolve("order-service/Dockerfile.svc"), "FROM eclipse-temurin:21\n");
+        Files.writeString(dir.resolve("faultline/hints.yaml"), "builds:\n  order-service: order-service/Dockerfile.svc\n");
+
+        assertThat(Hints.read(dir).dockerfiles(dir)).isEqualTo(Map.of("order-service", dir.resolve("order-service/Dockerfile.svc").toAbsolutePath().normalize()));
+
+        Files.writeString(dir.resolve("faultline/hints.yaml"), "builds:\n  payment-service: payment-service/Dockerfile.svc\n");
+        assertThatThrownBy(() -> Hints.read(dir)).hasMessageContaining("builds gives payment-service the Dockerfile payment-service/Dockerfile.svc, which is no file of the repo");
+    }
+
+    @Test
+    void severalComposeFilesAreReadInOrderBeforeFaultlinesOverride() {
+        var compose = new Plan.Compose("docker-compose-kafka.yml, docker-compose-spring-boot.yml", null, List.of("order"), 1, ".faultline/x/compose.faultline.yml");
+
+        assertThat(compose.files()).containsExactly("docker-compose-kafka.yml", "docker-compose-spring-boot.yml", ".faultline/x/compose.faultline.yml");
+        assertThat(Plan.Compose.appFiles("deploy/docker-compose.yml")).containsExactly("deploy/docker-compose.yml");
+    }
+
+    @Test
     void thePlanCarriesTheHintsAndThePromptShowsTheTestData(@TempDir Path dir) throws Exception {
         var app = App.read(TestApps.payments(dir));
         Files.createDirectories(dir.resolve("faultline"));

@@ -24,6 +24,7 @@ import dev.faultline.cli.plan.Plan;
 public final class Faults {
     public static final String PLAN_FILE = "agent-plan.properties";
     public static final String PARTNER_PLAN_FILE = "agent-plan-partner.properties";
+    public static final String RENAME_PLAN_FILE = "agent-plan-rename.properties";
     public static final String LOG_FILE = "faults.jsonl";
     /** Once this file is in the run folder, the agent starts counting calls (written after a warm-up). */
     static final String ARM_FILE = "armed";
@@ -39,7 +40,13 @@ public final class Faults {
      * With {@code armLater}, the agent counts no calls until {@link #arm} has run, such as after a warm-up.
      */
     public static Map<String, String> writeAgentPlan(Plan.Fault fault, Path runDir, String appRunDir, boolean armLater) throws IOException {
+        return writeAgentPlan(fault, runDir, appRunDir, armLater, null);
+    }
+
+    /** The same, for a service that also sends to a relayed topic: {@code rename} is to>from, null for none. */
+    public static Map<String, String> writeAgentPlan(Plan.Fault fault, Path runDir, String appRunDir, boolean armLater, String rename) throws IOException {
         var plan = new Properties();
+        if (rename != null) plan.setProperty("rename", rename);
         plan.setProperty("point", fault.point());
         plan.setProperty("when", fault.when() == null ? "before" : fault.when());
         plan.setProperty("action", fault.action());
@@ -74,6 +81,18 @@ public final class Faults {
         plan.setProperty("times", "1");
         plan.setProperty("log", appRunDir + "/" + LOG_FILE);
         return write(plan, runDir, appRunDir, PARTNER_PLAN_FILE);
+    }
+
+    /**
+     * The plan for a service that sends to a topic the relay sits in front of, when the code names the topic: its agent
+     * fires nothing, it only renames the topic of each send, {@code rename} being to>from, so the relay gets the message.
+     */
+    public static Map<String, String> writeRenamePlan(String rename, Path runDir, String appRunDir) throws IOException {
+        var plan = new Properties();
+        plan.setProperty("action", "rename");
+        plan.setProperty("rename", rename);
+        plan.setProperty("log", appRunDir + "/" + LOG_FILE);
+        return write(plan, runDir, appRunDir, RENAME_PLAN_FILE);
     }
 
     private static Map<String, String> write(Properties plan, Path runDir, String appRunDir, String file) throws IOException {

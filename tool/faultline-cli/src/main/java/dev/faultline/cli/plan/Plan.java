@@ -6,6 +6,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -16,6 +17,7 @@ import java.util.Set;
 import java.util.regex.Pattern;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import dev.faultline.cli.Json;
 import dev.faultline.cli.scan.Risks.Risk;
 import dev.faultline.cli.workload.EffectsTable;
 import dev.faultline.cli.workload.RequestTemplate;
@@ -120,9 +122,16 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
             return flush == null ? List.of() : flush;
         }
 
-        /** The Compose files, in the order Compose reads them. */
+        /** The Compose files, in the order Compose reads them: the app's, then Faultline's override. */
         public List<String> files() {
-            return override == null ? List.of(file) : List.of(file, override);
+            var files = new ArrayList<>(appFiles(file));
+            if (override != null) files.add(override);
+            return files;
+        }
+
+        /** An app's Compose files, from {@code file}: one, or several separated by commas, read in that order. */
+        public static List<String> appFiles(String file) {
+            return Plan.files(file);
         }
     }
 
@@ -166,9 +175,25 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
 
     /**
      * A chaos relay Faultline runs between two topics: the app publishes to {@code from}, the relay forwards to {@code to}
-     * and fires messaging faults on the way. The app must be set to publish to {@code from}.
+     * and fires messaging faults on the way. The app must be set to publish to {@code from}: by a setting of its own, or,
+     * when the code names the topic, by the agent in each of {@code senders}, the Compose services whose sends to
+     * {@code to} it renames to {@code from}.
      */
-    public record Relay(String from, String to) {}
+    public record Relay(String from, String to, List<String> senders) {
+        public Relay(String from, String to) {
+            this(from, to, null);
+        }
+
+        /** The services whose agent renames the topic; empty when a setting moves the app's sends. */
+        public List<String> senderServices() {
+            return senders == null ? List.of() : senders;
+        }
+
+        /** The agent's rename, to=>from, for the senders' agents; null without senders. */
+        public String rename() {
+            return senderServices().isEmpty() ? null : to + ">" + from;
+        }
+    }
 
     /**
      * A topic the app publishes to once it has done its work, such as payments.completed. Each event names its request
@@ -447,6 +472,7 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
                 problems.add("traffic.request.content_type must be application/json or " + Request.FORM);
             }
             if (correlateBy != null && !blank(correlateBy.requestField())) problems.addAll(bodyProblems(r.body(), correlateBy.requestField()));
+            if (r.path() != null) problems.addAll(pathProblems(r.path(), r.body()));
         }
 
         if (target != null) {
@@ -478,6 +504,13 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
 
         if (relay != null && (blank(relay.from()) || blank(relay.to()) || relay.from().equals(relay.to()))) {
             problems.add("relay needs two different topics, from and to");
+        }
+        if (relay != null && !relay.senderServices().isEmpty()) {
+            var services = target != null && target.compose() != null && target.compose().services() != null ? target.compose().services() : List.<String>of();
+            if (services.isEmpty()) problems.add("relay.senders needs target.compose: they are its services that get the agent");
+            for (String s : relay.senderServices()) {
+                if (!services.isEmpty() && !services.contains(s)) problems.add("relay.senders must be services of target.compose.services, not " + s);
+            }
         }
         if (order != null && (blank(order.key()) || !EffectsTable.isIdentifier(order.by()))) {
             problems.add("order needs key (a request field) and by (a column of " + (correlateBy == null ? "the effects table" : correlateBy.table()) + ")");
@@ -633,6 +666,24 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
             return List.of();
         } catch (IllegalArgumentException e) {
             return List.of("traffic.request.body: " + e.getMessage());
+        }
+    }
+
+    /** Files named as one, or as several separated by commas, such as the seed files of several databases; none for null. */
+    public static List<String> files(String names) {
+        return names == null ? List.of() : Arrays.stream(names.split(",")).map(String::strip).filter(f -> !f.isEmpty()).toList();
+    }
+
+    /** Each {name} in the path is filled from the body's field of that name, so the body must have one. */
+    private static List<String> pathProblems(String path, String body) {
+        var names = Workload.pathVariables(path);
+        if (names.isEmpty()) return List.of();
+        try {
+            var json = Json.MAPPER.readTree(RequestTemplate.parse(body).render(1, 0, new Random(1)));
+            return names.stream().filter(n -> Workload.field(json, n).isEmpty())
+                .map(n -> "traffic.request.path has {%s}, so the body needs a field %s: Faultline fills the path from it".formatted(n, n)).toList();
+        } catch (IllegalArgumentException | JacksonException e) {
+            return List.of();   // a body that does not parse is reported on its own
         }
     }
 

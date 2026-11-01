@@ -70,7 +70,8 @@ public record Deployment(Plan.Compose compose, String url, List<String> consumer
      * @param hints the services to leave out, and the module of a service Faultline cannot tell from its build
      */
     public static Deployment compose(String file, String override, String profile, Path appDir, List<Module> modules, Hints hints) throws Exception {
-        var args = new ArrayList<>(List.of("compose", "-f", file));
+        var args = new ArrayList<>(List.of("compose"));
+        for (String f : Plan.Compose.appFiles(file)) args.addAll(List.of("-f", f));
         if (override != null) args.addAll(List.of("-f", override));
         if (profile != null) args.addAll(List.of("--profile", profile));
         args.addAll(List.of("config", "--format", "json"));
@@ -114,7 +115,9 @@ public record Deployment(Plan.Compose compose, String url, List<String> consumer
         for (var e : services.properties()) {
             String name = e.getKey();
             JsonNode s = e.getValue();
-            if (moduleOf.containsKey(name)) {
+            if (hints.skipped().contains(name)) {
+                continue;   // left out, such as a Connect off the journey whose connector a script registers by hand
+            } else if (moduleOf.containsKey(name)) {
                 Module module = modules.stream().filter(m -> m.path().equals(moduleOf.get(name))).findFirst().orElseThrow();
                 boolean consumer = module.listens()
                     && !"false".equalsIgnoreCase(s.path("environment").path("SPRING_KAFKA_LISTENER_AUTO_STARTUP").asString(""));
@@ -252,11 +255,15 @@ public record Deployment(Plan.Compose compose, String url, List<String> consumer
         return i >= 0 && i + 1 < command.size() ? Optional.of(command.get(i + 1)) : Optional.empty();
     }
 
-    /** The port on this machine that a container port is published on. */
+    /**
+     * The port on this machine that a container port is published on; for a range, such as 51080-51081 for a service run
+     * as two replicas, its first port.
+     */
     private static Optional<Integer> published(JsonNode service, int target) {
         for (JsonNode p : service.path("ports")) {
-            if (p.path("target").asInt(-1) == target && !p.path("published").asString("").isEmpty()) {
-                return Optional.of(Integer.parseInt(p.path("published").asString()));
+            String published = p.path("published").asString("");
+            if (p.path("target").asInt(-1) == target && published.matches("\\d+(-\\d+)?")) {
+                return Optional.of(Integer.parseInt(published.split("-")[0]));
             }
         }
         return Optional.empty();
