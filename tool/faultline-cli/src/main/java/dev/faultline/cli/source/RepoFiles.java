@@ -25,6 +25,7 @@ public final class RepoFiles {
         "target", "build", "out", "node_modules");
     private static final Pattern COMPOSE = Pattern.compile("(docker-)?compose(\\.[\\w-]+)?\\.ya?ml");
     private static final Pattern SPRING_CONFIG = Pattern.compile("application\\.(yml|yaml|properties)");
+    private static final Pattern SPRING_PROFILE_CONFIG = Pattern.compile("application(-[\\w.-]+)?\\.(yml|yaml|properties)");
     private static final Pattern SPEC_FILE = Pattern.compile("(?i).+\\.(ya?ml|json)");
     private static final Pattern SPEC_START = Pattern.compile("(?m)^[\\s{]*\"?(openapi|swagger)\"?\\s*:");
     static final long MAX_SPEC_CHARS = 2_000_000;
@@ -114,6 +115,35 @@ public final class RepoFiles {
 
     public List<TextFile> springConfigs() {
         return read(p -> p.contains("src/main/resources/") && SPRING_CONFIG.matcher(fileName(p)).matches());
+    }
+
+    /** The base files and every profile's, such as application-prod.yml. */
+    public List<TextFile> allSpringConfigs() {
+        return read(p -> p.contains("src/main/resources/") && SPRING_PROFILE_CONFIG.matcher(fileName(p)).matches());
+    }
+
+    /** application-{profile}.yml, .yaml or .properties: what a Spring profile sets on top of the base files. */
+    public List<TextFile> springProfileConfigs(String profile) {
+        var names = Set.of("application-" + profile + ".yml", "application-" + profile + ".yaml", "application-" + profile + ".properties");
+        return read(p -> p.contains("src/main/resources/") && names.contains(fileName(p)));
+    }
+
+    /**
+     * Shell scripts (*.sh, *.bash, mvnw, gradlew) with Windows line endings: a Linux container cannot run them, which
+     * is what a Windows checkout with git's core.autocrlf on gives.
+     */
+    public List<String> scriptsWithWindowsLineEndings() {
+        var found = new ArrayList<String>();
+        for (String p : paths) {
+            String name = fileName(p);
+            if (!(name.endsWith(".sh") || name.endsWith(".bash") || name.equals("mvnw") || name.equals("gradlew"))) continue;
+            try {
+                if (new String(Files.readAllBytes(root.resolve(p)), StandardCharsets.ISO_8859_1).contains("\r\n")) found.add(p);
+            } catch (IOException e) {
+                throw new UncheckedIOException("cannot read " + p, e);
+            }
+        }
+        return found;
     }
 
     public List<Path> javaSources() {
