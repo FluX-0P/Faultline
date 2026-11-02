@@ -29,6 +29,8 @@ import dev.faultline.cli.source.SqlTables;
  * <li>P6 retries without backoff: the provider goes down for a while, and stays down while it gets too many requests.
  * <li>P7 no dead-letter handling: the relay corrupts one message.
  * <li>P8 save, then publish: crash just before the publish.
+ * <li>P9 relies on Kafka Connect delivering once: kill the Connect service mid-traffic, so it sends again what it sent
+ *     since it last stored its position; every event must still arrive, and be applied once.
  * </ul>
  *
  * The numbers are the ones the hand-written benchmark plans proved: a restarted worker takes about 10s to rejoin, so
@@ -94,8 +96,25 @@ final class FaultTemplate {
             }
             case "P7" -> p7(risk, app, d, listener, topic);
             case "P8" -> p8(risk, app, d, on);
+            case "P9" -> p9(risk, d, topic);
             default -> throw new IllegalStateException("there is no fault template for pattern " + risk.pattern() + " yet");
         };
+    }
+
+    /**
+     * Kafka Connect killed without a clean shutdown, 10s into the traffic, and started again 20s later: it sends again
+     * what it sent since it last stored its position. Every event must still reach the listener's topic, and the data
+     * checks see whether any was applied twice. The drain waits until the connectors run again and the topics settle.
+     */
+    private static Test p9(Risk risk, Deployment d, String topic) {
+        if (d.connectService() == null) {
+            throw new IllegalStateException("testing %s at %s takes the Kafka Connect service in the deployment: the app run with its Compose file (plan --compose)"
+                .formatted(risk.pattern(), risk.location()));
+        }
+        return new Test("kill %s (Kafka Connect) 10s into the traffic and start it again 20s later: it sends again what it sent since it last stored its position"
+                .formatted(d.connectService()),
+            new Plan.Fault("process", null, null, "kill", null, null, "20s", d.connectService(), "10s"),
+            checks(Plan.NO_LOST_DOWNSTREAM), new Traffic(2000, 100, null, null), null, Map.of(), topic, null, List.of(), false);
     }
 
     /** A barrier: one worker reads, then waits until another worker has written the same row. */

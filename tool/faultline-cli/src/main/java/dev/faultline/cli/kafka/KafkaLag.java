@@ -19,6 +19,8 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.GroupIdNotFoundException;
 import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
 
+import dev.faultline.cli.plan.Plan;
+
 /**
  * How far a consumer group is behind on a topic: messages on the topic it has not acknowledged yet.
  * After a crash the unacknowledged message keeps the lag above zero until it is redelivered and handled,
@@ -26,22 +28,48 @@ import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
  */
 public final class KafkaLag implements AutoCloseable {
     private static final long TIMEOUT_SECONDS = 10;
+    /** How long a group whose consumers just stopped may take to empty, so its offsets can move. */
+    private static final Duration SKIP_WAIT = Duration.ofSeconds(60);
 
     private final Admin admin;
     private final String group;
     private final String topic;
+    /** The journey's other groups, each on its topic: their lag counts too. */
+    private final List<KafkaLag> others;
 
     public KafkaLag(String bootstrapServers, String group, String topic) {
+        this(bootstrapServers, group, topic, List.of());
+    }
+
+    /** @param others the journey's other consumer groups, each on its topic, such as a ledger's on the events an outbox carries */
+    public KafkaLag(String bootstrapServers, String group, String topic, List<Plan.Consumer> others) {
         this.admin = Admin.create(Map.of(
             AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers,
             AdminClientConfig.REQUEST_TIMEOUT_MS_CONFIG, 5_000,
             AdminClientConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, 10_000));
         this.group = group;
         this.topic = topic;
+        this.others = others.stream().map(c -> new KafkaLag(bootstrapServers, c.group(), c.topic())).toList();
     }
 
-    /** Messages not yet acknowledged by the group. 0 if the topic does not exist yet. */
+    /** Messages not yet acknowledged by the group, and by each of the journey's other groups. 0 for a topic that does not exist yet. */
     public long lag() throws Exception {
+        long lag = ownLag();
+        for (var other : others) lag += other.ownLag();
+        return lag;
+    }
+
+    /**
+     * Every message the journey's topics hold: it stops growing once nothing publishes any more, such as Kafka Connect
+     * once it has carried the whole outbox, which no consumer group's lag shows.
+     */
+    public long published() throws Exception {
+        long total = endOffsets().values().stream().mapToLong(Long::longValue).sum();
+        for (var other : others) total += other.endOffsets().values().stream().mapToLong(Long::longValue).sum();
+        return total;
+    }
+
+    private long ownLag() throws Exception {
         Map<TopicPartition, Long> ends = endOffsets();
         if (ends.isEmpty()) return 0;
         Map<TopicPartition, OffsetAndMetadata> committed = committed();
@@ -73,16 +101,29 @@ public final class KafkaLag implements AutoCloseable {
     }
 
     public long skipBacklog() throws Exception {
-        long lag = lag();
+        long skipped = skipOwnBacklog();
+        for (var other : others) skipped += other.skipOwnBacklog();
+        return skipped;
+    }
+
+    private long skipOwnBacklog() throws Exception {
+        long lag = ownLag();
         if (lag == 0) return 0;
         var toEnd = endOffsets().entrySet().stream().collect(toMap(Map.Entry::getKey, e -> new OffsetAndMetadata(e.getValue())));
-        try {
-            admin.alterConsumerGroupOffsets(group, toEnd).all().get(TIMEOUT_SECONDS, SECONDS);
-        } catch (ExecutionException e) {
-            throw new IllegalStateException("could not skip " + lag + " leftover messages: is another consumer in group '"
-                + group + "' still running?", e);
+        // a group whose consumers have just stopped is still settling: Kafka refuses the move until it is empty
+        long deadline = System.nanoTime() + SKIP_WAIT.toNanos();
+        while (true) {
+            try {
+                admin.alterConsumerGroupOffsets(group, toEnd).all().get(TIMEOUT_SECONDS, SECONDS);
+                return lag;
+            } catch (ExecutionException e) {
+                if (System.nanoTime() > deadline) {
+                    throw new IllegalStateException("could not skip " + lag + " leftover messages: is another consumer in group '"
+                        + group + "' still running?", e);
+                }
+                Thread.sleep(2_000);
+            }
         }
-        return lag;
     }
 
     private Map<TopicPartition, Long> endOffsets() throws Exception {
@@ -123,6 +164,7 @@ public final class KafkaLag implements AutoCloseable {
 
     @Override
     public void close() {
+        others.forEach(KafkaLag::close);
         admin.close(Duration.ofSeconds(5));
     }
 }

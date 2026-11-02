@@ -72,6 +72,10 @@ final class Attempt {
     private AppProcess process;
     private DockerStack stack;
     private ChaosRelay relay;
+    /** How long nothing may change before a journey through Kafka Connect counts as done: a connector resumes in batches. */
+    static final Duration CONNECT_QUIET = Duration.ofSeconds(15);
+    /** The Kafka Connect connectors that ran once the app was ready; the drain waits until as many run again. */
+    private int connectors;
     private DownstreamReader downstream;
     private EffectsWatcher watcher;
 
@@ -102,7 +106,7 @@ final class Attempt {
 
         try (var databases = Databases.open(plan);
              var sender = new TrafficSender(URI.create(plan.target().url()), headers(plan), request.contentType(), plan.correlateBy().responseField());
-             var lag = new KafkaLag(plan.kafka().bootstrap(), plan.kafka().group(), plan.kafka().topic());
+             var lag = new KafkaLag(plan.kafka().bootstrap(), plan.kafka().group(), plan.kafka().topic(), plan.kafka().otherGroups());
              var toxiproxy = plan.toxiproxy() == null ? null : new Toxiproxy(plan.toxiproxy());
              var stub = plan.stub() == null ? null : new StubControl(plan.stub())) {
             Connection conn = databases.of(plan.effectsDatabase());
@@ -178,25 +182,34 @@ final class Attempt {
         }
     }
 
-    /** Waits until Kafka lag (the app's, and the relay's) is 0 and the effects table and downstream topic stop changing. */
+    /**
+     * Waits until Kafka lag (the app's, its other groups' and the relay's) is 0 and the effects table and downstream
+     * topic stop changing. With Kafka Connect in the journey, also until its connectors run again (after a fault that
+     * stopped it) and its topics stop growing: it publishes on its own, which no consumer group's lag shows.
+     */
     private AttemptResult.Drain drain(Connection conn, EffectsTable effects, KafkaLag lag, Duration maxWait) throws Exception {
-        Out.line(out, "drain     waiting until Kafka lag is 0 and %s%s stops changing ...", effects.table(),
-            downstream == null ? "" : " and " + plan.downstream().topic());
+        String connectUrl = plan.target().compose() == null ? null : plan.target().compose().connect();
+        // a connector polls its source and stores its position every few seconds, so 3s of quiet can fall between two of its batches
+        Duration quiet = connectUrl == null ? Drainer.QUIET : CONNECT_QUIET;
+        Out.line(out, "drain     waiting until Kafka lag is 0 and %s%s stops changing%s ...", effects.table(),
+            downstream == null ? "" : " and " + plan.downstream().topic(),
+            connectUrl == null ? "" : ", and Kafka Connect's %d connectors run".formatted(connectors));
         var relayLag = relayLag();
         Drainer.Result drained;
-        try {
+        try (var connect = connectUrl == null ? null : new KafkaConnect(connectUrl)) {
             drained = Drainer.waitUntilDone(() -> {
                 if (process != null) process.checkHealthy();
                 if (relay != null) relay.checkHealthy();
                 if (downstream != null) downstream.checkHealthy();
-                return effects.rows(conn) + (downstream == null ? 0 : downstream.events());
-            }, () -> lag.lag() + (relayLag == null ? 0 : relayLag.lag()), Drainer.QUIET, maxWait, Drainer.POLL);
+                return effects.rows(conn) + (downstream == null ? 0 : downstream.events()) + (connect == null ? 0 : lag.published());
+            }, () -> lag.lag() + (relayLag == null ? 0 : relayLag.lag()) + (connect != null && connect.running() < connectors ? 1 : 0),
+                quiet, maxWait, Drainer.POLL);
         } finally {
             if (relayLag != null) relayLag.close();
         }
         if (drained.settled()) {
             Out.line(out, "          %,d rows%s, lag 0, unchanged for %ds", effects.rows(conn),
-                downstream == null ? "" : ", %,d events".formatted(downstream.events()), Drainer.QUIET.toSeconds());
+                downstream == null ? "" : ", %,d events".formatted(downstream.events()), quiet.toSeconds());
         } else {
             Out.line(out, "          gave up after %ds with lag %d and %,d rows: 'lost' results may be false",
                 maxWait.toSeconds(), drained.backlog(), effects.rows(conn));
@@ -456,6 +469,7 @@ final class Attempt {
                 }
                 Out.line(out, "          ready after %.1fs%s%s", (System.nanoTime() - start) / 1e9, consumers > 0 ? ", " + consumers + " consumers in the group" : "",
                     connect == null ? "" : ", %d connectors running".formatted(connectors));
+                this.connectors = connectors;
             }
         } else if (target.jar() != null) {
             Path appJar = Path.of(target.jar());

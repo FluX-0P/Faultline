@@ -76,7 +76,16 @@ public record RiskPattern(String id, String title, String outcome, int severity,
             after the commit and before the publish loses the event.
 
             Protection: a transactional outbox (the event is saved in the same transaction as the data and published from
-            there, again after a crash), or another way that makes the publish certain once the data is saved."""));
+            there, again after a crash), or another way that makes the publish certain once the data is saved."""),
+        new RiskPattern("P9", "Relies on Kafka Connect delivering once", "applied twice", MONEY, """
+            The Kafka listener consumes a topic that Kafka Connect fills, such as Debezium carrying an outbox table to
+            Kafka. Kafka Connect delivers at least once: when its worker stops without a clean shutdown, it sends again what
+            it had sent since it last stored its position, so the same event arrives twice, with the same content and the
+            same ID.
+
+            Protection: the consumer applies an event once however often it arrives: a duplicate check keyed by the event's
+            ID (or the outbox row's), committed in the same transaction as the work, an upsert keyed by it, or a unique
+            constraint that stops the second one before any of its effects."""));
 
     static Optional<RiskPattern> byId(String id) {
         return ALL.stream().filter(p -> p.id().equals(id)).findFirst();

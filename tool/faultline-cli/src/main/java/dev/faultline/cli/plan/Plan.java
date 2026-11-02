@@ -155,8 +155,24 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
         }
     }
 
-    /** Where to read the consumer group's lag, to know when the app has finished. */
-    public record Kafka(String bootstrap, String topic, String group) {}
+    /**
+     * Where to read the consumer group's lag, to know when the app has finished. {@code groups} are the other consumer
+     * groups the journey's messages pass through, each on its topic, such as a ledger service's on the events an outbox
+     * carries: the app has finished once every one of them is at lag 0 too.
+     */
+    public record Kafka(String bootstrap, String topic, String group, List<Consumer> groups) {
+        public Kafka(String bootstrap, String topic, String group) {
+            this(bootstrap, topic, group, null);
+        }
+
+        /** The other groups; empty when the journey has one. */
+        public List<Consumer> otherGroups() {
+            return groups == null ? List.of() : groups;
+        }
+    }
+
+    /** A consumer group, and the topic of the journey it reads. */
+    public record Consumer(String topic, String group) {}
 
     /**
      * Without a {@code seed}, each run picks one. {@code drainTimeout} caps the wait for the app to finish (default 3m).
@@ -449,6 +465,8 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
 
         if (kafka == null || blank(kafka.bootstrap()) || blank(kafka.topic()) || blank(kafka.group())) {
             problems.add("kafka needs bootstrap, topic and group");
+        } else if (kafka.otherGroups().stream().anyMatch(c -> c == null || blank(c.topic()) || blank(c.group()))) {
+            problems.add("each of kafka.groups needs topic and group");
         }
 
         if (correlateBy == null || blank(correlateBy.requestField())) {

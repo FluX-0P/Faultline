@@ -92,8 +92,8 @@ class FaultTemplateTest {
             .hasMessageContaining("at least two Kafka consumers");
         assertThatThrownBy(() -> PlanCommand.aim(demo, MAP, risk("P5", "ProviderClient#charge"), jar))
             .hasMessageContaining("fake provider");
-        assertThatThrownBy(() -> PlanCommand.aim(demo, MAP, risk("P9", "ProviderClient#charge"), jar))
-            .hasMessageContaining("no fault template for pattern P9");
+        assertThatThrownBy(() -> PlanCommand.aim(demo, MAP, risk("P10", "ProviderClient#charge"), jar))
+            .hasMessageContaining("no fault template for pattern P10");
         var fixedTopic = App.read(TestApps.payments(dir));
         assertThatThrownBy(() -> PlanCommand.aim(fixedTopic, MAP, risk("P7", "PaymentListener#onMessage"), jar))
             .hasMessageContaining("under a fixed name");

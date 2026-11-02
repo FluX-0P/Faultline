@@ -155,13 +155,20 @@ public final class PlanCommand implements Callable<Integer> {
      * endpoint's request body; {@code auth} and {@code seedFile} (may be null) come from the hints. A repo of several
      * Spring Boot apps has its {@code databases}, each with its tables, and the {@code urls} of its HTTP endpoints, by
      * "METHOD /path": each answers on a service of its own module. An app of one module has neither, and its one database
-     * in {@code dbUrl}, {@code dbUser} and {@code dbPassword}.
+     * in {@code dbUrl}, {@code dbUser} and {@code dbPassword}. {@code groups} are the other consumer groups of a repo of
+     * several, each on its topic, that the run waits for too.
      */
     record Facts(Deployment deployment, String jar, String dbUrl, String dbUser, String dbPassword, String bootstrap, String topic, String group,
-                 Map<String, RequestShape> shapes, Plan.Auth auth, String seedFile, List<Db> databases, Map<String, String> urls) {
+                 Map<String, RequestShape> shapes, Plan.Auth auth, String seedFile, List<Db> databases, Map<String, String> urls,
+                 List<Plan.Consumer> groups) {
         Facts(Deployment deployment, String jar, String dbUrl, String dbUser, String dbPassword, String bootstrap, String topic, String group,
               Map<String, RequestShape> shapes, Plan.Auth auth, String seedFile) {
-            this(deployment, jar, dbUrl, dbUser, dbPassword, bootstrap, topic, group, shapes, auth, seedFile, List.of(), Map.of());
+            this(deployment, jar, dbUrl, dbUser, dbPassword, bootstrap, topic, group, shapes, auth, seedFile, List.of(), Map.of(), List.of());
+        }
+
+        Facts(Deployment deployment, String jar, String dbUrl, String dbUser, String dbPassword, String bootstrap, String topic, String group,
+              Map<String, RequestShape> shapes, Plan.Auth auth, String seedFile, List<Db> databases, Map<String, String> urls) {
+            this(deployment, jar, dbUrl, dbUser, dbPassword, bootstrap, topic, group, shapes, auth, seedFile, databases, urls, List.of());
         }
 
         String url() {
@@ -426,7 +433,7 @@ public final class PlanCommand implements Callable<Integer> {
             new Plan.Target(f.url(request), deployment.compose() == null ? f.jar() : null, deployment.compose(),
                 args.entrySet().stream().map(e -> "--" + e.getKey() + "=" + e.getValue()).toList(), f.auth()),
             database, databases,
-            new Plan.Kafka(f.bootstrap(), f.topic(), f.group()),
+            new Plan.Kafka(f.bootstrap(), f.topic(), f.group(), f.groups().isEmpty() ? null : f.groups()),
             test.relay(), null, test.stub() ? deployment.stub() : null,
             new Plan.Traffic(t.count(), t.rate(), null, request, t.drainTimeout(), t.warmup()),
             new Plan.CorrelateBy(d.correlateBy(), d.answerField(), effectDatabase, d.effect().table(), d.effect().column()),
@@ -861,6 +868,13 @@ public final class PlanCommand implements Callable<Integer> {
             .line("Risk to test: %s %s \"%s\" at %s%s. %s".formatted(risk.id(), risk.pattern(), risk.title(), risk.location(),
                 risk.outcome() == null ? "" : ", where the outcome would be: " + risk.outcome(), risk.why()))
             .line("The fault: Faultline will %s. The checks it already makes: %s.".formatted(test.does(), String.join(", ", made)));
+        if ("P9".equals(risk.pattern())) {
+            prompt.line("""
+                The events on %s come from Kafka Connect, not from the app's code: the app writes an outbox row for each \
+                request, and a connector turns it into the event. Take that outbox row as the effect (one row per request), so \
+                no-lost-downstream sees whether each one's event still arrives. Then add a rule that the consumer applied each \
+                event once, on what it writes for it, such as the rows of its own table per request.""".formatted(aim.topic()));
+        }
         if (app.multiModule()) {
             prompt.section("The repo's Spring Boot apps, each a service with its own database", app.describeModules())
                 .line("""
@@ -973,7 +987,27 @@ public final class PlanCommand implements Callable<Integer> {
             app.code().method(e.handler()).map(Method::module).flatMap(deployment::urlOf).ifPresent(url -> urls.put(e.name(), url));
         }
         return new Facts(deployment, null, null, null, null, bootstrap, aim.topic(), group, RequestShapes.of(app), hints.auth(),
-            hints.seedFile(app.dir()), List.copyOf(databases), urls);
+            hints.seedFile(app.dir()), List.copyOf(databases), urls, otherGroups(app, deployment, aim.topic(), group));
+    }
+
+    /**
+     * The consumer groups of the deployment's other listeners, each on its topics: a journey across services passes
+     * through several, such as a ledger's on the events an outbox carries, and the run has finished only once each is
+     * at lag 0. Only listeners of a module some consumer service runs: others would never drain.
+     */
+    static List<Plan.Consumer> otherGroups(App app, Deployment deployment, String topic, String group) {
+        var groups = new LinkedHashSet<Plan.Consumer>();
+        for (var e : app.code().endpoints()) {
+            if (e.kind() != Endpoint.Kind.KAFKA) continue;
+            var m = app.code().method(e.handler()).orElse(null);
+            if (m == null || deployment.services().stream().noneMatch(s -> s.consumer() && s.module().equals(m.module()))) continue;
+            String g = e.groupId() != null ? e.groupId() : app.configOf(m).get("spring.kafka.consumer.group-id").orElse(null);
+            if (g == null) continue;
+            for (String t : e.topics()) {
+                if (!(t.equals(topic) && g.equals(group))) groups.add(new Plan.Consumer(t, g));
+            }
+        }
+        return List.copyOf(groups);
     }
 
     /** The jar in target/, or the name Maven will give it once built. */
