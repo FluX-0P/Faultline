@@ -4,6 +4,7 @@ import java.util.TimeZone;
 
 import dev.faultline.cli.benchmark.BenchmarkCommand;
 import dev.faultline.cli.doctor.DoctorCommand;
+import dev.faultline.cli.fix.FixCommand;
 import dev.faultline.cli.plan.PlanCommand;
 import dev.faultline.cli.report.ReportCommand;
 import dev.faultline.cli.run.RunCommand;
@@ -18,7 +19,7 @@ import picocli.CommandLine.Command;
         "doctor -> understand -> scan -> plan -> run: check the app boots and Faultline reaches it, map it, find risky code,",
         "plan a fault for it, then prove the bug."},
     subcommands = {DoctorCommand.class, UnderstandCommand.class, ScanCommand.class, PlanCommand.class, RunCommand.class, ReportCommand.class,
-        BenchmarkCommand.class, StubCommand.class})
+        BenchmarkCommand.class, StubCommand.class, FixCommand.class})
 public final class Faultline {
     /** Exit codes: every check passed, a check failed, or the tool itself could not run. */
     public static final int PASS = 0;

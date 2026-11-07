@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "properties": {
+    "why": { "type": "string", "description": "First the reasoning: two to four sentences on how the code loses or doubles the data the evidence shows, naming the lines that do it." },
+    "summary": { "type": "string", "description": "Then the fix in one sentence, such as: record the event's ID in the same transaction and skip one seen before." },
+    "file": { "type": "string", "description": "The file to change, as the code shows its path." },
+    "change": { "type": "string", "description": "The change itself: the code as it should be (the changed method or lines, in the app's own style), or the configuration to set. Not a whole file." },
+    "risks": { "type": "string", "description": "What the fix could break or what else it needs, such as a migration for a new unique constraint; empty if nothing." }
+  },
+  "required": ["why", "summary", "file", "change", "risks"],
+  "additionalProperties": false
+}

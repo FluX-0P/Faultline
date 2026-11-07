@@ -147,6 +147,16 @@ The report labels the plan's risk:
 
 Drafted rules that a baseline failed, or that no baseline checked, are left out of every label; the report lists them under "Rules left out".
 
+## Traces and fix suggestions
+
+```bash
+./faultline run .faultline/demo-app/plan.yaml --traces
+./faultline fix runs/2026-11-07T05-27-32Z --app demo-app
+```
+
+- **`run --traces`** runs the OpenTelemetry Java agent (2.32.0, downloaded once into `.faultline/tools/`) next to Faultline's agent in every service of a Compose plan, and starts `faultline-otel` (`grafana/otel-lgtm:0.37.0`; Grafana at http://localhost:3300). Each request carries a `traceparent` whose trace ID comes from its request ID, so what it did in every service and through Kafka is one trace, and each request a finding names links to it in the report. The container keeps running after the run so the links work; stop it with `docker rm -f faultline-otel`. It needs about 1 GB of memory.
+- **`fix`** asks the LLM how to fix each confirmed finding of a run. It sees the pattern, the fault, the evidence, the code around the bug and the errors the app logged most during the runs with the fault (only for the suggestion, never for a verdict), writes `fixes.json`, and adds each suggestion to the report, marked as machine-made. Check it, apply it yourself, and run the plan again to prove it.
+
 ## Break harder: Docker, process faults and the benchmark
 
 A plan can run the app as Docker Compose services instead of a jar (`target.compose`). The demo app then runs as an `api` that takes the HTTP traffic and three workers that consume from Kafka, next to two helpers: Toxiproxy, which sits between each worker and Postgres, and `provider`, a fake payment provider the workers charge every payment at. Faultline recreates them all for each run with that run's settings and puts the fault agent where the fault needs it.

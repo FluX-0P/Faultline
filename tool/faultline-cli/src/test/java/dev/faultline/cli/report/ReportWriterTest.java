@@ -46,6 +46,18 @@ class ReportWriterTest {
             .contains("<code>pay-42-299 (2x)</code>")
             .contains("./faultline run runs/r1/plan.yaml")
             .contains("&quot;paymentId&quot;");   // the plan is shown escaped, not as markup
+
+        // faultline fix adds its suggestion to the finding, marked as machine-made
+        Json.writePretty(runDir.resolve(Fix.FILE), List.of(new Fix("R1", "PaymentListener#onMessage", "gemini-x", "Acknowledge only after the work",
+            "src/PaymentListener.java", "service.process(event);\nack.acknowledge();", "the ack comes first", "")));
+        String withFix = Files.readString(ReportWriter.write(runDir));
+        assertThat(withFix).contains("Suggested fix <span class=\"muted\">(machine-made by gemini-x")
+            .contains("Acknowledge only after the work").contains("ack.acknowledge();").doesNotContain("Also needs");
+
+        // a run that kept traces links each request a finding names to its trace
+        Files.writeString(runDir.resolve(ReportWriter.TRACES), "http://localhost:3300\n");
+        assertThat(Files.readString(ReportWriter.write(runDir))).contains("<a href=\"http://localhost:3300/explore?left=")
+            .contains("<code>pay-42-299 (2x)</code></a>").contains("each links to its trace");
     }
 
     @Test
