@@ -1,8 +1,55 @@
 # Faultline
 
-A crash-test lab for Spring Boot + Kafka apps. Faultline reads a repository, finds the places where a crash or slowdown could lose or duplicate data, breaks the app at exactly those places, and reports only the bugs it actually reproduced.
+A crash-test lab for Spring Boot + Kafka apps. Faultline reads a repository and finds the places where a crash, a slow call or a bad message could lose or duplicate data. It breaks the app at exactly those places, under real traffic, and reports only the bugs it reproduced. Each comes with the request IDs that show it and a command that reproduces it.
 
-> Work in progress.
+An LLM helps read the code, but it never decides a verdict. A bug counts as confirmed only when:
+- the fault fired as planned in every run;
+- a check of the app's own data failed in the runs with the fault;
+- the same check passed in a run without it.
+
+```mermaid
+flowchart LR
+    repo[Your repo] --> doctor --> understand --> scan --> plan --> run --> report
+    report -.-> fix
+```
+
+The steps:
+- **doctor:** checks that the app boots and that Faultline can reach its Kafka and databases.
+- **understand:** maps the app's journeys.
+- **scan:** JavaParser finds code that matches 9 risky patterns, and the LLM judges each match.
+- **plan:** turns a risk into a fault from that pattern's template, plus traffic and checks. You approve the plan before anything runs.
+- **run:** breaks the app with an agent in the JVM, Toxiproxy, a Kafka relay or a fake provider, then checks the data it left behind.
+- **fix:** suggests a fix for a confirmed bug. The suggestion is marked as machine-made.
+
+## Results
+
+**The benchmark:** a demo payments app with 10 planted bugs, each switched on by a setting with a neutral name. Each bug has a page in [docs/bugs/](docs/bugs/README.md).
+
+| | Hand-written plans | Plans Faultline drew up itself |
+|---|---|---|
+| Planted bugs confirmed | 10 of 10 | 8 of 10. B9 and B10 have no code pattern, on purpose. |
+| False confirmations on the bug-free build | 0 | 0 |
+| Scan | flagged 8 of the 8 bugs that have a pattern, with 0 false flags | the same |
+
+**Repos nobody planted bugs in:** 3 bugs confirmed and checked by hand in 4 open-source repos, and 1 clean result. See [docs/real-repos/](docs/real-repos/README.md).
+- [ewolff/microservice-kafka](https://github.com/ewolff/microservice-kafka) can save an order and lose its event.
+- In [ionutbalosin/ecommerce-app](https://github.com/ionutbalosin/ecommerce-app), one unreadable record stops order creation.
+- In [KHolodilin/spring-transactional-outbox-kafka](https://github.com/KHolodilin/spring-transactional-outbox-kafka), one bad record stops a partition's notifications.
+
+## Quick start
+
+You need Java 25, Docker, and a bash shell (Git Bash on Windows). No LLM key: the benchmark ships the LLM answers its scores were measured with.
+
+```bash
+git clone https://github.com/FluX-0P/Faultline.git && cd Faultline
+docker compose -f deploy/docker-compose.yml up -d    # Kafka and Postgres
+(cd demo-app && ./mvnw -q package -DskipTests)       # the demo app
+(cd tool && ./mvnw -q package -DskipTests)           # Faultline and its fault agent
+./faultline benchmark --bug B4                       # one planted bug, on and off: about 6 minutes
+./faultline benchmark                                # all ten, about an hour
+```
+
+Each run leaves a folder in `runs/` with a `report.html`, the plan exactly as it ran, and the command to run it again.
 
 ## Layout
 
@@ -191,5 +238,19 @@ Besides no-lost, no-duplicates and no-unexpected, a plan can check:
 The demo app's 10 planted bugs are switched by settings, all on by default; [benchmark/bugs.yaml](benchmark/bugs.yaml) lists them with the bug-free values and a hand-written plan for each. `faultline benchmark` scores the scan first: each bug that has a pattern is scanned with only that bug on and must be flagged at its location, and the bug-free build is scanned for every pattern, where anything flagged is a false flag (`--scan-only` stops there, `--skip-scan` leaves it out). Then it runs each plan with only its bug on, then again with every bug off, where nothing may be confirmed, and writes `benchmark.json`. `--plan` tries a bug with another plan, such as `./faultline benchmark --bug B10 --plan benchmark/b10-network.plan.yaml`, which reaches B10 through a slow database link instead of the agent.
 
 `--ai-plans` runs the plans Faultline draws up itself instead of the hand-written ones: for each bug, the risk its scan flagged at the bug's location becomes a plan, as `faultline plan` would make it, run as the Compose services in `bugs.yaml`. Bugs without a code pattern (B9, B10) get no plan, and the scores say how many bugs the AI plans targeted and confirmed. `--ai-plans --scan-only` draws up the plans without running them.
+
+The scan and the AI plans score the same on any machine, with no LLM key:
+- **The app map:** they read the one in [benchmark/app-map.json](benchmark/app-map.json).
+- **The LLM's answers:** they read [benchmark/llm-cache/](benchmark/llm-cache), one file per question, after Faultline's own cache. Only a question it lacks goes to the LLM, as `llm.model` in `bugs.yaml` unless `FAULTLINE_LLM_MODEL` says otherwise. Prompts send every line ending as `
+`, so a question asked on Windows is the same question on Linux.
+- **After a change to the demo app or to Faultline's prompts:** run `./faultline benchmark --ai-plans --scan-only --update-llm-cache` with a key, and commit the new answers.
+
+`--expect benchmark/expected.yaml` exits 1 when a score falls short of the file's: at least 10 of 10 confirmed with hand-written plans, 8 of 10 planned and confirmed with AI plans, 8 of 8 flagged by the scan, and no false confirmations or false flags. `--merge` scores the `benchmark.json` files of runs made apart as one benchmark: a bug missing from them counts as not confirmed.
+
+**CI:** [.github/workflows/benchmark.yml](.github/workflows/benchmark.yml) runs on every pull request to main, and by hand.
+- Each bug runs in its own job, for both kinds of plan, and fails if its bug is not confirmed.
+- A last job merges the 20 jobs and holds them to `expected.yaml`.
+- A bug that slipped is rerun alone with "Re-run failed jobs".
+- Each job's run folders, reports included, are kept as workflow artifacts for 14 days.
 
 Exit code 0 means every check passed, 1 means a check failed (or you did not approve a plan, or the benchmark confirmed a bug on the bug-free build), 2 means Faultline could not run.
