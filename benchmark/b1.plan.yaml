@@ -1,6 +1,6 @@
 # Planted bug B1: the worker commits the payment, then acknowledges the Kafka message. Crash worker-1 in between,
-# twice (a restarted worker takes ~10s to rejoin, so 3000 requests leave room for both). Kafka redelivers each message
-# it had not acknowledged, and without a duplicate check it is applied again.
+# twice. A restarted worker takes ~10s to rejoin on a laptop and ~25s on a CI runner, so 6000 requests (60s) leave room
+# for both. Kafka redelivers each message it had not acknowledged, and without a duplicate check it is applied again.
 # faultline benchmark adds the settings that switch the bug on or off.
 app: demo-app
 journey: make-payment
@@ -36,7 +36,7 @@ kafka:
   topic: payments.requested
   group: payment-worker
 traffic:
-  count: 3000
+  count: 6000
   rate: 100
   request:
     method: POST

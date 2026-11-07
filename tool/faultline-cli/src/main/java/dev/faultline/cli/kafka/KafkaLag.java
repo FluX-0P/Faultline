@@ -91,15 +91,23 @@ public final class KafkaLag implements AutoCloseable {
     }
 
     /**
+     * How many consumers the group has once it has settled; 0 while it is still rebalancing, has no members, or does not
+     * exist yet: on a fresh Kafka the group appears only when its first consumer joins.
+     */
+    public int stableMembers() throws Exception {
+        try {
+            var description = admin.describeConsumerGroups(List.of(group)).describedGroups().get(group).get(TIMEOUT_SECONDS, SECONDS);
+            return description.groupState() == GroupState.STABLE ? description.members().size() : 0;
+        } catch (ExecutionException e) {
+            if (e.getCause() instanceof GroupIdNotFoundException) return 0;
+            throw e;
+        }
+    }
+
+    /**
      * Moves the group to the end of the topic, so leftovers from an earlier, aborted run are never processed.
      * Kafka only allows this while no consumer in the group is running. Returns how many messages were skipped.
      */
-    /** How many consumers the group has once it has settled; 0 while it is still rebalancing or has no members. */
-    public int stableMembers() throws Exception {
-        var description = admin.describeConsumerGroups(List.of(group)).describedGroups().get(group).get(TIMEOUT_SECONDS, SECONDS);
-        return description.groupState() == GroupState.STABLE ? description.members().size() : 0;
-    }
-
     public long skipBacklog() throws Exception {
         long skipped = skipOwnBacklog();
         for (var other : others) skipped += other.skipOwnBacklog();

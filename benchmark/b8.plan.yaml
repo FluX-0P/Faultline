@@ -1,6 +1,7 @@
 # Planted bug B8: the worker saves the payment, then publishes "payment completed" once it has committed. Crash worker-1
 # in between, twice: Kafka redelivers the message, but the payment is already done, so its event is never published.
 # With the outbox the event is saved with the payment and published by whichever worker gets to it, crash or not.
+# 6000 requests (60s), so a worker that takes ~25s to restart, as on a CI runner, is back in time for the second crash.
 # faultline benchmark adds the settings that switch the bug on or off.
 app: demo-app
 journey: make-payment
@@ -35,7 +36,7 @@ kafka:
   topic: payments.requested
   group: payment-worker
 traffic:
-  count: 3000
+  count: 6000
   rate: 100
   request:
     method: POST

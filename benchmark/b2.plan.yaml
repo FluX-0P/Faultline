@@ -1,6 +1,7 @@
 # Planted bug B2: the worker hands each payment to a thread pool and acknowledges its message at once. Crash worker-1
 # while the pool is in the middle of a payment, twice: those messages were acknowledged, so Kafka never redelivers them.
 # With the fix the payment is processed on the listener's own thread, and acknowledged once it has committed.
+# 6000 requests (60s), so a worker that takes ~25s to restart, as on a CI runner, is back in time for the second crash.
 # faultline benchmark adds the settings that switch the bug on or off.
 app: demo-app
 journey: make-payment
@@ -35,7 +36,7 @@ kafka:
   topic: payments.requested
   group: payment-worker
 traffic:
-  count: 3000
+  count: 6000
   rate: 100
   request:
     method: POST

@@ -8,6 +8,16 @@ compose:
   file: deploy/docker-compose.yml
   profile: demo
 
+# what the scan and the AI plans were scored with, so they score the same on any machine: the app map faultline
+# understand drew, and the LLM's answers (llm-cache/, one file per question). A question the folder holds needs no LLM
+# key. After a change to the demo app or to Faultline's prompts, run
+#   faultline benchmark --ai-plans --scan-only --update-llm-cache
+# with a key, and commit the new answers.
+app_map: app-map.json
+llm:
+  model: gemini-3.5-flash-lite
+  cache: llm-cache
+
 # every bug off: the settings of the bug-free build
 bug_free:
   payments.dedupe: claim-first

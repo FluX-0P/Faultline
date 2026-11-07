@@ -46,10 +46,11 @@ public final class Asker {
      * @param problems what is wrong with a parsed answer, empty if nothing
      */
     public <T> Answer<T> ask(String system, String user, Schema schema, Class<T> type, Function<T, List<String>> problems) {
-        var messages = new ArrayList<>(List.of(Message.system(system), Message.user(user)));
+        // the same question on every machine: code JavaParser prints, and %n, end their lines with \r\n on Windows
+        var messages = new ArrayList<>(List.of(Message.system(lf(system)), Message.user(lf(user))));
         String key = LlmCache.key(llm.model(), schema, messages);
 
-        var cached = cache.get(key);
+        var cached = cache.get(key, llm.model(), messages);
         if (cached.isPresent()) {
             var parsed = parse(cached.get(), type, problems);
             if (parsed.problems.isEmpty()) return new Answer<>(parsed.value, llm.model(), true, Duration.ZERO);
@@ -73,6 +74,10 @@ public final class Asker {
             messages.add(Message.user("That answer has problems:\n- " + String.join("\n- ", parsed.problems)
                 + "\nReply again with the whole corrected JSON."));
         }
+    }
+
+    private static String lf(String text) {
+        return text.replace("\r\n", "\n");
     }
 
     private record Parsed<T>(T value, List<String> problems) {}

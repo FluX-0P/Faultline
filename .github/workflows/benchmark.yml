@@ -1,0 +1,113 @@
+# Guards the benchmark's scores: every planted bug in its own job, hand-written and AI plans, then the scores of all
+# of them together against benchmark/expected.yaml. The AI plans read the LLM answers committed in
+# benchmark/llm-cache/, so no LLM key is needed. A bug that slipped fails its own job: rerun the failed jobs.
+name: benchmark
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore: ['docs/**', '**/*.md']
+  workflow_dispatch:
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+      # the tests run in ci.yml
+      - run: (cd demo-app && ./mvnw -B -q package -DskipTests)
+      - run: (cd tool && ./mvnw -B -q package -DskipTests)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: jars
+          path: |
+            demo-app/target/demo-app-0.0.1-SNAPSHOT.jar
+            tool/faultline-cli/target/faultline.jar
+            tool/faultline-agent/target/faultline-agent.jar
+          if-no-files-found: error
+          retention-days: 3
+
+  bug:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        plans: [hand-written, ai]
+        bug: [B1, B2, B3, B4, B5, B6, B7, B8, B9, B10]
+    name: ${{ matrix.bug }} (${{ matrix.plans }})
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+      - uses: actions/download-artifact@v8
+        with:
+          name: jars
+      - name: Kafka and Postgres
+        run: docker compose -f deploy/docker-compose.yml up -d --wait postgres kafka
+      - name: Benchmark ${{ matrix.bug }}
+        run: ./faultline benchmark --bug ${{ matrix.bug }} ${{ matrix.plans == 'ai' && '--ai-plans' || '' }}
+      # a bug that has a plan must be confirmed with only it on (the benchmark itself fails on a confirmation on the bug-free build)
+      - name: ${{ matrix.bug }} is confirmed
+        run: |
+          json=$(ls runs/benchmark-*/benchmark.json)
+          jq -r '.bugs[] | "\(.id): \(.withBug // "not planned"), bug-free build: \(.bugFree // "-")"' "$json"
+          jq -e '[.bugs[] | select(.planned != false) | .withBug == "confirmed"] | all' "$json" > /dev/null
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-${{ matrix.plans }}-${{ matrix.bug }}
+          path: runs/
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 14
+
+  scores:
+    needs: bug
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+      - uses: actions/download-artifact@v8
+        with:
+          name: jars
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: bench-hand-written-*
+          path: bench/hand-written
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: bench-ai-*
+          path: bench/ai
+      - name: Scores against benchmark/expected.yaml
+        run: |
+          status=0
+          for plans in hand-written ai; do
+            echo "== $plans plans"
+            ./faultline benchmark --merge bench/$plans/*/benchmark-*/benchmark.json --expect benchmark/expected.yaml \
+              --runs-dir bench/scores-$plans || status=1
+          done
+          exit $status
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: scores
+          path: bench/scores-*/
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 90
