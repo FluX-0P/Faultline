@@ -1,0 +1,49 @@
+{
+  "app" : "demo-app",
+  "model" : "gemini-3.5-flash-lite",
+  "summary" : "A Faultline demo payments service built with Spring Boot, processing payment requests via REST and Kafka, with PostgreSQL persistence.",
+  "modules" : [ {
+    "name" : "payment",
+    "purpose" : "Handles payment processing, events, merchant balance, and provider integration."
+  } ],
+  "entryPoints" : [ {
+    "kind" : "http",
+    "name" : "POST /payments",
+    "handler" : "PaymentController#pay",
+    "purpose" : "Receive payment requests and publish them to Kafka."
+  }, {
+    "kind" : "kafka",
+    "name" : "kafka payments.requested",
+    "handler" : "PaymentListener#onMessage",
+    "purpose" : "Process inbound payment messages from Kafka."
+  }, {
+    "kind" : "kafka",
+    "name" : "kafka payments.retry",
+    "handler" : "PaymentListener#onRetry",
+    "purpose" : "Retry processing failed payment messages from Kafka."
+  } ],
+  "dataStores" : [ {
+    "kind" : "postgres",
+    "name" : "demo",
+    "tables" : [ "accounts", "payments", "processed_events", "merchant", "outbox" ]
+  }, {
+    "kind" : "kafka",
+    "name" : "localhost:9092",
+    "tables" : [ "payments.requested", "payments.retry", "payments.raw", "payments.completed" ]
+  } ],
+  "outsideCalls" : [ ],
+  "journeys" : [ {
+    "name" : "process-payment",
+    "description" : "End to end flow for receiving and processing a payment request.",
+    "steps" : [ {
+      "handler" : "PaymentController#pay",
+      "does" : "Receive payment request and send to Kafka."
+    }, {
+      "handler" : "PaymentListener#onMessage",
+      "does" : "Consume payment request from Kafka and pass to service."
+    }, {
+      "handler" : "PaymentService#process",
+      "does" : "Process payment transaction and persist updates."
+    } ]
+  } ]
+}

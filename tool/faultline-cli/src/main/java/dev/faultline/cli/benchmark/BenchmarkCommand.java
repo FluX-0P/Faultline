@@ -12,13 +12,18 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.Callable;
+import java.util.function.Consumer;
 
 import dev.faultline.cli.Faultline;
 import dev.faultline.cli.Json;
 import dev.faultline.cli.Out;
+import dev.faultline.cli.Workspace;
 import dev.faultline.cli.app.Deployment;
 import dev.faultline.cli.benchmark.BenchmarkFile.Bug;
+import dev.faultline.cli.config.Settings;
 import dev.faultline.cli.llm.Asker;
+import dev.faultline.cli.llm.LlmCache;
+import dev.faultline.cli.llm.OpenAiCompatibleLlm;
 import dev.faultline.cli.plan.Hints;
 import dev.faultline.cli.plan.Plan;
 import dev.faultline.cli.plan.PlanCommand;
@@ -38,7 +43,8 @@ import picocli.CommandLine.Spec;
         "at its location, and the bug-free build should flag nothing. The runs: each bug's plan with only that bug on, then",
         "every plan again with all bugs off, where nothing may be confirmed. The plans are the hand-written ones, or with",
         "--ai-plans the ones Faultline draws up from each bug's scan. Writes benchmark.json; the exit code is 1 if",
-        "anything was confirmed on the bug-free build."})
+        "anything was confirmed on the bug-free build, or with --expect if a score falls short.",
+        "--merge joins the benchmark.json of runs made apart, such as one per bug in CI, and scores them as one."})
 public final class BenchmarkCommand implements Callable<Integer> {
     private static final DateTimeFormatter STAMP = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH-mm-ss'Z'").withZone(ZoneOffset.UTC);
 
@@ -81,6 +87,16 @@ public final class BenchmarkCommand implements Callable<Integer> {
     @Option(names = "--skip-scan", description = "Leave the scan unscored, so no LLM calls")
     boolean skipScan;
 
+    @Option(names = "--merge", arity = "1..*", paramLabel = "FILE",
+        description = "Score these benchmark.json files as one benchmark, such as one per bug from CI: nothing runs")
+    List<Path> merge;
+
+    @Option(names = "--expect", paramLabel = "FILE", description = "The scores to reach, such as benchmark/expected.yaml: exit 1 when one falls short")
+    Path expect;
+
+    @Option(names = "--update-llm-cache", description = "Also write every LLM answer the benchmark uses to its llm.cache folder, to commit")
+    boolean updateLlmCache;
+
     /**
      * One planted bug's result: whether the scan flagged it, the plan that ran for it (with --ai-plans, whether Faultline
      * drew one up, and what it does or why there is none), and its label with only it switched on, and with every bug off.
@@ -106,6 +122,8 @@ public final class BenchmarkCommand implements Callable<Integer> {
     @Override
     public Integer call() throws Exception {
         PrintWriter out = spec.commandLine().getOut();
+        Expected expected = expect == null ? null : Expected.read(expect);
+        if (merge != null) return merged(expected, out);
         if (scanOnly && skipScan) throw new IllegalArgumentException("--scan-only and --skip-scan leave nothing to do");
         if (aiPlans && skipScan) throw new IllegalArgumentException("--ai-plans draws up each plan from the bug's scan, so it cannot --skip-scan");
         if (aiPlans && plan != null) throw new IllegalArgumentException("--ai-plans and --plan both choose the plans: use one");
@@ -115,7 +133,7 @@ public final class BenchmarkCommand implements Callable<Integer> {
         Path dir = Files.createDirectories(runsDir.resolve("benchmark-" + STAMP.format(Instant.now())));
         Path agent = agentJar != null ? agentJar : PlanRun.defaultAgentJar();
 
-        Asker asker = skipScan ? null : asker(out);
+        Asker asker = skipScan ? null : asker(bench, out);
         ScanScore scan = asker == null ? null : scan(bench, bugs, asker, dir, out);
         if (aiPlans && scan == null) throw new IllegalStateException("--ai-plans needs the LLM, to scan and to draft the plans");
         var plans = new LinkedHashMap<String, BugPlan>();
@@ -152,14 +170,28 @@ public final class BenchmarkCommand implements Callable<Integer> {
                 on == null ? null : on.label(), on == null ? null : on.reason(), on == null ? null : on.dir(),
                 off == null ? null : off.label(), off == null ? null : off.reason(), off == null ? null : off.dir()));
         }
-        Integer confirmed = scanOnly ? null : (int) results.stream().filter(r -> "confirmed".equals(r.withBug())).count();
-        Integer falseConfirmations = scanOnly || skipBugFree ? null : (int) results.stream().filter(r -> "confirmed".equals(r.bugFree())).count();
+        Integer falseFlags = scan == null ? null : scan.falseFlags();
+        var result = new Result(Instant.now(), seed, aiPlans ? "ai" : plan != null ? Out.path(plan) : "hand-written", results,
+            scores(results, bugs, aiPlans, !scanOnly, !scanOnly && !skipBugFree, falseFlags));
+        return report(dir, result, expected, out);
+    }
+
+    private static Scores scores(List<BugResult> results, List<Bug> bugs, boolean aiPlans, boolean ran, boolean ranBugFree, Integer falseFlags) {
+        Integer confirmed = ran ? (int) results.stream().filter(r -> "confirmed".equals(r.withBug())).count() : null;
+        Integer falseConfirmations = ranBugFree ? (int) results.stream().filter(r -> "confirmed".equals(r.bugFree())).count() : null;
         int withPattern = (int) bugs.stream().filter(b -> b.pattern() != null).count();
-        Integer flagged = scan == null ? null : (int) results.stream().filter(r -> Boolean.TRUE.equals(r.scanFlagged())).count();
+        Integer flagged = falseFlags == null ? null : (int) results.stream().filter(r -> Boolean.TRUE.equals(r.scanFlagged())).count();
         Integer planned = aiPlans ? (int) results.stream().filter(r -> Boolean.TRUE.equals(r.planned())).count() : null;
-        var scores = new Scores(bugs.size(), confirmed, falseConfirmations, withPattern, flagged, scan == null ? null : scan.falseFlags(), planned);
+        return new Scores(bugs.size(), confirmed, falseConfirmations, withPattern, flagged, falseFlags, planned);
+    }
+
+    /** Writes benchmark.json, prints the table and the scores, and says how they compare with {@code expected}. */
+    private static int report(Path dir, Result result, Expected expected, PrintWriter out) {
         Path json = dir.resolve("benchmark.json");
-        Json.writePretty(json, new Result(Instant.now(), seed, aiPlans ? "ai" : plan != null ? Out.path(plan) : "hand-written", results, scores));
+        Json.writePretty(json, result);
+        var results = result.bugs();
+        var scores = result.scores();
+        boolean aiPlans = "ai".equals(result.plans());
 
         Out.line(out, "\n%-6s %-8s %-9s %-14s %-16s %s", "bug", "pattern", "scan", "with the bug", "bug-free build", "title");
         for (var r : results) {
@@ -171,21 +203,81 @@ public final class BenchmarkCommand implements Callable<Integer> {
         if (aiPlans) {
             for (var r : results) Out.line(out, "plan      %-4s %s", r.id(), r.planned() ? r.planNote() : "none: " + r.planNote());
         }
-        String runs = scanOnly ? "runs skipped" : "confirmed %d of %d planted bugs, %s false confirmations on the bug-free build"
-            .formatted(confirmed, bugs.size(), falseConfirmations == null ? "unknown (skipped)" : String.valueOf(falseConfirmations));
-        Out.line(out, "scores    %s%s; scan %s", aiPlans ? "AI plans for %d of %d planted bugs, ".formatted(planned, bugs.size()) : "", runs, scan == null ? "not scored"
-            : "flagged %d of %d bugs that have a pattern, %d false flags on the bug-free build".formatted(flagged, withPattern, scan.falseFlags()));
+        String runs = scores.confirmed() == null ? "runs skipped" : "confirmed %d of %d planted bugs, %s false confirmations on the bug-free build"
+            .formatted(scores.confirmed(), scores.bugs(), scores.falseConfirmations() == null ? "unknown (skipped)" : String.valueOf(scores.falseConfirmations()));
+        Out.line(out, "scores    %s%s; scan %s", aiPlans ? "AI plans for %d of %d planted bugs, ".formatted(scores.planned(), scores.bugs()) : "", runs,
+            scores.scanFlagged() == null ? "not scored" : "flagged %d of %d bugs that have a pattern, %d false flags on the bug-free build"
+                .formatted(scores.scanFlagged(), scores.bugsWithPattern(), scores.scanFalseFlags()));
         Out.line(out, "wrote     %s", Out.path(json));
-        return falseConfirmations != null && falseConfirmations > 0 ? Faultline.FAIL : Faultline.PASS;
+
+        boolean falseConfirmed = scores.falseConfirmations() != null && scores.falseConfirmations() > 0;
+        if (expected == null) return falseConfirmed ? Faultline.FAIL : Faultline.PASS;
+        var shortfalls = expected.shortfalls(scores, aiPlans);
+        if (shortfalls.isEmpty()) {
+            Out.line(out, "expect    every score reaches what is expected");
+        } else {
+            for (String shortfall : shortfalls) Out.line(out, "expect    SHORT  %s", shortfall);
+        }
+        return falseConfirmed || !shortfalls.isEmpty() ? Faultline.FAIL : Faultline.PASS;
     }
 
-    private static Asker asker(PrintWriter out) {
-        try {
-            return Asker.fromSettings(message -> Out.line(out, "          %s", message));
-        } catch (RuntimeException e) {
-            Out.line(out, "scan      not scored: %s", e.getMessage());
-            return null;
+    /**
+     * Scores benchmark.json files of runs made apart as one benchmark: their bugs side by side, each bug once. A score
+     * counts only if every file has it, and the scan's false flags are the most any file saw on the bug-free build.
+     */
+    private int merged(Expected expected, PrintWriter out) throws Exception {
+        if (aiPlans || plan != null || !only.isEmpty() || scanOnly || skipScan || updateLlmCache) {
+            throw new IllegalArgumentException("--merge scores the files as they are: it takes only --file, --runs-dir and --expect");
         }
+        var bench = BenchmarkFile.read(file);
+        var byId = new LinkedHashMap<String, BugResult>();
+        var kinds = new java.util.TreeSet<String>();
+        boolean ran = true;
+        boolean ranBugFree = true;
+        Integer falseFlags = 0;
+        for (Path f : merge) {
+            Result r = Json.MAPPER.readValue(f.toFile(), Result.class);
+            kinds.add(r.plans());
+            for (BugResult b : r.bugs()) {
+                if (byId.putIfAbsent(b.id(), b) != null) throw new IllegalArgumentException(b.id() + " is in more than one of the files");
+            }
+            ran &= r.scores().confirmed() != null;
+            ranBugFree &= r.scores().falseConfirmations() != null;
+            falseFlags = falseFlags == null || r.scores().scanFalseFlags() == null ? null : Math.max(falseFlags, r.scores().scanFalseFlags());
+        }
+        if (kinds.size() > 1) throw new IllegalArgumentException("the files ran different plans (" + String.join(", ", kinds) + "): merge each kind apart");
+        // in the benchmark's order, and only the bugs the files have
+        var bugs = bench.bugs().stream().filter(b -> byId.containsKey(b.id())).toList();
+        var unknown = byId.keySet().stream().filter(id -> bugs.stream().noneMatch(b -> b.id().equals(id))).toList();
+        if (!unknown.isEmpty()) throw new IllegalArgumentException(file + " has no bug " + String.join(", ", unknown));
+        var results = bugs.stream().map(b -> byId.get(b.id())).toList();
+        Out.line(out, "merge     %d file(s), %d of the %d bugs of %s", merge.size(), bugs.size(), bench.bugs().size(), Out.path(file));
+        if (bugs.size() < bench.bugs().size()) {
+            Out.line(out, "          missing: %s", String.join(", ", bench.bugs().stream().map(Bug::id).filter(id -> !byId.containsKey(id)).toList()));
+        }
+        boolean ai = kinds.contains("ai");
+        // the scores are over every bug of the benchmark, so a bug whose file is missing counts as not confirmed
+        Scores partial = scores(results, bugs, ai, ran, ranBugFree, falseFlags);
+        int withPattern = (int) bench.bugs().stream().filter(b -> b.pattern() != null).count();
+        Scores scores = new Scores(bench.bugs().size(), partial.confirmed(), partial.falseConfirmations(), withPattern, partial.scanFlagged(),
+            partial.scanFalseFlags(), partial.planned());
+        Path dir = Files.createDirectories(runsDir.resolve("benchmark-" + STAMP.format(Instant.now())));
+        long seed = Json.MAPPER.readValue(merge.getFirst().toFile(), Result.class).seed();
+        return report(dir, new Result(Instant.now(), seed, kinds.first(), results, scores), expected, out);
+    }
+
+    /**
+     * The LLM the scan and the AI plans ask: the benchmark's model unless FAULTLINE_LLM_MODEL says otherwise, and its
+     * folder of answers read after Faultline's own cache, so the scores need no LLM key while nothing changed.
+     */
+    private Asker asker(BenchmarkFile bench, PrintWriter out) {
+        Consumer<String> log = message -> Out.line(out, "          %s", message);
+        String model = bench.llm() == null || bench.llm().model() == null ? OpenAiCompatibleLlm.DEFAULT_MODEL : bench.llm().model();
+        var cache = new LlmCache(Workspace.cache());
+        Path answers = bench.llmCache(file);
+        if (updateLlmCache && answers == null) throw new IllegalArgumentException(file + " names no llm.cache folder to update");
+        if (answers != null) cache = updateLlmCache ? cache.alsoReading(answers).copyingTo(answers) : cache.alsoReading(answers);
+        return new Asker(OpenAiCompatibleLlm.fromSettings(Settings.load(), model, log), cache, log);
     }
 
     /**
@@ -195,7 +287,8 @@ public final class BenchmarkCommand implements Callable<Integer> {
      */
     private ScanScore scan(BenchmarkFile bench, List<Bug> bugs, Asker asker, Path dir, PrintWriter out) throws Exception {
         App app = App.read(Path.of(bench.appDir()));
-        String appMap = Files.isRegularFile(bench.appMapFile()) ? Files.readString(bench.appMapFile()) : null;
+        Path appMapFile = bench.appMapFile(file);
+        String appMap = Files.isRegularFile(appMapFile) ? Files.readString(appMapFile) : null;
         var flagged = new LinkedHashMap<String, Boolean>();
         var byBug = new LinkedHashMap<String, Risks>();
         for (Bug bug : bugs) {
@@ -224,7 +317,7 @@ public final class BenchmarkCommand implements Callable<Integer> {
         if (risk.isEmpty()) return new BugPlan(null, "the scan did not flag " + bug.location());
         if (bench.compose() == null) throw new IllegalArgumentException(file + " needs compose: the file and profile the app's services are in");
         Out.line(out, "\n#### plan for %s from its scan's risk %s at %s", bug.id(), risk.get().id(), bug.location());
-        AppMap map = PlanCommand.readJson(bench.appMapFile(), AppMap.class, "understand " + bench.appDir());
+        AppMap map = PlanCommand.readJson(bench.appMapFile(file), AppMap.class, "understand " + bench.appDir());
         var settings = bench.settings(bug);
         App app = App.read(Path.of(bench.appDir())).withSettings(settings);
         int port = Integer.parseInt(app.config().get("server.port").orElse("8080"));

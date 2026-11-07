@@ -1,0 +1,13 @@
+# The scores faultline benchmark --expect must reach; CI fails a pull request when one falls short.
+# Floors for what is confirmed, planned and flagged, ceilings for false confirmations and false flags.
+# Raise a floor when a score goes up for good.
+hand_written:
+  confirmed: 10
+  false_confirmations: 0
+ai:
+  planned: 8
+  confirmed: 8
+  false_confirmations: 0
+scan:
+  flagged: 8
+  false_flags: 0
