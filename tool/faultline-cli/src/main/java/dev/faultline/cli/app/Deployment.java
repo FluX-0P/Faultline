@@ -39,6 +39,11 @@ public record Deployment(Plan.Compose compose, String url, List<String> consumer
     static final int CONNECT_PORT = 8083;
     /** Kafka Connect images: Debezium's, Confluent's and the plain ones. */
     private static final Pattern CONNECT = Pattern.compile("(debezium/connect|cp-kafka-connect|kafka-connect|/connect:)");
+
+    /** Whether a service's image runs Kafka Connect. */
+    public static boolean isConnect(String image) {
+        return image != null && CONNECT.matcher(image).find();
+    }
     // COPY or ADD of a jar from a module's build output, such as COPY order/target/order.jar app.jar
     private static final Pattern COPY = Pattern.compile("(?im)^\\s*(?:COPY|ADD)\\s+(?:--\\S+\\s+)*(.+)$");
 

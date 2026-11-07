@@ -44,6 +44,7 @@ import dev.faultline.cli.llm.Schema;
 import dev.faultline.cli.scan.Risks;
 import dev.faultline.cli.scan.Risks.Risk;
 import dev.faultline.cli.source.App;
+import dev.faultline.cli.source.RepoFiles;
 import dev.faultline.cli.source.Endpoint;
 import dev.faultline.cli.source.JavaSources;
 import dev.faultline.cli.source.JavaSources.Method;
@@ -160,7 +161,13 @@ public final class PlanCommand implements Callable<Integer> {
      */
     record Facts(Deployment deployment, String jar, String dbUrl, String dbUser, String dbPassword, String bootstrap, String topic, String group,
                  Map<String, RequestShape> shapes, Plan.Auth auth, String seedFile, List<Db> databases, Map<String, String> urls,
-                 List<Plan.Consumer> groups) {
+                 List<Plan.Consumer> groups, Map<String, List<String>> headers) {
+        Facts(Deployment deployment, String jar, String dbUrl, String dbUser, String dbPassword, String bootstrap, String topic, String group,
+              Map<String, RequestShape> shapes, Plan.Auth auth, String seedFile, List<Db> databases, Map<String, String> urls,
+              List<Plan.Consumer> groups) {
+            this(deployment, jar, dbUrl, dbUser, dbPassword, bootstrap, topic, group, shapes, auth, seedFile, databases, urls, groups, Map.of());
+        }
+
         Facts(Deployment deployment, String jar, String dbUrl, String dbUser, String dbPassword, String bootstrap, String topic, String group,
               Map<String, RequestShape> shapes, Plan.Auth auth, String seedFile) {
             this(deployment, jar, dbUrl, dbUser, dbPassword, bootstrap, topic, group, shapes, auth, seedFile, List.of(), Map.of(), List.of());
@@ -169,6 +176,21 @@ public final class PlanCommand implements Callable<Integer> {
         Facts(Deployment deployment, String jar, String dbUrl, String dbUser, String dbPassword, String bootstrap, String topic, String group,
               Map<String, RequestShape> shapes, Plan.Auth auth, String seedFile, List<Db> databases, Map<String, String> urls) {
             this(deployment, jar, dbUrl, dbUser, dbPassword, bootstrap, topic, group, shapes, auth, seedFile, databases, urls, List.of());
+        }
+
+        /** The same facts with the headers each endpoint requires, by "METHOD /path". */
+        Facts withHeaders(Map<String, List<String>> required) {
+            return new Facts(deployment, jar, dbUrl, dbUser, dbPassword, bootstrap, topic, group, shapes, auth, seedFile, databases, urls, groups, required);
+        }
+
+        /** The headers a request must carry, each with a value of its own (its ID), but for the one the hints' auth sets. */
+        Map<String, String> headersFor(Plan.Request request) {
+            var names = headers.getOrDefault(request.method() + " " + request.path(), headers.getOrDefault("ANY " + request.path(), List.of()));
+            var out = new LinkedHashMap<String, String>();
+            for (String name : names) {
+                if (auth == null || !auth.header().equalsIgnoreCase(name)) out.put(name, Plan.Request.ID);
+            }
+            return out.isEmpty() ? null : out;
         }
 
         String url() {
@@ -418,6 +440,7 @@ public final class PlanCommand implements Callable<Integer> {
         String contentType = shape != null && shape.form() ? Plan.Request.FORM : null;
         // the closing newline makes plan.yaml show the body as a | block, so its quotes need no escaping
         var request = new Plan.Request(d.request().method(), d.request().path(), contentType, d.request().body().strip() + "\n");
+        request = new Plan.Request(request.method(), request.path(), contentType, request.body(), f.headersFor(request));
 
         Plan.Database database = null;
         List<Plan.Database> databases = null;
@@ -433,7 +456,8 @@ public final class PlanCommand implements Callable<Integer> {
             new Plan.Target(f.url(request), deployment.compose() == null ? f.jar() : null, deployment.compose(),
                 args.entrySet().stream().map(e -> "--" + e.getKey() + "=" + e.getValue()).toList(), f.auth()),
             database, databases,
-            new Plan.Kafka(f.bootstrap(), f.topic(), f.group(), f.groups().isEmpty() ? null : f.groups()),
+            // through a relay the listener reads what the relay forwards to: its own topic, or one it was moved to
+            new Plan.Kafka(f.bootstrap(), test.relay() == null ? f.topic() : test.relay().to(), f.group(), f.groups().isEmpty() ? null : f.groups()),
             test.relay(), null, test.stub() ? deployment.stub() : null,
             new Plan.Traffic(t.count(), t.rate(), null, request, t.drainTimeout(), t.warmup()),
             new Plan.CorrelateBy(d.correlateBy(), d.answerField(), effectDatabase, d.effect().table(), d.effect().column()),
@@ -558,8 +582,32 @@ public final class PlanCommand implements Callable<Integer> {
         changed.retainAll(seededTables(app));
         saved.removeAll(changed);
         inserted.addAll(saved);
-        if (!inserted.isEmpty() && !inserted.contains(d.effect().table().toLowerCase(Locale.ROOT))) {
+        String effect = d.effect().table().toLowerCase(Locale.ROOT);
+        // a table the listener's own service creates may be written by a library, such as an idempotency store
+        var listenerModule = app.multiModule() ? app.moduleOf(aim.listener()) : Optional.<App.Module>empty();
+        Set<String> listenerCreates = listenerModule.map(m -> created(m.files())).orElse(Set.of());
+        if (!inserted.isEmpty() && !inserted.contains(effect) && !listenerCreates.contains(effect)) {
             problems.add("effect.table '%s' is not a table the journey's code inserts into (%s)".formatted(d.effect().table(), String.join(", ", inserted)));
+        }
+        if (!inserted.contains(effect) && listenerCreates.contains(effect) && d.reset().stream().noneMatch(s -> clears(effect).matcher(s).find())) {
+            problems.add("reset does not empty " + d.effect().table() + ", the effect table: rows left by one run would break the next");
+        }
+        if (listenerModule.isPresent() && onTheListenersSide(app, aim)) {
+            // a row the entry wrote before sending the message is there whatever happens to the message
+            var listenerTypes = journeyTypes(app, aim.listener());
+            var listenerSide = new TreeSet<>(tables(app, listenerTypes, INSERT));
+            listenerSide.addAll(saved(app, listenerTypes));
+            listenerSide.addAll(listenerCreates);
+            var entrySide = new TreeSet<String>();
+            entry(app, map, d).ifPresent(h -> {
+                var entryTypes = journeyTypes(app, h).stream().filter(t -> !listenerTypes.contains(t)).toList();
+                entrySide.addAll(tables(app, entryTypes, INSERT));
+                entrySide.addAll(saved(app, entryTypes));
+            });
+            if (entrySide.contains(effect) && !listenerSide.contains(effect)) {
+                problems.add(("effect.table '%s' is written before the message reaches %s, so the fault cannot show in it: take the table %s writes "
+                    + "for each message (%s)").formatted(d.effect().table(), aim.listener().handler(), listenerModule.get().name(), String.join(", ", listenerSide)));
+            }
         }
         var seeded = seedTables(facts);
         for (String table : inserted) {
@@ -613,6 +661,26 @@ public final class PlanCommand implements Callable<Integer> {
             }
         }
         return problems;
+    }
+
+    /** The tables a module's migrations create. */
+    private static Set<String> created(RepoFiles files) {
+        var tables = new TreeSet<String>();
+        for (var f : files.migrations()) CREATE_TABLE.matcher(f.text()).results().forEach(m -> tables.add(m.group(1).toLowerCase(Locale.ROOT)));
+        return tables;
+    }
+
+    /**
+     * Whether the fault acts on the message on its way to the listener (the relay) or in the listener's own service: it
+     * shows only in what that service writes.
+     */
+    private static boolean onTheListenersSide(App app, Aim aim) {
+        var test = aim.test();
+        if (test.relay() != null) return true;
+        var fault = test.fault();
+        if (fault == null || fault.point() == null) return false;
+        var listenerModule = app.moduleOf(aim.listener());
+        return app.code().method(fault.point()).flatMap(app::moduleOf).equals(listenerModule);
     }
 
     /** The HTTP handler of the draft's request; between modules with the same path, one the journey goes through. */
@@ -939,6 +1007,19 @@ public final class PlanCommand implements Callable<Integer> {
     }
 
     static Facts facts(App app, Deployment deployment, Aim aim, Hints hints) throws Exception {
+        return factsOfTheApp(app, deployment, aim, hints).withHeaders(requiredHeaders(app));
+    }
+
+    /** The headers each HTTP endpoint's handler requires, such as an Idempotency-Key, by "METHOD /path". */
+    static Map<String, List<String>> requiredHeaders(App app) {
+        var headers = new LinkedHashMap<String, List<String>>();
+        for (var e : httpEndpoints(app)) {
+            app.code().method(e.handler()).map(m -> app.code().requiredHeaders(m)).filter(h -> !h.isEmpty()).ifPresent(h -> headers.put(e.name(), h));
+        }
+        return headers;
+    }
+
+    private static Facts factsOfTheApp(App app, Deployment deployment, Aim aim, Hints hints) throws Exception {
         var listener = app.code().endpoints().stream()
             .filter(e -> e.kind() == Endpoint.Kind.KAFKA && e.handler().equals(aim.listener().handler())).findFirst().orElseThrow();
         var config = app.configOf(aim.listener());

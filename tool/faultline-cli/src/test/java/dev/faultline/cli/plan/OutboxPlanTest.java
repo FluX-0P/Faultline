@@ -3,11 +3,14 @@ package dev.faultline.cli.plan;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.List;
+import java.util.Map;
 
 import dev.faultline.cli.app.Deployment;
+import dev.faultline.cli.app.Environment;
 import dev.faultline.cli.scan.Risks.Risk;
 import dev.faultline.cli.source.App;
 import dev.faultline.cli.source.TestRepos;
@@ -36,6 +39,54 @@ class OutboxPlanTest {
         assertThat(test.fault()).isEqualTo(new Plan.Fault("process", null, null, "kill", null, null, "20s", "connect", "10s"));
         assertThat(test.downstreamTopic()).isEqualTo("ecommerce-notifications-topic");
         assertThat(test.checks()).contains(Plan.NO_LOST_DOWNSTREAM);
+    }
+
+    @Test
+    void aListenerOnlyKafkaConnectSendsToIsMovedBehindTheRelayWhenItsTopicIsASetting(@TempDir Path dir) throws Exception {
+        var deployment = new Deployment(COMPOSE, "http://localhost:8080", List.of("notification"), null, null, SERVICES, null, "connect");
+        // no code sends to its topic, which it names outright: nothing can be moved
+        var fixed = App.read(TestRepos.ecommerce(dir.resolve("fixed")));
+        assertThatThrownBy(() -> PlanCommand.aim(fixed, MAP, risk("P7", "NotificationHandler#handleBatch"), deployment))
+            .hasMessageContaining("no service of the deployment sends to it");
+
+        Path repo = TestRepos.ecommerce(dir.resolve("set"));
+        Path handler = repo.resolve("notification/src/main/java/shop/notification/NotificationHandler.java");
+        Files.writeString(handler, Files.readString(handler).replace("topics = \"ecommerce-notifications-topic\"", "topics = \"${notification.topic}\""));
+        Files.writeString(repo.resolve("notification/src/main/resources/application.yml"), "notification:\n  topic: ecommerce-notifications-topic\n",
+            StandardOpenOption.APPEND);
+
+        var test = PlanCommand.aim(App.read(repo), MAP, risk("P7", "NotificationHandler#handleBatch"), deployment).test();
+
+        // the relay reads Kafka Connect's topic and forwards to the one the listener now reads
+        assertThat(test.relay()).isEqualTo(new Plan.Relay("ecommerce-notifications-topic", "ecommerce-notifications-topic.faultline"));
+        assertThat(test.settings()).isEqualTo(Map.of("notification.topic", "ecommerce-notifications-topic.faultline"));
+        assertThat(test.fault()).isEqualTo(new Plan.Fault("messaging", null, null, "corrupt", 300L, 1, null, null, null));
+    }
+
+    @Test
+    void aFaultOnTheWayToTheListenerShowsOnlyInWhatTheListenersServiceWrites(@TempDir Path dir) throws Exception {
+        var environment = new Environment("ecommerce", new Environment.Compose("docker-compose.yml", null, "ecommerce", null),
+            List.of(new Environment.Service("cart", "cart", Map.of(), List.of(), false), new Environment.Service("order", "order", Map.of(), List.of(), true),
+                new Environment.Service("notification", "notification", Map.of(), List.of(), true)),
+            new Environment.Kafka("kafka", List.of("kafka:9092"), "localhost:39092", "a listener Faultline's override adds"),
+            List.of(new Environment.Database("cart-db", "cart-db:5432", "cart", "localhost:15433", "cart", "cart", List.of("cart"),
+                    List.of(new Environment.Table("cart_item", List.of(new Environment.Column("user_id", "uuid"), new Environment.Column("product_id", "uuid")), 0))),
+                new Environment.Database("order-db", "order-db:5432", "order", "localhost:15434", "order", "order", List.of("order"),
+                    List.of(new Environment.Table("orders", List.of(new Environment.Column("id", "uuid"), new Environment.Column("user_id", "uuid")), 0)))),
+            List.of(), List.of(), "2026-11-07T00:00:00Z");
+        var app = App.read(TestRepos.ecommerce(dir), environment);
+        var deployment = new Deployment(COMPOSE, "http://localhost:8080", List.of("order"), null, null, SERVICES, null);
+        var aim = PlanCommand.aim(app, MAP, risk("P7", "OrderEventListener#receive"), deployment);
+        var facts = PlanCommand.facts(app, deployment, aim);
+        var request = new PlanDraft.Request("POST", "/cart/{userId}/items", "{\"userId\": \"0000-${seed}-${seq}\", \"productId\": \"p-1\"}");
+        var reset = List.of("TRUNCATE cart_item", "TRUNCATE orders");
+
+        // the cart writes its row before it sends the message the relay corrupts: that row is there either way
+        var cartRow = new PlanDraft("checkout", request, "userId", new PlanDraft.Effect("cart_item", "user_id"), reset, List.of(), "w");
+        assertThat(PlanCommand.problems(cartRow, app, MAP, aim, facts, Map.of()))
+            .anyMatch(p -> p.startsWith("effect.table 'cart_item' is written before the message reaches OrderEventListener#receive"));
+        var orderRow = new PlanDraft("checkout", request, "userId", new PlanDraft.Effect("orders", "user_id"), reset, List.of(), "w");
+        assertThat(PlanCommand.problems(orderRow, app, MAP, aim, facts, Map.of())).noneMatch(p -> p.startsWith("effect.table"));
     }
 
     @Test

@@ -2,6 +2,7 @@ package dev.faultline.cli.plan;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 
@@ -86,6 +87,30 @@ class FormatsPlanTest {
             p.confirm());
 
         assertThat(withPath.problems()).containsExactly("traffic.request.path has {userId}, so the body needs a field userId: Faultline fills the path from it");
+    }
+
+    @Test
+    void aHeaderTheHandlerRequiresGoesOnEachRequestWithItsOwnId(@TempDir Path dir) throws Exception {
+        Path repo = TestRepos.ecommerce(dir);
+        Path controller = repo.resolve("cart/src/main/java/shop/cart/CartController.java");
+        Files.writeString(controller, Files.readString(controller)
+            .replace("cartUserIdItemsPost(UUID userId, CartItemDto item)",
+                "cartUserIdItemsPost(@RequestHeader(Headers.KEY) String key, @RequestHeader(value = \"X-Trace\", required = false) String trace, "
+                    + "@RequestHeader(name = \"X-Tenant\", defaultValue = \"t1\") String tenant, @RequestHeader Map<String, String> all, UUID userId, CartItemDto item)")
+            .replace("public class CartController", "class Headers { static final String KEY = \"Idempotency-Key\"; }\n@Controller\npublic class CartController")
+            .replaceFirst("@Controller\n", ""));
+        var app = App.read(repo);
+
+        // optional ones, those with a default and a map of them all are left out
+        assertThat(PlanCommand.requiredHeaders(app)).isEqualTo(java.util.Map.of("POST /cart/{userId}/items", List.of("Idempotency-Key")));
+
+        var p = TestPlans.valid();
+        var t = p.traffic();
+        var withHeaders = new Plan.Request("POST", "/payments", null, t.request().body(), java.util.Map.of("Idempotency-Key", "k-${id}", "X-Day", "${seq}"));
+        var plan = new Plan(p.app(), p.journey(), p.risk(), p.target(), p.database(), p.kafka(), null, null, null,
+            new Plan.Traffic(t.count(), t.rate(), t.seed(), withHeaders, t.drainTimeout()), p.correlateBy(), null, null, p.fault(), p.checks(), null, null,
+            p.confirm());
+        assertThat(plan.problems()).containsExactly("traffic.request.headers.X-Day may use only ${id}, the request's ID");
     }
 
     @Test

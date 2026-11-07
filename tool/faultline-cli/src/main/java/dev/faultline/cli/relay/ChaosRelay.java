@@ -80,14 +80,22 @@ public final class ChaosRelay implements AutoCloseable {
     }
 
     /**
-     * Joins the topic at its end, then forwards in the background. Call it before the traffic starts. A {@code from} topic
-     * that does not exist yet is made like the {@code to} topic, since a broker may not create topics on use.
+     * Makes the relay's topic that does not exist yet like the other: the {@code from} topic the app's sends were moved
+     * to, or the {@code to} topic its listener was moved to, since a broker may not create topics on use, and one that
+     * does makes them with its default partitions. Call it before the app starts, so a moved listener finds its topic.
      */
-    public void start() throws Exception {
+    public static void makeTopics(String bootstrap, Plan.Relay relay, Consumer<String> print) throws Exception {
         try (var topics = new Topics(bootstrap)) {
             int partitions = topics.createLike(relay.from(), relay.to());
             if (partitions > 0) print.accept("relay     made topic %s with %d partitions, like %s".formatted(relay.from(), partitions, relay.to()));
+            partitions = topics.createLike(relay.to(), relay.from());
+            if (partitions > 0) print.accept("relay     made topic %s with %d partitions, like %s".formatted(relay.to(), partitions, relay.from()));
         }
+    }
+
+    /** Joins the topic at its end, then forwards in the background. Call it before the traffic starts. */
+    public void start() throws Exception {
+        makeTopics(bootstrap, relay, print);
         consumer.subscribe(List.of(relay.from()));
         long deadline = System.nanoTime() + ASSIGN_TIMEOUT.toNanos();
         while (consumer.assignment().isEmpty()) {

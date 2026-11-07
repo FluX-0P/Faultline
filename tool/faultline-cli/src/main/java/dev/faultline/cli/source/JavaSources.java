@@ -453,6 +453,42 @@ public final class JavaSources {
         return Optional.empty();
     }
 
+    /**
+     * The headers a handler cannot do without: its {@code @RequestHeader} parameters that are required and have no
+     * default, by the name they read (the parameter's own when the annotation names none).
+     */
+    public List<String> requiredHeaders(Method handler) {
+        var headers = new ArrayList<String>();
+        for (var p : handler.declaration().getParameters()) {
+            var a = p.getAnnotationByName("RequestHeader");
+            if (a.isEmpty()) continue;
+            boolean optional = a.get() instanceof NormalAnnotationExpr n && n.getPairs().stream()
+                .anyMatch(pair -> pair.getNameAsString().equals("required") && pair.getValue().toString().equals("false"));
+            if (optional || !rawValues(a.get(), handler.module(), "defaultValue").isEmpty()) continue;
+            // a Map or HttpHeaders parameter takes them all
+            String type = p.getTypeAsString();
+            if (type.startsWith("Map") || type.endsWith("HttpHeaders") || type.startsWith("MultiValueMap")) continue;
+            var names = rawValues(a.get(), handler.module(), "value", "name");
+            headers.add(names.isEmpty() || names.getFirst().isBlank() ? p.getNameAsString() : names.getFirst());
+        }
+        return headers;
+    }
+
+    /**
+     * The setting a listener's topics come from, when it names {@code topic} now: {@code @KafkaListener(topics =
+     * "${app.kafka.topic}")}. Changing it moves the listener, which puts a relay in front of it whoever sends.
+     */
+    public Optional<String> listenerTopicSetting(Method listener, String topic) {
+        var annotation = listener.declaration().getAnnotationByName("KafkaListener")
+            .or(() -> listener.declaration().getAnnotationByName("KafkaHandler").flatMap(h -> listener.owner().getAnnotationByName("KafkaListener")));
+        if (annotation.isEmpty()) return Optional.empty();
+        for (String raw : rawValues(annotation.get(), listener.module(), "topics")) {
+            var key = PROPERTY.matcher(raw);
+            if (key.matches() && resolveProperties(listener.module(), raw).equals(topic)) return Optional.of(key.group(1));
+        }
+        return Optional.empty();
+    }
+
     /** The raw @Value text a field is set from, on the field or on the constructor parameter of the same name. */
     private Optional<String> setting(TypeDeclaration<?> owner, String field) {
         var annotations = new ArrayList<AnnotationExpr>();

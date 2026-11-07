@@ -121,6 +121,7 @@ final class Attempt {
              var stub = plan.stub() == null ? null : new StubControl(plan.stub())) {
             Connection conn = databases.of(plan.effectsDatabase());
             if (traces != null) sender.sendTraceparents();
+            sender.sendRequestHeaders(request.requestHeaders());
             try {
                 prepare(sender, lag);
                 reset(databases);
@@ -355,6 +356,7 @@ final class Attempt {
 
     /** Checks Kafka answers, then makes sure no messages from an earlier run will be processed during this one. */
     private void prepare(TrafficSender sender, KafkaLag lag) throws Exception {
+        if (plan.relay() != null) ChaosRelay.makeTopics(plan.kafka().bootstrap(), plan.relay(), line -> Out.line(out, "%s", line));
         long backlog;
         try {
             backlog = lag.lag();
