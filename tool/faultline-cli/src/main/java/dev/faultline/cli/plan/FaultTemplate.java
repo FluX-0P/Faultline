@@ -33,12 +33,13 @@ import dev.faultline.cli.source.SqlTables;
  *     since it last stored its position; every event must still arrive, and be applied once.
  * </ul>
  *
- * The numbers are the ones the hand-written benchmark plans proved: a restarted worker takes about 10s to rejoin, so
- * two crashes need 3000 requests at 100 a second.
+ * The numbers are the ones the hand-written benchmark plans proved. A restarted worker takes about 10s to rejoin on a
+ * laptop, but about 25s on a 2-core CI runner, so two crashes need 60s of traffic: 6000 requests at 100 a second.
  */
 final class FaultTemplate {
     static final long CRASH_EVERY = 150;
     static final int CRASHES = 2;
+    static final Traffic CRASH_TRAFFIC = new Traffic(6000, 100, null, null);
     static final String RELAY_SUFFIX = ".faultline";
     static final Plan.Rule ONE_CHARGE_AT_THE_PROVIDER = new Plan.Rule("one-charge-per-payment-at-the-provider",
         "select payment_id, count(*) as charges from stub.charges group by payment_id having count(*) > 1");
@@ -66,16 +67,15 @@ final class FaultTemplate {
      */
     static Test of(Risk risk, App app, Deployment d, Method listener, String topic) {
         String on = d.faultTarget() == null ? "the app" : d.faultTarget();
-        var crashTraffic = new Traffic(3000, 100, null, null);
         return switch (risk.pattern() == null ? "" : risk.pattern()) {
             case "P1" -> new Test("crash %s just before it acknowledges a message, on every %dth acknowledgment, %d times".formatted(on, CRASH_EVERY, CRASHES),
                 new Plan.Fault(null, "before-ack", null, "crash", CRASH_EVERY, CRASHES, null, d.faultTarget(), null),
-                checks(), crashTraffic, null, Map.of(), null, null, List.of(), false);
+                checks(), CRASH_TRAFFIC, null, Map.of(), null, null, List.of(), false);
             case "P2" -> {
                 String point = isListener(app, risk.location()) ? risk.location() : listener.handler();
                 yield new Test("crash %s the moment %s returns, on every %dth message, %d times: what it handed off is still running".formatted(on, point, CRASH_EVERY, CRASHES),
                     new Plan.Fault(null, point, "after", "crash", CRASH_EVERY, CRASHES, null, d.faultTarget(), null),
-                    checks(), crashTraffic, null, Map.of(), null, null, List.of(), false);
+                    checks(), CRASH_TRAFFIC, null, Map.of(), null, null, List.of(), false);
             }
             case "P3" -> new Test("send every 50th request twice, like a client that submits again, 20 times",
                 new Plan.Fault("traffic", null, null, "duplicate", 50L, 20, null, null, null),
@@ -213,14 +213,14 @@ final class FaultTemplate {
             return new Test("crash %s the moment %s returns, before Spring Kafka sends its reply to %s, on every %dth message, %d times"
                     .formatted(on, m.handler(), replyTo.getFirst(), 100, CRASHES),
                 new Plan.Fault(null, m.handler(), "after", "crash", 100L, CRASHES, null, d.faultTarget(), null),
-                checks(Plan.NO_LOST_DOWNSTREAM), new Traffic(3000, 100, null, null), null, Map.of(), replyTo.getFirst(), null, List.of(), false);
+                checks(Plan.NO_LOST_DOWNSTREAM), CRASH_TRAFFIC, null, Map.of(), replyTo.getFirst(), null, List.of(), false);
         }
         if (sender == null) throw new IllegalStateException("cannot test %s at %s: it publishes nothing Faultline can see".formatted(risk.pattern(), risk.location()));
         var topics = app.code().sentTopics(sender);
         if (topics.isEmpty()) throw new IllegalStateException("cannot tell which topic %s publishes to".formatted(sender.handler()));
         return new Test("crash %s just before %s publishes, on every %dth event, %d times".formatted(on, sender.handler(), 100, CRASHES),
             new Plan.Fault(null, sender.handler(), "before", "crash", 100L, CRASHES, null, d.faultTarget(), null),
-            checks(Plan.NO_LOST_DOWNSTREAM), new Traffic(3000, 100, null, null), null, Map.of(), topics.getFirst(), null, List.of(), false);
+            checks(Plan.NO_LOST_DOWNSTREAM), CRASH_TRAFFIC, null, Map.of(), topics.getFirst(), null, List.of(), false);
     }
 
     /**
