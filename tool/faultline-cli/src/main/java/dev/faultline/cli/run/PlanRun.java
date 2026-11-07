@@ -17,6 +17,7 @@ import dev.faultline.cli.plan.Plan;
 import dev.faultline.cli.report.Finding;
 import dev.faultline.cli.report.Findings;
 import dev.faultline.cli.report.ReportWriter;
+import dev.faultline.cli.trace.Traces;
 
 /**
  * Runs a plan as its confirm settings say: {@code runs} times with the fault, then {@code baselines} times without it,
@@ -32,7 +33,13 @@ public final class PlanRun {
 
     /** @param plan a plan with its seed set, as {@link Plan#forRun} returns it */
     public static Outcome run(Plan plan, String source, Path runsDir, Path agentJar, PrintWriter out) throws Exception {
+        return run(plan, source, runsDir, agentJar, null, out);
+    }
+
+    /** @param traces the run's traces, so the report links each request it flags to its trace; null for none */
+    public static Outcome run(Plan plan, String source, Path runsDir, Path agentJar, Traces traces, PrintWriter out) throws Exception {
         Path dir = createRunDir(runsDir);
+        if (traces != null) Files.writeString(dir.resolve(ReportWriter.TRACES), "http://localhost:" + Traces.GRAFANA_PORT + System.lineSeparator());
         Path planCopy = dir.resolve("plan.yaml");
         String reproduce = "./faultline run " + Out.path(planCopy);
         plan.write(planCopy, List.of("The plan exactly as this run used it, seed included. Run it again with:", "  " + reproduce));
@@ -45,12 +52,12 @@ public final class PlanRun {
         for (int i = 1; i <= confirm.runs(); i++) {
             String name = "run-" + i;
             Out.line(out, "== %s of %d%s ==", name, confirm.runs(), plan.fault() == null ? "" : ", with the fault");
-            attempts.add(Attempt.run(name, AttemptResult.FAULT, plan, dir.resolve(name), agentJar, out));
+            attempts.add(Attempt.run(name, AttemptResult.FAULT, plan, dir.resolve(name), agentJar, traces, out));
         }
         for (int i = 1; i <= confirm.baselines(); i++) {
             String name = "baseline-" + i;
             Out.line(out, "== %s of %d, without the fault ==", name, confirm.baselines());
-            attempts.add(Attempt.run(name, AttemptResult.BASELINE, plan.withoutFault(), dir.resolve(name), agentJar, out));
+            attempts.add(Attempt.run(name, AttemptResult.BASELINE, plan.withoutFault(), dir.resolve(name), agentJar, traces, out));
         }
 
         List<Finding> findings = Findings.of(plan, attempts);

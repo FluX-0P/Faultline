@@ -9,6 +9,8 @@ import java.util.concurrent.ThreadLocalRandom;
 
 import dev.faultline.cli.Faultline;
 import dev.faultline.cli.Out;
+import dev.faultline.cli.Workspace;
+import dev.faultline.cli.trace.Traces;
 import dev.faultline.cli.plan.Plan;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Model.CommandSpec;
@@ -48,6 +50,9 @@ public final class RunCommand implements Callable<Integer> {
     @Option(names = "--runs-dir", defaultValue = "runs", description = "Where run folders are written (default: ${DEFAULT-VALUE})")
     Path runsDir;
 
+    @Option(names = "--traces", description = "Keep traces of every request (OpenTelemetry agent in each service, Grafana at http://localhost:3300): the report links each request it flags to its trace")
+    boolean traces;
+
     @Option(names = "--agent-jar", description = "The fault agent jar (default: tool/faultline-agent/target/faultline-agent.jar, next to this CLI)")
     Path agentJar;
 
@@ -63,7 +68,9 @@ public final class RunCommand implements Callable<Integer> {
         if (!problems.isEmpty()) {
             throw new IllegalArgumentException("the plan has problems, fix them in " + Out.path(planFile) + ":\n  - " + String.join("\n  - ", problems));
         }
-        var outcome = PlanRun.run(plan, Out.path(planFile), runsDir, agentJar != null ? agentJar : PlanRun.defaultAgentJar(), out);
+        if (traces && plan.target().compose() == null) throw new IllegalArgumentException("--traces needs a plan that runs the app with Docker Compose");
+        var keep = traces ? Traces.start(Workspace.TOOLS, line -> Out.line(out, "%s", line)) : null;
+        var outcome = PlanRun.run(plan, Out.path(planFile), runsDir, agentJar != null ? agentJar : PlanRun.defaultAgentJar(), keep, out);
         return outcome.result().verdict().equals("PASS") ? Faultline.PASS : Faultline.FAIL;
     }
 }

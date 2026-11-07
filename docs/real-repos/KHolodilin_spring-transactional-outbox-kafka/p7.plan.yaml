@@ -1,0 +1,77 @@
+# The plan exactly as this run used it, seed included. Run it again with:
+#   ./faultline run runs/2026-11-07T07-53-36Z/plan.yaml
+app: KHolodilin_spring-transactional-outbox-kafka
+journey: place-order
+risk:
+  id: R2
+  pattern: P7
+  title: No dead-letter handling
+  location: notification-stub:NotificationStubHandler#handleBatch
+  file: notification-stub/src/main/java/com/kholodilin/outbox/notification/NotificationStubHandler.java
+  line: 45
+  confidence: high
+  why: "NotificationStubHandler#handleBatch in notification-stub is a batch Kafka listener that loops over records and delegates to processRecord. Since no custom Kafka error handler or DeadLetterPublishingRecoverer is configured, persistent processing failures cause endless retries on the partition."
+  outcome: stuck
+  saw: "a batch Kafka listener (the container commits the whole batch once it returns), and the app configures no error handling of its own"
+target:
+  url: http://localhost:8096
+  compose:
+    file: <clone>/docker/compose.debezium.yml
+    services:
+    - connect
+    - notification-stub
+    - order-service-debezium
+    consumers: 1
+    connect: http://localhost:8087
+  args:
+  - --app.kafka.topic=orders.events.faultline
+databases:
+- name: outbox_debezium
+  url: jdbc:postgresql://localhost:5435/outbox_debezium
+  user: outbox
+  password: outbox
+  reset:
+  - TRUNCATE TABLE outbox_events CASCADE
+  - TRUNCATE TABLE order_items CASCADE
+  - TRUNCATE TABLE orders CASCADE
+  - TRUNCATE TABLE idempotency_records CASCADE
+  - TRUNCATE TABLE notification_idempotency_records CASCADE
+kafka:
+  bootstrap: localhost:19095
+  topic: orders.events.faultline
+  group: notification-stub
+relay:
+  from: orders.events
+  to: orders.events.faultline
+traffic:
+  count: 2000
+  rate: 100
+  seed: 638236
+  request:
+    method: POST
+    path: /api/v1/orders
+    body: |
+      {"customerId": ${int:1:50}, "items": [{"productId": "prod-${int:1:100}", "quantity": ${int:1:5}, "price": 10.0}], "correlationId": "corr-${seed}-${seq}"}
+    headers:
+      Idempotency-Key: "${id}"
+  drain_timeout: 30s
+correlate_by:
+  request_field: correlationId
+  response_field: eventId
+  database: outbox_debezium
+  table: notification_idempotency_records
+  column: idempotency_key
+fault:
+  layer: messaging
+  action: corrupt
+  nth_hit: 300
+  times: 1
+checks:
+- no-lost
+- no-duplicates
+- no-unexpected
+- faults-fired
+confirm:
+  runs: 2
+  baselines: 1
+  min_failing: 2

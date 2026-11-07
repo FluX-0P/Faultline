@@ -87,7 +87,7 @@ public record RiskPattern(String id, String title, String outcome, int severity,
             ID (or the outbox row's), committed in the same transaction as the work, an upsert keyed by it, or a unique
             constraint that stops the second one before any of its effects."""));
 
-    static Optional<RiskPattern> byId(String id) {
+    public static Optional<RiskPattern> byId(String id) {
         return ALL.stream().filter(p -> p.id().equals(id)).findFirst();
     }
 }

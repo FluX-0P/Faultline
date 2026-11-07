@@ -148,6 +148,8 @@ final class FaultTemplate {
             var senders = app.code().methods().stream().filter(m -> app.code().sentTopics(m).contains(topic)).map(Method::module).distinct()
                 .flatMap(module -> d.servicesOf(module).stream()).distinct().toList();
             if (d.compose() == null || senders.isEmpty()) {
+                var listens = app.code().listenerTopicSetting(listener, topic);
+                if (listens.isPresent()) return movedListener(risk, app, listener, topic, listens.get());
                 throw new IllegalStateException(("cannot test %s at %s: the app sends to %s under a fixed name, so only the agent in the service that sends it "
                     + "could move it to Faultline's relay, and %s").formatted(risk.pattern(), risk.location(), topic,
                     d.compose() == null ? "that takes the app run with Docker Compose (plan --compose)" : "no service of the deployment sends to it"));
@@ -158,6 +160,24 @@ final class FaultTemplate {
                 checks(), new Traffic(2000, 100, null, "30s"), new Plan.Relay(from, topic, senders), Map.of(), null, null, List.of(), false);
         }
         return p7(risk, app, listener, topic, key.get(), from);
+    }
+
+    /**
+     * When nothing of the app's sends to the topic (Kafka Connect does, from an outbox) but the listener's topic is a
+     * setting: the listener moves to a topic of Faultline's, and the relay forwards the real one to it.
+     */
+    private static Test movedListener(Risk risk, App app, Method listener, String topic, String key) {
+        String to = topic + RELAY_SUFFIX;
+        var moved = app.withSettings(Map.of(key, to)).code();
+        boolean senderMoved = moved.methods().stream().anyMatch(m -> moved.sentTopics(m).contains(to));
+        if (senderMoved) {
+            throw new IllegalStateException("cannot test %s at %s: %s sets the topic the app sends to as well, so a relay cannot sit in between"
+                .formatted(risk.pattern(), risk.location(), key));
+        }
+        return new Test("move %s to %s (%s=%s), forward %s to it through Faultline's relay and corrupt the 300th, once"
+                .formatted(listener.handler(), to, key, to, topic),
+            new Plan.Fault("messaging", null, null, "corrupt", 300L, 1, null, null, null),
+            checks(), new Traffic(2000, 100, null, "30s"), new Plan.Relay(topic, to), Map.of(key, to), null, null, List.of(), false);
     }
 
     private static Test p7(Risk risk, App app, Method listener, String topic, String key, String from) {

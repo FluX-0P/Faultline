@@ -24,6 +24,8 @@ import java.util.concurrent.TimeUnit;
 import dev.faultline.cli.Json;
 import dev.faultline.cli.history.HistoryEntry;
 import dev.faultline.cli.history.HistoryLog;
+import dev.faultline.cli.plan.Plan;
+import dev.faultline.cli.trace.Traces;
 import dev.faultline.cli.workload.Request;
 import dev.faultline.cli.workload.Workload;
 import tools.jackson.core.JacksonException;
@@ -42,6 +44,10 @@ public final class TrafficSender implements AutoCloseable {
     private final Map<String, String> headers;
     private final boolean form;
     private final String responseField;
+    /** Whether each request carries a traceparent from its request ID, for the run's traces. */
+    private volatile boolean traceparents;
+    /** Headers of each request's own, such as an Idempotency-Key: {@code ${id}} in a value becomes its request ID. */
+    private volatile Map<String, String> requestHeaders = Map.of();
     private final HttpClient http = HttpClient.newBuilder()
         .version(HttpClient.Version.HTTP_1_1)
         .connectTimeout(CONNECT_TIMEOUT)
@@ -65,6 +71,16 @@ public final class TrafficSender implements AutoCloseable {
         this.headers = Map.copyOf(headers);
         this.form = FORM.equals(contentType);
         this.responseField = responseField;
+    }
+
+    /** Each request carries a W3C traceparent whose trace ID comes from its request ID, so its trace is found by that ID. */
+    public void sendTraceparents() {
+        this.traceparents = true;
+    }
+
+    /** Headers each request carries with its own value: {@code ${id}} in one becomes the request's ID. */
+    public void sendRequestHeaders(Map<String, String> headers) {
+        this.requestHeaders = Map.copyOf(headers);
     }
 
     /** Whether anything answers at the target. Any HTTP response, even a 404, counts. */
@@ -113,6 +129,8 @@ public final class TrafficSender implements AutoCloseable {
             .header("Content-Type", form ? FORM : "application/json")
             .method(method, HttpRequest.BodyPublishers.ofString(form ? formOf(r.body()) : r.body()));
         headers.forEach(builder::header);
+        requestHeaders.forEach((name, value) -> builder.header(name, value.replace(Plan.Request.ID, r.id())));
+        if (traceparents) builder.header("traceparent", Traces.traceparent(r.id()));
         var request = builder.build();
         Instant sentAt = Instant.now();
         try {

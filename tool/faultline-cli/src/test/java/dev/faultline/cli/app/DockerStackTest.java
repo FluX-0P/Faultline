@@ -33,4 +33,22 @@ class DockerStackTest {
         assertThat(worker1.path("volumes").path(0).path("source").asString()).isEqualTo(agentJar.toAbsolutePath().toString().replace('\\', '/'));
         assertThat(worker1.path("volumes").path(1).path("target").asString()).isEqualTo("/faultline/run");
     }
+
+    @Test
+    void withTracesEveryServiceRunsTheOpenTelemetryAgentToo(@TempDir Path runDir) throws Exception {
+        Path agentJar = runDir.resolve("faultline-agent.jar");
+        try (var stack = new DockerStack(TestPlans.COMPOSE, runDir)) {
+            stack.keepTraces(runDir.resolve("opentelemetry-javaagent.jar"));
+            stack.writeOverride(Map.of(), Map.of("worker-1", Map.of("FAULTLINE_PLAN", "/faultline/run/agent-plan.properties")), agentJar);
+        }
+
+        JsonNode services = YAMLMapper.builder().build().readTree(Files.readString(runDir.resolve("compose.override.yml"))).path("services");
+        assertThat(services.path("worker-1").path("environment").path("JAVA_TOOL_OPTIONS").asString())
+            .isEqualTo("-javaagent:/faultline/agent.jar -javaagent:/faultline/otel.jar");
+        JsonNode api = services.path("api");
+        assertThat(api.path("environment").path("JAVA_TOOL_OPTIONS").asString()).isEqualTo("-javaagent:/faultline/otel.jar");
+        assertThat(api.path("environment").path("OTEL_SERVICE_NAME").asString()).isEqualTo("api");
+        assertThat(api.path("environment").path("OTEL_EXPORTER_OTLP_ENDPOINT").asString()).isEqualTo("http://host.docker.internal:4318");
+        assertThat(api.path("extra_hosts").path(0).asString()).isEqualTo("host.docker.internal:host-gateway");
+    }
 }

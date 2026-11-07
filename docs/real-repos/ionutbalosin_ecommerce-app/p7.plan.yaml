@@ -1,0 +1,100 @@
+# The plan exactly as this run used it, seed included. Run it again with:
+#   ./faultline run runs/2026-11-01T13-55-19Z/plan.yaml
+app: ionutbalosin_ecommerce-app
+journey: checkout-cart
+risk:
+  id: R9
+  pattern: P7
+  title: No dead-letter handling
+  location: order-service:OrderEventListener#receive
+  file: order-service/src/main/java/ionutbalosin/training/ecommerce/order/listener/OrderEventListener.java
+  line: 67
+  confidence: high
+  why: order-service:OrderEventListener#receive at order-service/src/main/java/ionutbalosin/training/ecommerce/order/listener/OrderEventListener.java line 67 is a Kafka listener with no explicit error handler or DLT configuration in the order-service properties.
+  outcome: stuck
+  saw: "a Kafka listener, and the app configures no error handling of its own"
+target:
+  url: http://localhost:52080
+  compose:
+    file: "<clone>/docker-compose-spring-boot.yml"
+    services:
+    - order-service
+    - product-service
+    - shopping-cart-service
+    consumers: 1
+    override: .faultline/ionutbalosin_ecommerce-app/compose.faultline.yml
+  args: []
+databases:
+- name: order-service-database-application_db
+  url: jdbc:postgresql://localhost:53432/application_db
+  user: masteruser
+  password: masterpass
+  reset:
+  - TRUNCATE TABLE orders
+- name: product-service-database-application_db
+  url: jdbc:postgresql://localhost:51432/application_db
+  user: masteruser
+  password: masterpass
+  reset: []
+  seed_file: <clone>/faultline/product-seed.sql
+- name: shopping-cart-service-database-application_db
+  url: jdbc:postgresql://localhost:25432/application_db
+  user: masteruser
+  password: masterpass
+  reset:
+  - TRUNCATE TABLE cart_item CASCADE
+  seed_file: <clone>/faultline/cart-seed.sql
+kafka:
+  bootstrap: localhost:29092
+  topic: ecommerce-orders-topic
+  group: ecommerce_group_id
+relay:
+  from: ecommerce-orders-topic.faultline
+  to: ecommerce-orders-topic
+  senders:
+  - shopping-cart-service
+traffic:
+  count: 2000
+  rate: 100
+  seed: 301282
+  request:
+    method: POST
+    path: "/cart/{userId}/checkout"
+    body: |
+      {"userId": "00000000-0000-0000-${seq:4}-${seed:12}"}
+  drain_timeout: 30s
+correlate_by:
+  request_field: userId
+  database: order-service-database-application_db
+  table: orders
+  column: user_id
+fault:
+  layer: messaging
+  action: corrupt
+  nth_hit: 300
+  times: 1
+checks:
+- no-lost
+- no-duplicates
+- no-unexpected
+- faults-fired
+rules:
+- id: order-amount-non-negative
+  sql: SELECT * FROM orders WHERE amount <= 0
+  why: "Every created order must have a positive amount, as initiated by the checkout journey."
+  drafted: true
+  database: order-service-database-application_db
+- id: order-currency-eur
+  sql: SELECT * FROM orders WHERE currency <> 'EUR'
+  why: Every order must be placed in EUR currency matching the system configuration.
+  drafted: true
+  database: order-service-database-application_db
+- id: order-status-valid
+  sql: SELECT * FROM orders WHERE status <> 'NW'
+  why: New orders must start with status NW.
+  drafted: true
+  database: order-service-database-application_db
+confirm:
+  runs: 2
+  baselines: 1
+  min_failing: 2

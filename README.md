@@ -82,7 +82,7 @@ Then it boots the stack once and writes `.faultline/<repo>/environment.json`, wh
 - **the app's services**: those that build a Spring Boot module of the repo (the Dockerfile's folder, or the build context), each judged by its configuration as it runs: the module's files, the profiles `SPRING_PROFILES_ACTIVE` switches on, and its Compose environment (`SPRING_DATASOURCE_URL` sets `spring.datasource.url`). Values Compose fills in from your shell or `.env` are not written down.
 - **how Faultline reaches Kafka and each database from this machine**: a port the Compose file publishes, else Faultline's own override (`.faultline/<repo>/compose.faultline.yml`) publishes the database on 127.0.0.1 and gives Kafka a listener for this machine (apache/kafka, confluentinc/cp-kafka, bitnami/kafka and wurstmeister/kafka). The app's files stay as they are.
 - **the live schema** of every database, as the app made it (migrations, Liquibase or Hibernate's `ddl-auto`), with the rows each table started with and the first keys of those that have some (so requests refer to rows that exist), and the topics and consumer groups.
-- **what else the app needs running**: besides its Kafka and databases, any service its settings name by host and port, such as a schema registry or a load balancer in front of another of its services, though no `depends_on` says so.
+- **what else the app needs running**: besides its Kafka and databases, any service its settings name by host and port, such as a schema registry or a load balancer in front of another of its services, though no `depends_on` says so. A Kafka Connect service (Debezium reading an outbox table) boots too, though nothing of the app names it, with what depends on it, such as the one-shot service that registers its connector. `skip:` in the hints leaves out a Connect that is off the journey.
 
 Before booting it checks every port the stack publishes, and names the container that holds a taken one instead of moving it elsewhere; it also stops when a Dockerfile copies a jar that is not built yet, with the build command. Then it removes the stack again (`--keep` leaves it up). Exit code 2 means it could not run.
 
@@ -111,6 +111,9 @@ A repo that holds several Spring Boot apps (each a folder with a build file and 
 - **Listener shapes**: a batch listener (`List<ConsumerRecord<String, OrderEvent>>`), a class-level `@KafkaListener` with `@KafkaHandler` methods, a message inside a `ConsumerRecord` or a `Message`, with or without `@Payload`. The scan follows a listener's work through the methods of its own class it calls (a batch listener's method for one record), and shows the reviewer the message type. A listener whose `@SendTo` publishes what it returns saves, then publishes (P8): the fault crashes it the moment it returns, before Spring Kafka sends the reply.
 - **Avro, Protobuf and other binary messages**: the relay and the reader of the downstream topic move bytes and never decode them. A message that is not JSON is matched to its request by the run's IDs, found as whole strings in its bytes (Avro and Protobuf write a string as its length and its UTF-8 bytes). A corrupted message that names none of them is counted, and no-lost excuses as many missing requests.
 - **A topic the code names** (`ORDERS_TOPIC = "orders"`, no setting to move it): the relay still sits in front of the listener. The agent goes into each service that sends to the topic (`relay.senders`) and sends what it sends there to `<topic>.faultline` instead, where the relay reads it. Every send goes through `KafkaProducer.send`, so `KafkaTemplate`, `@SendTo` replies and plain producers are all moved.
+- **A topic only Kafka Connect sends to** (Debezium's outbox router): no code of the app sends to it, so the listener moves instead, when its topic is a setting (`@KafkaListener(topics = "${app.kafka.topic}")`). The plan sets it to `<topic>.faultline`, the relay forwards the real topic there, and `kafka.topic` is the topic the listener now reads.
+- **A header each request needs a value of its own**, such as `@RequestHeader("Idempotency-Key")`: plan gives every required `@RequestHeader` of the entry handler (not optional ones, those with a default, or a map of them all) one in `traffic.request.headers`, `Idempotency-Key: "${id}"`, where `${id}` is the request's ID. A duplicated request carries the same one, as a client retrying would. The header the hints' auth sets is left to it.
+- **The effect must be able to show the fault**: when the fault is on the way to the listener or in its service, the plan's effect table must be one the listener's side writes, not a row the entry wrote before sending the message. A table the listener's service creates in its migrations counts, though a library writes it (an idempotency store).
 
 ## Onboard an app: faultline/hints.yaml
 
@@ -146,6 +149,16 @@ The report labels the plan's risk:
 - **not tested**: the fault never fired as planned, or the baseline failed too, so the runs say nothing either way.
 
 Drafted rules that a baseline failed, or that no baseline checked, are left out of every label; the report lists them under "Rules left out".
+
+## Traces and fix suggestions
+
+```bash
+./faultline run .faultline/demo-app/plan.yaml --traces
+./faultline fix runs/2026-11-07T05-27-32Z --app demo-app
+```
+
+- **`run --traces`** runs the OpenTelemetry Java agent (2.32.0, downloaded once into `.faultline/tools/`) next to Faultline's agent in every service of a Compose plan, and starts `faultline-otel` (`grafana/otel-lgtm:0.37.0`; Grafana at http://localhost:3300). Each request carries a `traceparent` whose trace ID comes from its request ID, so what it did in every service and through Kafka is one trace, and each request a finding names links to it in the report. The container keeps running after the run so the links work; stop it with `docker rm -f faultline-otel`. It needs about 1 GB of memory.
+- **`fix`** asks the LLM how to fix each confirmed finding of a run. It sees the pattern, the fault, the evidence, the code around the bug and the errors the app logged most during the runs with the fault (only for the suggestion, never for a verdict), writes `fixes.json`, and adds each suggestion to the report, marked as machine-made. Check it, apply it yourself, and run the plan again to prove it.
 
 ## Break harder: Docker, process faults and the benchmark
 

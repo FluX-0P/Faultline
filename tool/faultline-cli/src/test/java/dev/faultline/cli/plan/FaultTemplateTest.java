@@ -94,8 +94,16 @@ class FaultTemplateTest {
             .hasMessageContaining("fake provider");
         assertThatThrownBy(() -> PlanCommand.aim(demo, MAP, risk("P10", "ProviderClient#charge"), jar))
             .hasMessageContaining("no fault template for pattern P10");
-        var fixedTopic = App.read(TestApps.payments(dir));
-        assertThatThrownBy(() -> PlanCommand.aim(fixedTopic, MAP, risk("P7", "PaymentListener#onMessage"), jar))
-            .hasMessageContaining("under a fixed name");
+    }
+
+    @Test
+    void withNoSenderToMoveTheListenerMovesThroughTheSettingItsTopicComesFrom(@TempDir Path dir) throws Exception {
+        // nothing in this app sends to payments.in; its listener reads Topics.IN = "${app.topic}"
+        var app = App.read(TestApps.payments(dir));
+
+        var test = PlanCommand.aim(app, MAP, risk("P7", "PaymentListener#onMessage"), Deployment.jar("http://localhost:8080")).test();
+
+        assertThat(test.relay()).isEqualTo(new Plan.Relay("payments.in", "payments.in.faultline"));
+        assertThat(test.settings()).isEqualTo(Map.of("app.topic", "payments.in.faultline"));
     }
 }

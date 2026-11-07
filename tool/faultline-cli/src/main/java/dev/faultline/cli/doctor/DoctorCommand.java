@@ -193,6 +193,11 @@ public final class DoctorCommand implements Callable<Integer> {
         stack.databases.forEach(d -> named.add(d.service().name()));
         named.addAll(stack.reached);
         if (!stack.reached.isEmpty()) Out.line(out, "reach     the app's settings name %s too, so they boot with it", String.join(", ", stack.reached));
+        named.addAll(stack.connect);
+        if (!stack.connect.isEmpty()) {
+            Out.line(out, "connect   %s boot with it: Kafka Connect carries the app's events to Kafka, and what depends on it registers its connectors",
+                String.join(", ", stack.connect));
+        }
         var boot = config.withDependencies(named);
         checkSkipped(stack.skipped, boot, config);
         if (!portsFree(out, config, boot, reach.publishedPorts())) return Faultline.ERROR;
@@ -235,6 +240,7 @@ public final class DoctorCommand implements Callable<Integer> {
             var infra = new TreeSet<String>(List.of(stack.kafka.name()));
             stack.databases.forEach(d -> infra.add(d.service().name()));
             infra.addAll(stack.reached);
+            infra.addAll(stack.connect);
             Out.line(out, "note      a run needs them up with Faultline's override: docker compose %s up -d %s",
                 files.stream().map(f -> "-f " + f).collect(joining(" ")), String.join(" ", infra));
         }

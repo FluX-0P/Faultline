@@ -46,6 +46,7 @@ import dev.faultline.cli.plan.Durations;
 import dev.faultline.cli.plan.Plan;
 import dev.faultline.cli.relay.ChaosRelay;
 import dev.faultline.cli.stub.StubControl;
+import dev.faultline.cli.trace.Traces;
 import dev.faultline.cli.traffic.TrafficSender;
 import dev.faultline.cli.workload.EffectsTable;
 import dev.faultline.cli.workload.EffectsWatcher;
@@ -79,17 +80,26 @@ final class Attempt {
     private DownstreamReader downstream;
     private EffectsWatcher watcher;
 
-    private Attempt(String name, String kind, Plan plan, Path dir, Path agentJar, PrintWriter out) {
+    /** The run's traces, when it keeps them; else null. */
+    private final Traces traces;
+
+    private Attempt(String name, String kind, Plan plan, Path dir, Path agentJar, Traces traces, PrintWriter out) {
         this.name = name;
         this.kind = kind;
         this.plan = plan;
         this.dir = dir;
         this.agentJar = agentJar;
+        this.traces = traces;
         this.out = out;
     }
 
     static AttemptResult run(String name, String kind, Plan plan, Path dir, Path agentJar, PrintWriter out) throws Exception {
-        return new Attempt(name, kind, plan, dir, agentJar, out).run();
+        return run(name, kind, plan, dir, agentJar, null, out);
+    }
+
+    /** @param traces the run's traces, or null to keep none */
+    static AttemptResult run(String name, String kind, Plan plan, Path dir, Path agentJar, Traces traces, PrintWriter out) throws Exception {
+        return new Attempt(name, kind, plan, dir, agentJar, traces, out).run();
     }
 
     private AttemptResult run() throws Exception {
@@ -110,6 +120,8 @@ final class Attempt {
              var toxiproxy = plan.toxiproxy() == null ? null : new Toxiproxy(plan.toxiproxy());
              var stub = plan.stub() == null ? null : new StubControl(plan.stub())) {
             Connection conn = databases.of(plan.effectsDatabase());
+            if (traces != null) sender.sendTraceparents();
+            sender.sendRequestHeaders(request.requestHeaders());
             try {
                 prepare(sender, lag);
                 reset(databases);
@@ -344,6 +356,7 @@ final class Attempt {
 
     /** Checks Kafka answers, then makes sure no messages from an earlier run will be processed during this one. */
     private void prepare(TrafficSender sender, KafkaLag lag) throws Exception {
+        if (plan.relay() != null) ChaosRelay.makeTopics(plan.kafka().bootstrap(), plan.relay(), line -> Out.line(out, "%s", line));
         long backlog;
         try {
             backlog = lag.lag();
@@ -457,6 +470,7 @@ final class Attempt {
             Out.line(out, "app       starting %s with Docker Compose%s%s ...", String.join(", ", target.compose().services()),
                 agent ? ", the fault agent on " + faulted : "",
                 senders.isEmpty() ? "" : ", the agent in %s sending to %s instead of %s".formatted(String.join(", ", senders), plan.relay().from(), plan.relay().to()));
+            if (traces != null) stack.keepTraces(traces.agentJar());
             stack.up(plan.appSettings(), agents, agentJar);
             // building the images is not starting up: an app whose Dockerfiles build its jars takes minutes to build
             long start = System.nanoTime();

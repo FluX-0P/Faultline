@@ -15,6 +15,7 @@ import java.util.regex.Pattern;
 import dev.faultline.cli.Json;
 import dev.faultline.cli.Out;
 import dev.faultline.cli.plan.Plan;
+import dev.faultline.cli.trace.Traces;
 import tools.jackson.dataformat.yaml.YAMLMapper;
 import tools.jackson.dataformat.yaml.YAMLWriteFeature;
 
@@ -36,6 +37,8 @@ public final class DockerStack implements AutoCloseable {
     private final Path override;
     private final Thread shutdownHook = new Thread(this::removeQuietly);
     private boolean up;
+    /** The OpenTelemetry agent jar every service runs with, when the run keeps traces; else null. */
+    private Path tracesAgent;
 
     public DockerStack(Plan.Compose compose, Path runDir) {
         this.compose = compose;
@@ -67,6 +70,11 @@ public final class DockerStack implements AutoCloseable {
     }
 
     /** @param restart services that get restart: on-failure */
+    /** Every service also runs the OpenTelemetry agent, sending its traces to Faultline's observability container. */
+    public void keepTraces(Path otelAgentJar) {
+        this.tracesAgent = otelAgentJar;
+    }
+
     void writeOverride(Map<String, String> settings, Map<String, Map<String, String>> agents, Path agentJar, List<String> restart) throws IOException {
         var services = new LinkedHashMap<String, Object>();
         String json = Json.MAPPER.writeValueAsString(settings);
@@ -74,13 +82,23 @@ public final class DockerStack implements AutoCloseable {
             var env = new LinkedHashMap<String, String>();
             env.put("SPRING_APPLICATION_JSON", json);
             var service = new LinkedHashMap<String, Object>();
+            var volumes = new ArrayList<Map<String, Object>>();
+            var javaAgents = new ArrayList<String>();
             if (agents.containsKey(name)) {
-                env.put("JAVA_TOOL_OPTIONS", "-javaagent:" + AGENT_IN_CONTAINER);
+                javaAgents.add("-javaagent:" + AGENT_IN_CONTAINER);
                 env.putAll(agents.get(name));
-                service.put("volumes", List.of(
-                    Map.of("type", "bind", "source", Out.path(agentJar.toAbsolutePath()), "target", AGENT_IN_CONTAINER, "read_only", true),
-                    Map.of("type", "bind", "source", Out.path(runDir.toAbsolutePath()), "target", RUN_DIR_IN_CONTAINER)));
+                volumes.add(Map.of("type", "bind", "source", Out.path(agentJar.toAbsolutePath()), "target", AGENT_IN_CONTAINER, "read_only", true));
+                volumes.add(Map.of("type", "bind", "source", Out.path(runDir.toAbsolutePath()), "target", RUN_DIR_IN_CONTAINER));
             }
+            if (tracesAgent != null) {
+                // two -javaagent flags work together; the services reach the container's OTLP port through this machine
+                javaAgents.add("-javaagent:" + Traces.AGENT_IN_CONTAINER);
+                env.putAll(Traces.environment(name));
+                volumes.add(Map.of("type", "bind", "source", Out.path(tracesAgent.toAbsolutePath()), "target", Traces.AGENT_IN_CONTAINER, "read_only", true));
+                service.put("extra_hosts", List.of("host.docker.internal:host-gateway"));
+            }
+            if (!javaAgents.isEmpty()) env.put("JAVA_TOOL_OPTIONS", String.join(" ", javaAgents));
+            if (!volumes.isEmpty()) service.put("volumes", volumes);
             service.put("environment", env);
             if (restart.contains(name)) service.put("restart", "on-failure");
             services.put(name, service);

@@ -8,6 +8,8 @@ import java.nio.file.Path;
  */
 public final class Workspace {
     public static final Path ROOT = Path.of(".faultline");
+    /** Tools Faultline downloads once, such as the OpenTelemetry Java agent. */
+    public static final Path TOOLS = ROOT.resolve("tools");
     public static final String APP_MAP = "app-map.json";
     public static final String RISKS = "risks.json";
     public static final String PLAN = "plan.yaml";

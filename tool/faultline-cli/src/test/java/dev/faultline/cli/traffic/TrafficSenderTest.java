@@ -20,7 +20,7 @@ class TrafficSenderTest {
         var seen = new CopyOnWriteArrayList<String>();
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/payments", exchange -> {
-            seen.add(exchange.getRequestHeaders().getFirst("Authorization"));
+            seen.add(exchange.getRequestHeaders().getFirst("Authorization") + " " + exchange.getRequestHeaders().getFirst("Idempotency-Key"));
             exchange.getRequestBody().readAllBytes();
             exchange.sendResponseHeaders(202, -1);
             exchange.close();
@@ -29,9 +29,13 @@ class TrafficSenderTest {
         try (var sender = new TrafficSender(URI.create("http://127.0.0.1:" + server.getAddress().getPort()), Map.of("Authorization", "Bearer t0ken"))) {
             var entry = sender.sendOne(URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/payments"), "POST",
                 new Request(0, "p-1", "{\"paymentId\": \"p-1\"}"));
+            // a header of each request's own takes its ID
+            sender.sendRequestHeaders(Map.of("Idempotency-Key", "key-${id}"));
+            sender.sendOne(URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/payments"), "POST",
+                new Request(1, "p-2", "{\"paymentId\": \"p-2\"}"));
 
             assertThat(entry.status()).isEqualTo(HistoryEntry.Status.OK);
-            assertThat(seen).isEqualTo(List.of("Bearer t0ken"));
+            assertThat(seen).isEqualTo(List.of("Bearer t0ken null", "Bearer t0ken key-p-2"));
         } finally {
             server.stop(0);
         }

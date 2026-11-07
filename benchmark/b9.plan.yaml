@@ -1,6 +1,8 @@
 # Planted bug B9: a payment that fails is retried later from a retry topic, so later payments for the same account
-# overtake it. The fault makes worker-1 fail every 100th payment, 5 times, as a passing database error would; retried
+# overtake it. The fault makes worker-1 fail every 100th payment, 4 times, as a passing database error would; retried
 # in place, the order holds. per-key-order only counts payments that happened one after the other.
+# 4, not 5: which partition worker-1 gets depends on the order the workers join, and on some it sees fewer than 500
+# payments, so a fifth throw would not fire.
 # faultline benchmark adds the settings that switch the bug on or off.
 app: demo-app
 journey: make-payment
@@ -53,7 +55,7 @@ fault:
   when: before
   action: throw
   nth_hit: 100
-  times: 5
+  times: 4
   target: worker-1
 checks: [no-lost, no-duplicates, no-unexpected, per-key-order, faults-fired]
 confirm:

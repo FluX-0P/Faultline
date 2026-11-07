@@ -35,5 +35,7 @@ Thumbs.db
 runs/
 .faultline/
 
-# Docs stay local for now
-docs/
+# Docs stay local, except the published results
+docs/*
+!docs/real-repos/
+!docs/bugs/

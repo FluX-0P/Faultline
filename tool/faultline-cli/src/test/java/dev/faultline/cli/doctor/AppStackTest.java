@@ -134,6 +134,22 @@ class AppStackTest {
     }
 
     @Test
+    void kafkaConnectBootsWithTheAppWithWhatRegistersItsConnectorsThoughNoSettingNamesIt(@TempDir Path dir) throws Exception {
+        TestStacks.shop(dir);
+        Path repo = dir.toAbsolutePath().normalize();
+        var json = TestStacks.config(dir, true).replace("\"services\": {", """
+            "services": {
+                "connect": {"image": "quay.io/debezium/connect:3.2.4.Final", "depends_on": {"kafka": {}}},
+                "connect-init": {"image": "curlimages/curl:8.17.0", "depends_on": {"connect": {}, "order": {}}},
+                "grafana": {"image": "grafana/grafana:12.3.3"},""");
+        var config = ComposeConfig.parse(json);
+
+        assertThat(AppStack.read(repo, config, config).connect).containsExactly("connect", "connect-init");
+        // a Connect off the journey, left out by the hints, takes what registers its connectors with it
+        assertThat(AppStack.read(repo, config, config, List.of("connect")).connect).isEmpty();
+    }
+
+    @Test
     void aSkippedServiceIsLeftOutWithTheDatabasesOnlyItUses(@TempDir Path dir) throws Exception {
         TestStacks.shop(dir);
         Path repo = dir.toAbsolutePath().normalize();

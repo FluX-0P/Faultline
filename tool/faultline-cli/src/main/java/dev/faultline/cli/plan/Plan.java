@@ -248,11 +248,22 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
      * The request that starts the journey. {@code body} is a JSON template; with {@code contentType}
      * application/x-www-form-urlencoded Faultline sends it as form fields instead, nested as a.b and a[0] (null: JSON).
      */
-    public record Request(String method, String path, String contentType, String body) {
+    public record Request(String method, String path, String contentType, String body, Map<String, String> headers) {
         public static final String FORM = "application/x-www-form-urlencoded";
+        /** In a header's value: the request's own ID, so each request has its own, such as an Idempotency-Key. */
+        public static final String ID = "${id}";
 
         public Request(String method, String path, String body) {
             this(method, path, null, body);
+        }
+
+        public Request(String method, String path, String contentType, String body) {
+            this(method, path, contentType, body, null);
+        }
+
+        /** Headers each request carries ({@code ${id}} in a value becomes its ID); empty when the plan has none. */
+        public Map<String, String> requestHeaders() {
+            return headers == null ? Map.of() : headers;
         }
 
         public boolean form() {
@@ -491,6 +502,12 @@ public record Plan(String app, String journey, Risk risk, Target target, Databas
             }
             if (correlateBy != null && !blank(correlateBy.requestField())) problems.addAll(bodyProblems(r.body(), correlateBy.requestField()));
             if (r.path() != null) problems.addAll(pathProblems(r.path(), r.body()));
+            for (var h : r.requestHeaders().entrySet()) {
+                if (blank(h.getKey()) || !h.getKey().matches("[A-Za-z0-9!#$%&'*+.^_`|~-]+")) problems.add("traffic.request.headers: '" + h.getKey() + "' is not a header name");
+                if (h.getValue() == null || h.getValue().replace(Request.ID, "").contains("${")) {
+                    problems.add("traffic.request.headers." + h.getKey() + " may use only " + Request.ID + ", the request's ID");
+                }
+            }
         }
 
         if (target != null) {

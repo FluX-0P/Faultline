@@ -14,6 +14,7 @@ import dev.faultline.cli.report.Finding.Label;
 import dev.faultline.cli.run.AttemptResult;
 import dev.faultline.cli.run.RunInfo;
 import dev.faultline.cli.run.RunResult;
+import dev.faultline.cli.trace.Traces;
 
 /**
  * report.html: one self-contained page per run, from the run folder's run.json, result.json and plan.yaml.
@@ -21,6 +22,8 @@ import dev.faultline.cli.run.RunResult;
  */
 public final class ReportWriter {
     public static final String FILE = "report.html";
+    /** In a run folder when the run kept traces: Grafana's address, where each request's trace is. */
+    public static final String TRACES = "traces.txt";
     static final int SHOW_IDS = 20;
 
     private ReportWriter() {}
@@ -30,13 +33,22 @@ public final class ReportWriter {
         var result = Json.MAPPER.readValue(runDir.resolve("result.json").toFile(), RunResult.class);
         Path planFile = runDir.resolve("plan.yaml");
         Plan plan = Plan.read(planFile);
-        String html = render(info, result, plan, Files.readString(planFile, StandardCharsets.UTF_8), runDir.getFileName().toString());
+        String html = render(info, result, plan, Files.readString(planFile, StandardCharsets.UTF_8), runDir.getFileName().toString(), Fix.read(runDir),
+            Files.isRegularFile(runDir.resolve(TRACES)));
         Path file = runDir.resolve(FILE);
         Files.writeString(file, html, StandardCharsets.UTF_8);
         return file;
     }
 
     static String render(RunInfo info, RunResult result, Plan plan, String planText, String runName) {
+        return render(info, result, plan, planText, runName, List.of(), false);
+    }
+
+    /**
+     * @param fixes the fixes {@code faultline fix} suggested for the confirmed findings, shown with each
+     * @param traced whether the run kept traces: each request a finding names links to its trace
+     */
+    static String render(RunInfo info, RunResult result, Plan plan, String planText, String runName, List<Fix> fixes, boolean traced) {
         long confirmed = result.findings().stream().filter(f -> f.label() == Label.CONFIRMED).count();
         boolean pass = result.verdict().equals("PASS");
         String headline = confirmed > 0 ? confirmed + (confirmed == 1 ? " confirmed bug" : " confirmed bugs")
@@ -73,7 +85,10 @@ public final class ReportWriter {
         if (result.findings().isEmpty()) {
             html.append("<p class=\"muted\">This plan names no risk, so there is nothing to label. The checks below still apply.</p>\n");
         }
-        for (Finding f : result.findings()) html.append(finding(f, result.reproduce()));
+        for (Finding f : result.findings()) {
+            html.append(finding(f, result.reproduce(), fixes.stream().filter(x -> x.location().equals(f.location())).findFirst().orElse(null),
+                traced));
+        }
         var dropped = result.droppedRules() == null ? List.<RunResult.DroppedRule>of() : result.droppedRules();
         if (!dropped.isEmpty()) {
             html.append("<h2>Rules left out</h2>\n<p class=\"muted\">The LLM drafted these rules; no verdict above counts them.</p>\n<ul>\n");
@@ -122,7 +137,7 @@ public final class ReportWriter {
         return html.toString();
     }
 
-    private static String finding(Finding f, String reproduce) {
+    private static String finding(Finding f, String reproduce, Fix fix, boolean traced) {
         String label = f.label().name().toLowerCase(Locale.ROOT).replace('_', '-');
         var html = new StringBuilder();
         html.append("<article class=\"card\">\n")
@@ -133,9 +148,17 @@ public final class ReportWriter {
         row(html, "Journey", esc(f.journey()));
         row(html, "The run", esc(f.reason()));
         row(html, "The scan", esc(f.why()) + " <span class=\"muted\">(" + esc(f.confidence()) + " confidence)</span>");
-        if (!f.evidence().isEmpty()) row(html, "Evidence", ids(f.evidence()));
+        if (!f.evidence().isEmpty()) row(html, "Evidence", ids(f.evidence(), traced) + (traced ? " <span class=\"muted\">(each links to its trace)</span>" : ""));
         html.append("</dl>\n");
         if (f.label() == Label.CONFIRMED) html.append("<div class=\"label\">Reproduce</div>\n<pre>").append(esc(reproduce)).append("</pre>\n");
+        if (fix != null) {
+            html.append("<div class=\"label\">Suggested fix <span class=\"muted\">(machine-made by ").append(esc(fix.model()))
+                .append(": check it, apply it yourself, then run the plan again)</span></div>\n<dl>\n");
+            row(html, "Fix", esc(fix.summary()));
+            row(html, "Why", esc(fix.why()));
+            if (fix.risks() != null && !fix.risks().isBlank()) row(html, "Also needs", esc(fix.risks()));
+            html.append("</dl>\n<div class=\"mono muted\">").append(esc(fix.file())).append("</div>\n<pre>").append(esc(fix.change())).append("</pre>\n");
+        }
         return html.append("</article>\n").toString();
     }
 
@@ -148,8 +171,20 @@ public final class ReportWriter {
     }
 
     private static String ids(List<String> ids) {
+        return ids(ids, false);
+    }
+
+    /** @param traced whether to link each to the trace of the request it starts with, such as pay-42-299 in "pay-42-299 (2x)" */
+    private static String ids(List<String> ids, boolean traced) {
         var html = new StringBuilder("<div class=\"ids\">");
-        for (String id : ids.stream().limit(SHOW_IDS).toList()) html.append("<code>").append(esc(id)).append("</code>");
+        for (String id : ids.stream().limit(SHOW_IDS).toList()) {
+            String request = id.split("[\s(]", 2)[0];
+            if (traced && !request.isEmpty() && !request.endsWith(":")) {
+                html.append("<a href=\"").append(esc(Traces.link(request))).append("\"><code>").append(esc(id)).append("</code></a>");
+            } else {
+                html.append("<code>").append(esc(id)).append("</code>");
+            }
+        }
         if (ids.size() > SHOW_IDS) html.append("<span class=\"muted\">and ").append(ids.size() - SHOW_IDS).append(" more in result.json</span>");
         return html.append("</div>").toString();
     }

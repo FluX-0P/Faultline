@@ -16,6 +16,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 import dev.faultline.cli.app.ComposeConfig;
+import dev.faultline.cli.app.Deployment;
 import dev.faultline.cli.plan.Hints;
 import dev.faultline.cli.source.App;
 import dev.faultline.cli.source.Endpoint;
@@ -64,6 +65,11 @@ final class AppStack {
      * of its services: they must run for the app to work, though no depends_on says so.
      */
     final Set<String> reached = new TreeSet<>();
+    /**
+     * Kafka Connect, which carries the app's events from its database to Kafka (an outbox through Debezium) though no
+     * setting of the app names it, and what depends on it, such as the service that registers its connectors.
+     */
+    final Set<String> connect = new TreeSet<>();
     ComposeConfig.Service kafka;
 
     private AppStack(ComposeConfig config) {
@@ -137,6 +143,13 @@ final class AppStack {
                 config.reachedAt(host).map(ComposeConfig.Service::name).filter(n -> !own.contains(n) && !stack.skipped.contains(n)).ifPresent(stack.reached::add);
             }
         }
+        for (var s : config.services().values()) {
+            if (Deployment.isConnect(s.image()) && !own.contains(s.name()) && !stack.skipped.contains(s.name())) stack.connect.add(s.name());
+        }
+        var registers = config.services().values().stream()
+            .filter(s -> !own.contains(s.name()) && !stack.skipped.contains(s.name()) && !stack.connect.contains(s.name()))
+            .filter(s -> s.dependsOn().stream().anyMatch(stack.connect::contains)).map(ComposeConfig.Service::name).toList();
+        stack.connect.addAll(registers);
         return stack;
     }
 
