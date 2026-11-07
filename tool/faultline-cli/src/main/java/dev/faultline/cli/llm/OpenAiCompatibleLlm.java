@@ -56,9 +56,17 @@ public final class OpenAiCompatibleLlm implements Llm {
     }
 
     public static OpenAiCompatibleLlm fromSettings(Settings settings, Consumer<String> log) {
-        String key = settings.require(KEY_ENV, "copy .env.example to .env and add your key (free at https://aistudio.google.com)");
-        return new OpenAiCompatibleLlm(URI.create(settings.get(BASE_URL_ENV).orElse(DEFAULT_BASE_URL)), key,
-            settings.get(MODEL_ENV).orElse(DEFAULT_MODEL), log, Thread::sleep);
+        return fromSettings(settings, DEFAULT_MODEL, log);
+    }
+
+    /**
+     * The key is asked for only when a question is sent, so answers the cache already holds need none.
+     *
+     * @param defaultModel the model when {@value #MODEL_ENV} is not set
+     */
+    public static OpenAiCompatibleLlm fromSettings(Settings settings, String defaultModel, Consumer<String> log) {
+        return new OpenAiCompatibleLlm(URI.create(settings.get(BASE_URL_ENV).orElse(DEFAULT_BASE_URL)), settings.get(KEY_ENV).orElse(null),
+            settings.get(MODEL_ENV).orElse(defaultModel), log, Thread::sleep);
     }
 
     @Override
@@ -68,6 +76,10 @@ public final class OpenAiCompatibleLlm implements Llm {
 
     @Override
     public String reply(List<Message> messages, Schema schema) {
+        if (apiKey == null) {
+            throw new IllegalStateException(KEY_ENV + " is not set, and the LLM cache has no answer to this question for " + model
+                + ": copy .env.example to .env and add your key (free at https://aistudio.google.com)");
+        }
         var request = HttpRequest.newBuilder(endpoint)
             .timeout(REQUEST_TIMEOUT)
             .header("Authorization", "Bearer " + apiKey)
