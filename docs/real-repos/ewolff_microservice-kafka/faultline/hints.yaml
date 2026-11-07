@@ -1,0 +1,3 @@
+# wurstmeister/zookeeper:3.4.6 has an old v1 manifest that today's Docker cannot pull; the official image of the same line can
+images:
+  zookeeper: zookeeper:3.4.14

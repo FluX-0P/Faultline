@@ -1,0 +1,6 @@
+# notification-service does not start under compose.yml: its audit log goes to logs/ under /app, which its user
+# (appuser) cannot write; the repo's Kubernetes manifest sets LOG_AUSTRAC_PATH=/tmp/... for it, compose.yml does not.
+# The payment -> ledger journey does not need it.
+skip: [notification-service]
+# the app starts with no accounts; transfers need two that exist and have money
+seed: seed.sql

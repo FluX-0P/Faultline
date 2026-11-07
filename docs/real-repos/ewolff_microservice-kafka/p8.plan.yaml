@@ -1,0 +1,96 @@
+# The plan exactly as this run used it, seed included. Run it again with:
+#   ./faultline run runs/2026-11-07T07-28-50Z/plan.yaml
+app: ewolff_microservice-kafka
+journey: create-order
+risk:
+  id: R3
+  pattern: P8
+  title: "Save, then publish an event"
+  location: OrderService#order
+  file: microservice-kafka/microservice-kafka-order/src/main/java/com/ewolff/microservice/order/logic/OrderService.java
+  line: 21
+  confidence: high
+  why: "In OrderService#order (lines 20-22), the order is first saved via orderRepository.save(order) and then immediately published to Kafka via fireOrderCreatedEvent(order) as two separate steps without a transactional outbox. If the app crashes between these two lines, the order is saved in the database but the event is never published, causing downstream services to miss the creation."
+  outcome: event lost
+  saw: writes to a repository and publishes (through fireOrderCreatedEvent)
+target:
+  url: http://localhost:8081
+  compose:
+    file: <clone>/docker/docker-compose.yml
+    services:
+    - invoicing
+    - order
+    - shipping
+    consumers: 1
+    override: .faultline/ewolff_microservice-kafka/compose.faultline.yml
+  args: []
+databases:
+- name: dbinvoicing
+  url: jdbc:postgresql://localhost:15432/dbinvoicing
+  user: dbuser
+  password: dbpass
+  reset:
+  - TRUNCATE TABLE invoice CASCADE
+  - TRUNCATE TABLE invoice_line CASCADE
+  - TRUNCATE TABLE invoice_invoice_line CASCADE
+- name: dborder
+  url: jdbc:postgresql://localhost:15432/dborder
+  user: dbuser
+  password: dbpass
+  reset:
+  - TRUNCATE TABLE ordertable CASCADE
+  - TRUNCATE TABLE order_line CASCADE
+  - TRUNCATE TABLE ordertable_order_line CASCADE
+- name: dbshipping
+  url: jdbc:postgresql://localhost:15432/dbshipping
+  user: dbuser
+  password: dbpass
+  reset:
+  - TRUNCATE TABLE shipment CASCADE
+  - TRUNCATE TABLE shipment_line CASCADE
+  - TRUNCATE TABLE shipment_shipment_line CASCADE
+kafka:
+  bootstrap: localhost:39092
+  topic: order
+  group: invoicing
+traffic:
+  count: 3000
+  rate: 100
+  seed: 571747
+  request:
+    method: POST
+    path: /
+    content_type: application/x-www-form-urlencoded
+    body: |
+      {"customer": "1", "shippingAddress": {"street": "Main St ${seed}-${seq}", "zip": "12345", "city": "City"}, "billingAddress": {"street": "Main St ${seed}-${seq}", "zip": "12345", "city": "City"}, "orderLine": [{"count": ${int:1:5}, "item": "1"}]}
+correlate_by:
+  request_field: shippingAddress.street
+  database: dborder
+  table: ordertable
+  column: shipping_street
+downstream:
+  topic: order
+  request_field: shippingAddress.street
+fault:
+  point: OrderService#fireOrderCreatedEvent
+  when: before
+  action: crash
+  nth_hit: 100
+  times: 2
+  target: order
+checks:
+- no-lost
+- no-duplicates
+- no-unexpected
+- no-lost-downstream
+- faults-fired
+rules:
+- id: order-lines-exist
+  sql: SELECT o.id FROM ordertable o WHERE NOT EXISTS (SELECT 1 FROM ordertable_order_line l WHERE l.order_id = o.id)
+  why: Every created order in dborder must have at least one associated order line.
+  drafted: true
+  database: dborder
+confirm:
+  runs: 2
+  baselines: 1
+  min_failing: 2

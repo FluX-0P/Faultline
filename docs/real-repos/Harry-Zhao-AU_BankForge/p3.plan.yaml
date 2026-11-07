@@ -1,0 +1,90 @@
+# The plan exactly as this run used it, seed included. Run it again with:
+#   ./faultline run runs/2026-11-01T07-51-19Z/plan.yaml
+app: Harry-Zhao-AU_BankForge
+journey: execute-payment-transfer
+risk:
+  id: R4
+  pattern: P3
+  title: No duplicate check on a consumer
+  location: TransferStateService#confirm
+  file: payment-service/src/main/java/au/com/bankforge/payment/service/TransferStateService.java
+  line: 79
+  confidence: medium
+  why: "TransferStateService#confirm is called by TransferConfirmationListener#onTransferConfirmed without a prior duplicate or idempotency check on the transferId state, risking repeated state transitions if duplicate confirmation messages arrive."
+  outcome: applied twice
+  saw: the method the Kafka listener TransferConfirmationListener#onTransferConfirmed calls to do its work
+target:
+  url: http://localhost:8082
+  compose:
+    file: <clone>/compose.yml
+    services:
+    - debezium-connect
+    - account-service
+    - ledger-service
+    - payment-service
+    consumers: 1
+    connect: http://localhost:8085
+    flush:
+    - redis
+  args: []
+databases:
+- name: accountdb
+  url: jdbc:postgresql://localhost:5432/accountdb
+  user: account
+  password: secret
+  reset:
+  - TRUNCATE TABLE accounts CASCADE
+  - TRUNCATE TABLE outbox_event CASCADE
+  seed_file: <clone>/faultline/seed.sql
+- name: ledgerdb
+  url: jdbc:postgresql://localhost:5434/ledgerdb
+  user: ledger
+  password: secret
+  reset:
+  - TRUNCATE TABLE ledger_entries CASCADE
+  - TRUNCATE TABLE ledger_outbox_event CASCADE
+- name: paymentdb
+  url: jdbc:postgresql://localhost:5433/paymentdb
+  user: payment
+  password: secret
+  reset:
+  - TRUNCATE TABLE transfers CASCADE
+kafka:
+  bootstrap: localhost:29092
+  topic: banking.transfer.confirmed
+  group: payment-service
+traffic:
+  count: 2000
+  rate: 100
+  seed: 103554
+  request:
+    method: POST
+    path: /api/payments/transfers
+    body: |
+      {"fromAccountId": "00000000-0000-0000-0000-0000000000${int:10:14}", "toAccountId": "00000000-0000-0000-0000-0000000000${int:15:19}", "amount": ${int:1:100}.00, "idempotencyKey": "idem-${seed}-${seq}", "description": "Transfer ${seq}"}
+correlate_by:
+  request_field: idempotencyKey
+  response_field: transferId
+  database: paymentdb
+  table: transfers
+  column: id
+fault:
+  layer: traffic
+  action: duplicate
+  nth_hit: 50
+  times: 20
+checks:
+- no-lost
+- no-duplicates
+- no-unexpected
+- faults-fired
+rules:
+- id: no-extra-confirmations
+  sql: SELECT id FROM transfers WHERE state = 'CONFIRMED' GROUP BY id HAVING count(*) > 1
+  why: "Each transfer state should only be updated once per confirmation event, and no unexpected duplicate records or invalid state progressions should happen from duplicate consumer calls."
+  drafted: true
+  database: paymentdb
+confirm:
+  runs: 1
+  baselines: 1
+  min_failing: 1

@@ -1,0 +1,100 @@
+# The plan exactly as this run used it, seed included. Run it again with:
+#   ./faultline run runs/2026-11-01T16-41-38Z/plan.yaml
+app: Harry-Zhao-AU_BankForge
+journey: execute-payment-transfer
+risk:
+  id: R5
+  pattern: P9
+  title: Relies on Kafka Connect delivering once
+  location: TransferConfirmationListener#onTransferConfirmed
+  file: payment-service/src/main/java/au/com/bankforge/payment/kafka/TransferConfirmationListener.java
+  line: 48
+  confidence: medium
+  why: "TransferConfirmationListener#onTransferConfirmed calls transferStateService.confirm(transferId) which attempts a state machine transition; without a duplicate check or idempotent upsert, re-delivering a confirmation event can trigger an invalid state transition exception."
+  outcome: applied twice
+  saw: "a Kafka listener on banking.transfer.confirmed, which no code of the app sends to: Kafka Connect fills it, and delivers at least once"
+target:
+  url: http://localhost:8082
+  compose:
+    file: <clone>/compose.yml
+    services:
+    - debezium-connect
+    - account-service
+    - ledger-service
+    - payment-service
+    consumers: 1
+    connect: http://localhost:8085
+    flush:
+    - redis
+  args: []
+databases:
+- name: accountdb
+  url: jdbc:postgresql://localhost:5432/accountdb
+  user: account
+  password: secret
+  reset:
+  - TRUNCATE TABLE outbox_event
+  - "UPDATE accounts SET balance = 1000000000.0000 WHERE id IN ('00000000-0000-0000-0000-000000000010', '00000000-0000-0000-0000-000000000011')"
+  seed_file: <clone>/faultline/seed.sql
+- name: ledgerdb
+  url: jdbc:postgresql://localhost:5434/ledgerdb
+  user: ledger
+  password: secret
+  reset:
+  - TRUNCATE TABLE ledger_entries
+  - TRUNCATE TABLE ledger_outbox_event
+- name: paymentdb
+  url: jdbc:postgresql://localhost:5433/paymentdb
+  user: payment
+  password: secret
+  reset:
+  - TRUNCATE TABLE transfers
+kafka:
+  bootstrap: localhost:29092
+  topic: banking.transfer.confirmed
+  group: payment-service
+  groups:
+  - topic: banking.transfer.events-dlt
+    group: ledger-service-dlt
+  - topic: banking.transfer.events
+    group: ledger-service
+traffic:
+  count: 2000
+  rate: 100
+  seed: 995595
+  request:
+    method: POST
+    path: /api/payments/transfers
+    body: |
+      {"fromAccountId": "00000000-0000-0000-0000-00000000001${int:0:4}", "toAccountId": "00000000-0000-0000-0000-00000000001${int:5:9}", "amount": 10.00, "idempotencyKey": "key-${seed}-${seq}", "description": "transfer ${seq}"}
+correlate_by:
+  request_field: idempotencyKey
+  response_field: transferId
+  database: paymentdb
+  table: transfers
+  column: id
+downstream:
+  topic: banking.transfer.confirmed
+  request_field: idempotencyKey
+fault:
+  layer: process
+  action: kill
+  duration: 20s
+  target: debezium-connect
+  at: 10s
+checks:
+- no-lost
+- no-duplicates
+- no-unexpected
+- no-lost-downstream
+- faults-fired
+rules:
+- id: transfer-state-never-invalid
+  sql: SELECT id FROM transfers WHERE state != 'CONFIRMED'
+  why: Each payment transfer must reach CONFIRMED state successfully without throwing state transition exceptions due to duplicate confirmation event consumption.
+  drafted: true
+  database: paymentdb
+confirm:
+  runs: 2
+  baselines: 1
+  min_failing: 2

@@ -1,0 +1,24 @@
+# Faultline's hints for ionutbalosin/ecommerce-app, tested at 9cc90da: the last commit whose Docker setup runs (the next
+# one compiles for Java 25, while every Dockerfile.svc still runs Java 21).
+#
+# The Compose files run images bootstrap.sh builds; Faultline builds them the same way, each in its module's folder.
+builds:
+  product-service: product-service/Dockerfile.svc
+  shopping-cart-service: shopping-cart-service/Dockerfile.svc
+  order-service: order-service/Dockerfile.svc
+  payment-service: payment-service/Dockerfile.svc
+  account-service: account-service/Dockerfile.svc
+  shipping-service: shipping-service/Dockerfile.svc
+  notification-service: notification-service/Dockerfile.svc
+# Traefik v3.0 cannot talk to today's Docker Engine (29: "Error response from daemon" on every query), so it never
+# learns the product service's route and the cart's product lookups get 404; v3.6.1 can
+images:
+  traefik: traefik:v3.6.1
+# Debezium only carries product changes to the cart's cache, off the checkout journey, and its connector is registered
+# by hand (debezium-register-postgres.sh): a run would wait for a connector that never comes
+skip: [debezium-connect]
+# this machine's Windows keeps 52432-52531 for itself, so the cart's database is published on 25432 instead
+ports:
+  shopping-cart-service-database: ["25432:5432"]
+# products with IDs of a known form, then a cart for each user the traffic checks out
+seed: product-seed.sql, cart-seed.sql
